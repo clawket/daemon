@@ -6,3 +6,5 @@ dist/
 *.sqlite-wal
 *.sqlite-shm
 web/
+rust/target/
+rust/Cargo.lock

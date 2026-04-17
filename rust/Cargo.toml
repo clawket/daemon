@@ -1,0 +1,21 @@
+[package]
+name = "clawketd-rs"
+version = "0.1.0-pre"
+edition = "2021"
+description = "Clawket daemon (Rust) — Phase 6 migration target"
+license = "MIT"
+repository = "https://github.com/clawket/daemon"
+
+[[bin]]
+name = "clawketd-rs"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
