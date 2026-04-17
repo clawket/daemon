@@ -1,10 +1,38 @@
 {
-  "name": "clawket",
+  "name": "@clawket/daemon",
   "version": "2.2.1",
-  "description": "LLM-native work management state layer",
+  "description": "Clawket daemon — Node.js state layer (Hono + better-sqlite3 + sqlite-vec + local RAG)",
   "type": "module",
+  "main": "bin/clawketd.js",
   "bin": {
     "clawketd": "./bin/clawketd.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "migrations",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clawket/daemon.git"
+  },
+  "homepage": "https://github.com/clawket/clawket",
+  "keywords": [
+    "clawket",
+    "daemon",
+    "sqlite",
+    "rag",
+    "hono"
+  ],
+  "author": "Seungwoo Lee",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node bin/clawketd.js"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
