@@ -7,4 +7,3 @@ dist/
 *.sqlite-shm
 web/
 rust/target/
-rust/Cargo.lock
