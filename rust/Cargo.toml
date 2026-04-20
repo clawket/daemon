@@ -24,3 +24,4 @@ dirs = "6"
 rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
 sqlite-vec = "0.1"
 zerocopy = "0.7"
+rand = "0.8"

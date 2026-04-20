@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 const APP: &str = "clawket";
 
+#[derive(Clone)]
 pub struct Paths {
     pub data: PathBuf,
     pub cache: PathBuf,

@@ -1,13 +1,17 @@
 mod config;
 mod db;
+mod id;
+mod models;
 mod paths;
+mod state;
 
 use anyhow::Result;
-use axum::{routing::get, Json, Router};
+use axum::{extract::State, routing::get, Json, Router};
 use clap::Parser;
 use config::Cli;
 use paths::Paths;
 use serde::Serialize;
+use state::AppState;
 use std::net::SocketAddr;
 
 #[derive(Serialize)]
@@ -15,13 +19,15 @@ struct Health {
     status: &'static str,
     version: &'static str,
     engine: &'static str,
+    vec_enabled: bool,
 }
 
-async fn health() -> Json<Health> {
+async fn health(State(app): State<AppState>) -> Json<Health> {
     Json(Health {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         engine: "rust",
+        vec_enabled: app.vec_enabled(),
     })
 }
 
@@ -45,7 +51,7 @@ async fn main() -> Result<()> {
         vec_enabled = database.vec_enabled,
         "database initialized"
     );
-    drop(database);
+    let app_state = AppState::new(database, paths_cfg.clone());
 
     let addr: SocketAddr = format!("{}:{}", cli.host, cli.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -59,7 +65,9 @@ async fn main() -> Result<()> {
         "clawketd listening"
     );
 
-    let app = Router::new().route("/health", get(health));
+    let app = Router::new()
+        .route("/health", get(health))
+        .with_state(app_state);
 
     let port_file = paths_cfg.port_file.clone();
     let shutdown = async move {
