@@ -4,6 +4,7 @@ mod id;
 mod models;
 mod paths;
 mod repo;
+mod routes;
 mod state;
 
 use anyhow::Result;
@@ -68,6 +69,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .merge(routes::router())
         .with_state(app_state);
 
     let port_file = paths_cfg.port_file.clone();
