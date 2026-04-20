@@ -52,7 +52,7 @@ pub struct Cycle {
     pub goal: Option<String>,
     pub created_at: i64,
     pub started_at: Option<i64>,
-    pub completed_at: Option<i64>,
+    pub ended_at: Option<i64>,
     pub status: String,
 }
 
