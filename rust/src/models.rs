@@ -1,6 +1,33 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Artifact {
+    pub id: String,
+    pub task_id: Option<String>,
+    pub unit_id: Option<String>,
+    pub plan_id: Option<String>,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub title: String,
+    pub content: String,
+    pub content_format: String,
+    pub parent_id: Option<String>,
+    pub scope: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactVersion {
+    pub id: String,
+    pub artifact_id: String,
+    pub version: i64,
+    pub content: Option<String>,
+    pub content_format: Option<String>,
+    pub created_at: Option<i64>,
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
     pub name: String,

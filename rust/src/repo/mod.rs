@@ -1,3 +1,4 @@
+pub mod artifacts;
 pub mod cycles;
 pub mod plans;
 pub mod projects;
