@@ -1,6 +1,43 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskComment {
+    pub id: String,
+    pub task_id: String,
+    pub author: String,
+    pub body: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Question {
+    pub id: String,
+    pub plan_id: Option<String>,
+    pub unit_id: Option<String>,
+    pub task_id: Option<String>,
+    pub kind: String,
+    pub origin: String,
+    pub body: String,
+    pub asked_by: Option<String>,
+    pub created_at: i64,
+    pub answer: Option<String>,
+    pub answered_by: Option<String>,
+    pub answered_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Run {
+    pub id: String,
+    pub task_id: String,
+    pub session_id: Option<String>,
+    pub agent: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub result: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
     pub id: String,
     pub task_id: Option<String>,

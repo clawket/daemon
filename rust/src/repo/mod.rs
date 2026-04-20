@@ -1,6 +1,9 @@
 pub mod artifacts;
+pub mod comments;
 pub mod cycles;
 pub mod plans;
 pub mod projects;
+pub mod questions;
+pub mod runs;
 pub mod tasks;
 pub mod units;

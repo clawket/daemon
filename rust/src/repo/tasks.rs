@@ -1,6 +1,6 @@
 use crate::id::{new_id, now_ms};
 use crate::models::Task;
-use crate::repo::{cycles, plans, units};
+use crate::repo::{cycles, plans, runs, units};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -357,6 +357,33 @@ pub fn update(conn: &mut Connection, id: &str, f: UpdateFields) -> Result<Option
     conn.execute(&sql, params_iter)?;
 
     if let Some(status) = &f.status {
+        if status == "in_progress" {
+            let existing_runs = runs::list(
+                conn,
+                runs::ListFilter {
+                    task_id: Some(&canonical),
+                    ..Default::default()
+                },
+            )?;
+            if !existing_runs.iter().any(|r| r.ended_at.is_none()) {
+                let agent = f.assignee.as_ref().and_then(|a| a.clone()).unwrap_or_else(|| "main".into());
+                runs::create(conn, &canonical, None, &agent)?;
+            }
+        }
+        if status == "done" || status == "cancelled" {
+            let result = if status == "done" { "success" } else { status.as_str() };
+            for r in runs::list(
+                conn,
+                runs::ListFilter {
+                    task_id: Some(&canonical),
+                    ..Default::default()
+                },
+            )? {
+                if r.ended_at.is_none() {
+                    runs::finish(conn, &r.id, result, None)?;
+                }
+            }
+        }
         if status == "in_progress" {
             let task = get(conn, &canonical)?
                 .ok_or_else(|| anyhow::anyhow!("task vanished after update"))?;
