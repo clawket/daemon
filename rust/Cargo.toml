@@ -21,3 +21,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
+sqlite-vec = "0.1"
+zerocopy = "0.7"

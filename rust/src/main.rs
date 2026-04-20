@@ -1,4 +1,5 @@
 mod config;
+mod db;
 mod paths;
 
 use anyhow::Result;
@@ -38,6 +39,13 @@ async fn main() -> Result<()> {
         paths_cfg.db = db.clone();
     }
     paths_cfg.ensure_dirs()?;
+
+    let database = db::Db::open(&paths_cfg.db)?;
+    tracing::info!(
+        vec_enabled = database.vec_enabled,
+        "database initialized"
+    );
+    drop(database);
 
     let addr: SocketAddr = format!("{}:{}", cli.host, cli.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
