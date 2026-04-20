@@ -78,4 +78,6 @@ pub struct Task {
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub status: String,
+    pub depends_on: Vec<String>,
+    pub labels: Vec<String>,
 }
