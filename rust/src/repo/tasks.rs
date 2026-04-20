@@ -1,6 +1,6 @@
 use crate::id::{new_id, now_ms};
 use crate::models::Task;
-use crate::repo::{cycles, plans, runs, units};
+use crate::repo::{activity_log, cycles, plans, runs, units};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -266,6 +266,7 @@ pub struct UpdateFields {
 pub fn update(conn: &mut Connection, id: &str, f: UpdateFields) -> Result<Option<Task>> {
     let canonical = resolve_id(conn, id)?
         .ok_or_else(|| anyhow::anyhow!("Task not found: {}", id))?;
+    let old = get(conn, &canonical)?;
 
     if let Some(status) = &f.status {
         if !matches!(
@@ -425,6 +426,64 @@ pub fn update(conn: &mut Connection, id: &str, f: UpdateFields) -> Result<Option
 
         if TERMINAL.contains(&status.as_str()) {
             cascade_complete(conn, &canonical)?;
+        }
+    }
+
+    if let Some(old_task) = old {
+        let actor = f
+            .assignee
+            .as_ref()
+            .and_then(|a| a.clone())
+            .or_else(|| old_task.assignee.clone())
+            .unwrap_or_else(|| "system".into());
+
+        if let Some(new_status) = &f.status {
+            if new_status != &old_task.status {
+                let _ = activity_log::record(
+                    conn,
+                    activity_log::RecordInput {
+                        entity_type: "task",
+                        entity_id: &canonical,
+                        action: "status_change",
+                        field: Some("status"),
+                        old_value: Some(&old_task.status),
+                        new_value: Some(new_status),
+                        actor: Some(&actor),
+                    },
+                );
+            }
+        }
+        if let Some(Some(new_assignee)) = &f.assignee {
+            if old_task.assignee.as_deref() != Some(new_assignee.as_str()) {
+                let _ = activity_log::record(
+                    conn,
+                    activity_log::RecordInput {
+                        entity_type: "task",
+                        entity_id: &canonical,
+                        action: "updated",
+                        field: Some("assignee"),
+                        old_value: old_task.assignee.as_deref(),
+                        new_value: Some(new_assignee),
+                        actor: Some(&actor),
+                    },
+                );
+            }
+        }
+        if let Some(new_priority) = &f.priority {
+            if new_priority != &old_task.priority {
+                let _ = activity_log::record(
+                    conn,
+                    activity_log::RecordInput {
+                        entity_type: "task",
+                        entity_id: &canonical,
+                        action: "updated",
+                        field: Some("priority"),
+                        old_value: Some(&old_task.priority),
+                        new_value: Some(new_priority),
+                        actor: Some(&actor),
+                    },
+                );
+            }
         }
     }
 
