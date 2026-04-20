@@ -4,10 +4,7 @@ State layer daemon for [Clawket](https://github.com/clawket/clawket). Hono HTTP 
 
 ## Install
 
-```sh
-pnpm install -g @clawket/daemon
-clawketd
-```
+The daemon is distributed as a tarball on [GitHub Releases](https://github.com/clawket/daemon/releases). In practice, the [`clawket` Claude Code plugin](https://github.com/clawket/clawket) downloads and wires up the daemon for you; the sections below are for running it standalone.
 
 On first run, the daemon:
 - writes its port to `$XDG_CACHE_HOME/clawket/clawketd.port`

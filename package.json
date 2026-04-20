@@ -1,19 +1,13 @@
 {
   "name": "@clawket/daemon",
+  "private": true,
   "version": "2.2.1",
-  "description": "Clawket daemon — Node.js state layer (Hono + better-sqlite3 + sqlite-vec + local RAG)",
+  "description": "Clawket daemon — Node.js state layer (Hono + better-sqlite3 + sqlite-vec + local RAG). Distributed as a GitHub Release tarball.",
   "type": "module",
   "main": "bin/clawketd.js",
   "bin": {
     "clawketd": "./bin/clawketd.js"
   },
-  "files": [
-    "bin",
-    "src",
-    "migrations",
-    "README.md",
-    "LICENSE"
-  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/clawket/daemon.git"
