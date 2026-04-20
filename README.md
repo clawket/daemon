@@ -29,7 +29,7 @@ pnpm start            # runs bin/clawketd.js
 
 ## Rust migration
 
-This package will be superseded by a Rust rewrite (Phase 6 of the v7 roadmap). Releases will continue to ship from this repo, with Node.js and Rust binaries alternating on the same tag line.
+A Rust rewrite is in progress in this repo and will eventually replace the Node.js implementation. Releases will continue to ship from this repository; tags bind to whichever implementation is current at release time.
 
 ## License
 
