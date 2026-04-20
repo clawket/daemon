@@ -7,6 +7,8 @@ pub struct Project {
     pub description: Option<String>,
     pub key: Option<String>,
     pub enabled: i64,
+    pub wiki_paths: Vec<String>,
+    pub cwds: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }

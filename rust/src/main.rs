@@ -3,6 +3,7 @@ mod db;
 mod id;
 mod models;
 mod paths;
+mod repo;
 mod state;
 
 use anyhow::Result;
