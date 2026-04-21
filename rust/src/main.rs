@@ -92,8 +92,7 @@ async fn run_daemon(args: StartArgs) -> Result<()> {
     );
     let app_state = AppState::new(database, paths_cfg.clone());
 
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
-    let tcp_listener = tokio::net::TcpListener::bind(addr).await?;
+    let tcp_listener = bind_with_fallback(&args.host, args.port).await?;
     let bound = tcp_listener.local_addr()?;
     paths::write_port_file(&paths_cfg.port_file, bound.port())?;
     paths::write_pid_file(&paths_cfg.pid_file, std::process::id())?;
@@ -163,6 +162,47 @@ async fn run_daemon(args: StartArgs) -> Result<()> {
     paths::remove_socket_file(&socket_file);
     result?;
     Ok(())
+}
+
+/// Bind a TCP listener on `host:port`. If `port == 0`, OS picks a random port.
+/// Otherwise, try `port`, `port+1`, ... for up to 20 attempts, skipping ports
+/// already in use. Fails if no port in the range is free.
+async fn bind_with_fallback(host: &str, port: u16) -> Result<tokio::net::TcpListener> {
+    if port == 0 {
+        let addr: SocketAddr = format!("{host}:0").parse()?;
+        return Ok(tokio::net::TcpListener::bind(addr).await?);
+    }
+
+    const MAX_ATTEMPTS: u16 = 20;
+    let mut last_err: Option<std::io::Error> = None;
+    for offset in 0..MAX_ATTEMPTS {
+        let candidate = port.saturating_add(offset);
+        let addr: SocketAddr = format!("{host}:{candidate}").parse()?;
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                if offset > 0 {
+                    tracing::warn!(
+                        requested = port,
+                        bound = candidate,
+                        "port in use; bound to next free port"
+                    );
+                }
+                return Ok(listener);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let end = port.saturating_add(MAX_ATTEMPTS - 1);
+    bail!(
+        "no free port in range {port}..={end}: {}",
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    )
 }
 
 async fn stop_daemon() -> Result<()> {

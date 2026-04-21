@@ -25,8 +25,9 @@ pub enum Command {
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct StartArgs {
-    /// Port to bind (0 = random, default)
-    #[arg(long, default_value_t = 0)]
+    /// Port to bind. Default 19400; auto-increments (+1, up to 20 attempts)
+    /// if the port is already in use. Pass 0 for an OS-assigned random port.
+    #[arg(long, default_value_t = 19400)]
     pub port: u16,
 
     /// Bind address
