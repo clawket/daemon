@@ -1,6 +1,6 @@
 [package]
 name = "clawketd"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Clawket daemon — Axum HTTP server + SQLite + sqlite-vec for local RAG"
 license = "MIT"
