@@ -673,6 +673,108 @@ fn list_labels(conn: &Connection, task_id: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+// Node v2.2.1 parity: if the query contains FTS5 operators the user likely
+// knows what they're typing, pass through verbatim; otherwise split on
+// whitespace and append a prefix wildcard to each term so that "rust clap"
+// matches "rustfmt claps" style prefixes.
+fn build_fts_query(trimmed: &str) -> String {
+    if trimmed.chars().any(|c| matches!(c, '*' | '"' | ':' | '(' | ')')) {
+        return trimmed.to_string();
+    }
+    let terms: Vec<String> = trimmed
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("{t}*"))
+        .collect();
+    if terms.is_empty() {
+        String::new()
+    } else {
+        terms.join(" ")
+    }
+}
+
+pub fn keyword_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Task>> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fts_query = build_fts_query(trimmed);
+    let mut stmt = match conn.prepare(
+        "SELECT t.id FROM tasks_fts f
+         JOIN tasks t ON t.rowid = f.rowid
+         WHERE tasks_fts MATCH ?1
+         ORDER BY bm25(tasks_fts) LIMIT ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let ids: Vec<String> = stmt
+        .query_map(params![fts_query, limit], |r| r.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some(t) = get(conn, &id)? {
+            out.push(t);
+        }
+    }
+    Ok(out)
+}
+
+pub fn store_embedding(conn: &Connection, task_id: &str, embedding: &[f32]) -> Result<()> {
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            embedding.as_ptr() as *const u8,
+            std::mem::size_of_val(embedding),
+        )
+    };
+    let _ = conn.execute("DELETE FROM vec_tasks WHERE task_id = ?1", params![task_id]);
+    let _ = conn.execute(
+        "INSERT INTO vec_tasks (task_id, embedding) VALUES (?1, ?2)",
+        params![task_id, bytes],
+    );
+    Ok(())
+}
+
+pub fn vector_search(
+    conn: &Connection,
+    embedding: &[f32],
+    limit: i64,
+) -> Result<Vec<(Task, f32)>> {
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            embedding.as_ptr() as *const u8,
+            std::mem::size_of_val(embedding),
+        )
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT task_id, distance FROM vec_tasks
+         WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let rows = stmt.query_map(params![bytes, limit], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, f32>(1)?))
+    });
+    let rows = match rows {
+        Ok(r) => r,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, distance) = match row {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(t) = get(conn, &id)? {
+            out.push((t, distance));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
