@@ -38,7 +38,7 @@ jobs:
       tag: ${{ steps.bump.outputs.tag }}
       should_release: ${{ steps.bump.outputs.should_release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           token: ${{ secrets.CLAWKET_RELEASE_PAT }}
@@ -67,14 +67,22 @@ jobs:
             exit 0
           fi
 
+          # Conventional Commits → SemVer policy.
+          # Only feat/fix/perf and breaking changes trigger a release.
+          # ci/docs/chore/refactor/test/style/build commits do not release.
           BUMP="${{ inputs.bump }}"
           if [ -z "$BUMP" ]; then
-            if git log $RANGE --format='%B' | grep -qE '(^|\n)BREAKING CHANGE:|!:'; then
+            if git log $RANGE --format='%B' | grep -qE '^BREAKING CHANGE:' \
+               || git log $RANGE --format='%s' | grep -qE '^[a-z]+(\(.+\))?!:'; then
               BUMP=major
             elif git log $RANGE --format='%s' | grep -qE '^feat(\(.+\))?:'; then
               BUMP=minor
-            else
+            elif git log $RANGE --format='%s' | grep -qE '^(fix|perf)(\(.+\))?:'; then
               BUMP=patch
+            else
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "No release-worthy commits since ${LAST_TAG:-<init>}"
+              exit 0
             fi
           fi
           echo "Selected bump: $BUMP"
@@ -93,8 +101,8 @@ jobs:
           git add rust/Cargo.toml rust/Cargo.lock
           git commit -m "chore: release $TAG [skip ci]"
           git tag "$TAG" -m "Release $TAG"
-          git push origin HEAD:main
-          git push origin "$TAG"
+          # Atomic push: main and tag succeed together, or neither.
+          git push --atomic origin HEAD:main "$TAG"
 
   build:
     needs: bump
@@ -117,7 +125,7 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.bump.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
@@ -159,7 +167,7 @@ jobs:
           cp ../LICENSE "dist/$NAME/" 2>/dev/null || true
           tar -C dist -czvf "${NAME}.tar.gz" "$NAME"
           shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: dist-${{ matrix.target }}
           path: |
@@ -173,10 +181,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.bump.outputs.tag }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           path: artifacts
           pattern: dist-*
@@ -208,7 +216,7 @@ jobs:
           cd plugin
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
+          git checkout -B "$BRANCH"
 
           jq --arg key "$REPO_NAME" --arg ver "$TAG" \
             '.[$key] = $ver' components.json > components.json.tmp
