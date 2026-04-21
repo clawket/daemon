@@ -159,6 +159,62 @@ pub fn delete(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn keyword_search(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+    scope: Option<&str>,
+) -> Result<Vec<Artifact>> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fts_query = build_artifact_fts_query(trimmed);
+    let sql = if scope.is_some() {
+        "SELECT a.id FROM artifacts a JOIN artifacts_fts f ON a.rowid = f.rowid
+         WHERE artifacts_fts MATCH ?1 AND a.scope = ?2 ORDER BY rank LIMIT ?3"
+    } else {
+        "SELECT a.id FROM artifacts a JOIN artifacts_fts f ON a.rowid = f.rowid
+         WHERE artifacts_fts MATCH ?1 ORDER BY rank LIMIT ?2"
+    };
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let ids: Vec<String> = if let Some(s) = scope {
+        stmt.query_map(params![fts_query, s, limit], |r| r.get::<_, String>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    } else {
+        stmt.query_map(params![fts_query, limit], |r| r.get::<_, String>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    };
+    drop(stmt);
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some(a) = get(conn, &id)? {
+            out.push(a);
+        }
+    }
+    Ok(out)
+}
+
+fn build_artifact_fts_query(trimmed: &str) -> String {
+    if trimmed
+        .chars()
+        .any(|c| matches!(c, '*' | '"' | ':' | '(' | ')'))
+    {
+        return trimmed.to_string();
+    }
+    let terms: Vec<String> = trimmed
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("{t}*"))
+        .collect();
+    terms.join(" ")
+}
+
 pub fn store_embedding(conn: &Connection, artifact_id: &str, embedding: &[f32]) -> Result<()> {
     let bytes: &[u8] = bytemuck_f32_slice(embedding);
     conn.execute(
@@ -176,6 +232,68 @@ pub fn store_embedding(conn: &Connection, artifact_id: &str, embedding: &[f32]) 
 
 fn bytemuck_f32_slice(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+pub fn vector_search(
+    conn: &Connection,
+    embedding: &[f32],
+    limit: i64,
+    scope: Option<&str>,
+) -> Result<Vec<(Artifact, f32)>> {
+    let bytes = bytemuck_f32_slice(embedding);
+    let mut stmt = match conn.prepare(
+        "SELECT artifact_id, distance FROM vec_artifacts
+         WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let over_fetch = (limit * 2).max(limit);
+    let rows = stmt.query_map(params![bytes, over_fetch], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, f32>(1)?))
+    });
+    let rows = match rows {
+        Ok(r) => r,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, distance) = match row {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(art) = get(conn, &id)? {
+            if let Some(s) = scope {
+                if art.scope != s {
+                    continue;
+                }
+            }
+            out.push((art, distance));
+            if (out.len() as i64) >= limit {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn snapshot_current(
+    conn: &Connection,
+    artifact_id: &str,
+    created_by: Option<&str>,
+) -> Result<Option<ArtifactVersion>> {
+    let existing = match get(conn, artifact_id)? {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    let v = create_version(
+        conn,
+        &existing.id,
+        Some(&existing.content),
+        Some(&existing.content_format),
+        created_by,
+    )?;
+    Ok(Some(v))
 }
 
 fn create_version(
