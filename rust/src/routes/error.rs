@@ -63,12 +63,27 @@ impl From<anyhow::Error> for ApiError {
 #[derive(Serialize)]
 struct ErrorBody {
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stack: Option<String>,
+}
+
+fn debug_enabled() -> bool {
+    std::env::var("CLAWKET_DEBUG")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let stack = if debug_enabled() {
+            Some(format!("{}\n(status={})", self.message, self.status))
+        } else {
+            None
+        };
         let body = ErrorBody {
             error: self.message,
+            stack,
         };
         (self.status, Json(body)).into_response()
     }

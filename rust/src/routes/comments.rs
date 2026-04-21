@@ -40,5 +40,5 @@ async fn delete_one(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     comments::delete(&app.conn(), &id)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(serde_json::json!({ "ok": true, "deleted": id })))
 }
