@@ -1,6 +1,6 @@
 [package]
 name = "clawketd-rs"
-version = "0.1.0-pre"
+version = "0.1.0"
 edition = "2021"
 description = "Clawket daemon (Rust)"
 license = "MIT"
