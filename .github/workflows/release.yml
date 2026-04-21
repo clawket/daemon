@@ -4,9 +4,9 @@ name: Release
 # Trigger: push to main → conventional-commit 기반 자동 버전업 → cross-platform
 # build → GitHub Release → clawket/clawket 레포에 components.json 업데이트 PR.
 #
-# Required secrets in the target repo:
-#   - RELEASE_PAT      : PAT with `contents: write` on this repo (bump + tag push)
-#   - PLUGIN_REPO_PAT  : PAT with `contents: write` + `pull_requests: write` on clawket/clawket
+# Required org-level secret (clawket org 전체 공유):
+#   - CLAWKET_RELEASE_PAT : fine-grained PAT, clawket org 모든 레포에
+#     `contents: write` + `pull_requests: write` 권한
 #
 # Assumptions:
 #   - Rust crate lives at `rust/` with a single [[bin]] whose name matches the asset prefix.
@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_PAT }}
+          token: ${{ secrets.CLAWKET_RELEASE_PAT }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -196,7 +196,7 @@ jobs:
     steps:
       - name: Update components.json in clawket/clawket
         env:
-          GH_TOKEN: ${{ secrets.PLUGIN_REPO_PAT }}
+          GH_TOKEN: ${{ secrets.CLAWKET_RELEASE_PAT }}
         shell: bash
         run: |
           set -euo pipefail
