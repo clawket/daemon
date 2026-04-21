@@ -1,10 +1,13 @@
 [package]
-name = "clawketd-rs"
+name = "clawketd"
 version = "0.1.0"
 edition = "2021"
-description = "Clawket daemon (Rust)"
+description = "Clawket daemon — Axum HTTP server + SQLite + sqlite-vec for local RAG"
 license = "MIT"
 repository = "https://github.com/clawket/daemon"
+homepage = "https://github.com/clawket/clawket"
+keywords = ["clawket", "daemon", "task-management", "rag"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "clawketd"

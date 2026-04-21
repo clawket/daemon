@@ -4,22 +4,6 @@ use std::path::Path;
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "001_initial.sql", include_str!("../../migrations/001_initial.sql")),
-    (2, "002_questions_and_approval.sql", include_str!("../../migrations/002_questions_and_approval.sql")),
-    (3, "003_v3.sql", include_str!("../../migrations/003_v3.sql")),
-    (4, "004_bolts.sql", include_str!("../../migrations/004_bolts.sql")),
-    (5, "005_activity_log.sql", include_str!("../../migrations/005_activity_log.sql")),
-    (6, "006_labels.sql", include_str!("../../migrations/006_labels.sql")),
-    (7, "007_reporter_review.sql", include_str!("../../migrations/007_reporter_review.sql")),
-    (8, "008_step_relations.sql", include_str!("../../migrations/008_step_relations.sql")),
-    (9, "009_vector_search.sql", include_str!("../../migrations/009_vector_search.sql")),
-    (10, "010_step_type.sql", include_str!("../../migrations/010_step_type.sql")),
-    (11, "011_artifact_scope.sql", include_str!("../../migrations/011_artifact_scope.sql")),
-    (12, "012_project_enabled.sql", include_str!("../../migrations/012_project_enabled.sql")),
-    (13, "013_wiki_paths.sql", include_str!("../../migrations/013_wiki_paths.sql")),
-    (14, "014_cleanup_statuses.sql", include_str!("../../migrations/014_cleanup_statuses.sql")),
-    (15, "015_phase_execution_mode.sql", include_str!("../../migrations/015_phase_execution_mode.sql")),
-    (16, "016_step_agent_id.sql", include_str!("../../migrations/016_step_agent_id.sql")),
-    (17, "017_clawket_rename.sql", include_str!("../../migrations/017_clawket_rename.sql")),
 ];
 
 pub struct Db {

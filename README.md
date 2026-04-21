@@ -32,7 +32,7 @@ cd rust
 cargo run -- --port 0
 ```
 
-Cross-compiled release artifacts are produced by `.github/workflows/release.yml` on tag push.
+Cross-compiled release artifacts are produced by `.github/workflows/release.yml` on push to `main` (auto-bumps version from conventional commits, then builds and publishes to GitHub Releases).
 
 ## License
 
