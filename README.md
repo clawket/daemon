@@ -1,15 +1,23 @@
-# @clawket/daemon
+# clawketd
 
-State layer daemon for [Clawket](https://github.com/clawket/clawket). Hono HTTP server backed by `better-sqlite3` + `sqlite-vec` for local RAG.
+State-layer daemon for [Clawket](https://github.com/clawket/clawket). Axum HTTP server backed by `rusqlite` + `sqlite-vec` for local RAG. Embeddings via `candle-core` + all-MiniLM-L6-v2.
 
 ## Install
 
-The daemon is distributed as a tarball on [GitHub Releases](https://github.com/clawket/daemon/releases). In practice, the [`clawket` Claude Code plugin](https://github.com/clawket/clawket) downloads and wires up the daemon for you; the sections below are for running it standalone.
+The daemon is distributed as a platform-specific binary on [GitHub Releases](https://github.com/clawket/daemon/releases). In practice, the [`clawket` Claude Code plugin](https://github.com/clawket/clawket) downloads and wires up the daemon for you; the sections below are for running it standalone.
+
+Supported targets:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
 
 On first run, the daemon:
+
 - writes its port to `$XDG_CACHE_HOME/clawket/clawketd.port`
-- creates the SQLite DB under `$XDG_DATA_HOME/clawket/clawket.db`
-- applies pending migrations
+- creates the SQLite DB under `$XDG_DATA_HOME/clawket/db.sqlite`
+- applies pending migrations (embedded in the binary)
 
 ## Consumed by
 
@@ -20,13 +28,11 @@ On first run, the daemon:
 ## Development
 
 ```sh
-pnpm install
-pnpm start            # runs bin/clawketd.js
+cd rust
+cargo run -- --port 0
 ```
 
-## Rust migration
-
-A Rust rewrite is in progress in this repo and will eventually replace the Node.js implementation. Releases will continue to ship from this repository; tags bind to whichever implementation is current at release time.
+Cross-compiled release artifacts are produced by `.github/workflows/release.yml` on tag push.
 
 ## License
 

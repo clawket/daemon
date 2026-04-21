@@ -7,24 +7,29 @@ on:
     branches: [main]
 
 jobs:
-  build:
+  rust-build:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          version: 9
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - name: Smoke test (start and stop)
+          workspaces: rust
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
+      - name: Smoke (start/stop)
+        shell: bash
         run: |
-          node bin/clawketd.js &
+          DB_PATH=$(mktemp -d)/test.sqlite
+          target/debug/clawketd --db "$DB_PATH" --port 0 &
           PID=$!
           sleep 3
           kill $PID || true

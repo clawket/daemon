@@ -6,24 +6,80 @@ on:
       - 'v*'
 
 jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install cross toolchain (Linux aarch64)
+        if: matrix.cross == true
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Configure cross linker
+        if: matrix.cross == true
+        run: |
+          mkdir -p ~/.cargo
+          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> ~/.cargo/config.toml
+      - name: Build release
+        env:
+          CARGO_TERM_COLOR: always
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          NAME="clawketd-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          cp "target/${{ matrix.target }}/release/clawketd" "dist/$NAME/"
+          cp ../LICENSE "dist/$NAME/" 2>/dev/null || true
+          tar -C dist -czvf "$NAME.tar.gz" "$NAME"
+          shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clawketd-${{ matrix.target }}
+          path: |
+            rust/clawketd-*.tar.gz
+            rust/clawketd-*.tar.gz.sha256
+
   publish:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/download-artifact@v4
         with:
-          version: 9
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - name: Package source tarball
-        run: tar -czvf clawket-daemon-${GITHUB_REF_NAME}.tar.gz bin src migrations package.json README.md LICENSE
+          path: artifacts
+          pattern: clawketd-*
+          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            clawket-daemon-*.tar.gz
+            artifacts/clawketd-*.tar.gz
+            artifacts/clawketd-*.tar.gz.sha256
           generate_release_notes: true
