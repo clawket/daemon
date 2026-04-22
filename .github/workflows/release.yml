@@ -71,12 +71,19 @@ jobs:
           # ci/docs/chore/refactor/test/style/build commits do not release.
           BUMP="${{ inputs.bump }}"
           if [ -z "$BUMP" ]; then
-            if git log $RANGE --format='%B' | grep -qE '^BREAKING CHANGE:' \
-               || git log $RANGE --format='%s' | grep -qE '^[a-z]+(\(.+\))?!:'; then
+            # Capture log output into variables first. Piping `git log | grep -q`
+            # under `set -o pipefail` is a trap: grep -q closes stdin on first
+            # match, git log then dies with SIGPIPE (141), pipefail propagates
+            # that as the pipeline exit, and the conditional treats the elif
+            # branch as false. Here-strings sidestep the pipe entirely.
+            SUBJECTS=$(git log $RANGE --format='%s')
+            BODIES=$(git log $RANGE --format='%B')
+            if grep -qE '^BREAKING CHANGE:' <<< "$BODIES" \
+               || grep -qE '^[a-z]+(\(.+\))?!:' <<< "$SUBJECTS"; then
               BUMP=major
-            elif git log $RANGE --format='%s' | grep -qE '^feat(\(.+\))?:'; then
+            elif grep -qE '^feat(\(.+\))?:' <<< "$SUBJECTS"; then
               BUMP=minor
-            elif git log $RANGE --format='%s' | grep -qE '^(fix|perf)(\(.+\))?:'; then
+            elif grep -qE '^(fix|perf)(\(.+\))?:' <<< "$SUBJECTS"; then
               BUMP=patch
             else
               echo "should_release=false" >> "$GITHUB_OUTPUT"
