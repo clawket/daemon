@@ -144,12 +144,11 @@ fn resolve_web_dir() -> Option<PathBuf> {
             // Installed layout: bin next to web/.
             candidates.push(exe_dir.join("web"));
             candidates.push(exe_dir.join("../web"));
-            // Dev layouts. target/{release,debug}/clawketd → clawket/web/dist lives 4
-            // levels up (exe_dir=target/release → ../.. = crate root, ../../.. = parent
-            // repo dir, ../../../.. = clawket workspace root where web/ lives).
+            // Dev layouts. target/{release,debug}/clawketd → clawket/web/dist lives 3
+            // levels up (exe_dir=target/release → ../.. = crate root = daemon repo,
+            // ../../.. = clawket workspace root where sibling web/ lives).
             candidates.push(exe_dir.join("../../web/dist"));
             candidates.push(exe_dir.join("../../../web/dist"));
-            candidates.push(exe_dir.join("../../../../web/dist"));
         }
     }
     if let Ok(cwd) = env::current_dir() {

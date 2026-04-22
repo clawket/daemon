@@ -4,4 +4,4 @@
 *.sqlite-wal
 *.sqlite-shm
 web/
-rust/target/
+target/

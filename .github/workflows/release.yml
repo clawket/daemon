@@ -9,7 +9,8 @@ name: Release
 #     `contents: write` + `pull_requests: write` 권한
 #
 # Assumptions:
-#   - Rust crate lives at `rust/` with a single [[bin]] whose name matches the asset prefix.
+#   - Cargo.toml lives at the repo root.
+#   - Single [[bin]] or [package] whose name matches the asset prefix.
 #   - Tag format: v${version}
 #   - Plugin manifest key is the repo name (e.g. `daemon`, `cli`).
 
@@ -44,8 +45,6 @@ jobs:
           token: ${{ secrets.CLAWKET_RELEASE_PAT }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - name: Install cargo-edit
         run: cargo install cargo-edit --locked
       - name: Configure Git
@@ -87,18 +86,16 @@ jobs:
           fi
           echo "Selected bump: $BUMP"
 
-          cd rust
           cargo set-version --bump "$BUMP"
           VERSION=$(cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import sys, json; print(json.load(sys.stdin)["packages"][0]["version"])')
-          cd ..
 
           TAG="v$VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "should_release=true" >> "$GITHUB_OUTPUT"
 
-          git add rust/Cargo.toml rust/Cargo.lock
+          git add Cargo.toml Cargo.lock
           git commit -m "chore: release $TAG [skip ci]"
           git tag "$TAG" -m "Release $TAG"
           # Atomic push: main and tag succeed together, or neither.
@@ -121,9 +118,6 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
-    defaults:
-      run:
-        working-directory: rust
     steps:
       - uses: actions/checkout@v5
         with:
@@ -132,8 +126,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - name: Install cross toolchain (Linux aarch64)
         if: matrix.cross == true
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
@@ -164,15 +156,15 @@ jobs:
           NAME="${BIN}-${TAG}-${TARGET}"
           mkdir -p "dist/$NAME"
           cp "target/${TARGET}/release/${BIN}" "dist/$NAME/"
-          cp ../LICENSE "dist/$NAME/" 2>/dev/null || true
+          cp LICENSE "dist/$NAME/" 2>/dev/null || true
           tar -C dist -czvf "${NAME}.tar.gz" "$NAME"
           shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
       - uses: actions/upload-artifact@v6
         with:
           name: dist-${{ matrix.target }}
           path: |
-            rust/*.tar.gz
-            rust/*.tar.gz.sha256
+            *.tar.gz
+            *.tar.gz.sha256
 
   publish:
     needs: [bump, build]

@@ -377,10 +377,10 @@ async fn smoke_dashboard_picks_up_project_by_cwd() {
 // Skipped when the MCP binary isn't available in the release workspace.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smoke_mcp_rag_tools_list() {
-    // The MCP binary lives in ../../mcp/rust — built separately. Best effort here.
+    // The MCP binary lives in ../mcp/rust — built separately. Best effort here.
     let candidates = [
-        "../../mcp/rust/target/release/clawket-mcp-rs",
-        "../../mcp/rust/target/debug/clawket-mcp-rs",
+        "../mcp/rust/target/release/clawket-mcp-rs",
+        "../mcp/rust/target/debug/clawket-mcp-rs",
     ];
     let bin = candidates.iter().find(|p| std::path::Path::new(p).is_file());
     let bin = match bin {

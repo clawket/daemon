@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
-    (1, "001_initial.sql", include_str!("../../migrations/001_initial.sql")),
+    (1, "001_initial.sql", include_str!("../migrations/001_initial.sql")),
 ];
 
 pub struct Db {
