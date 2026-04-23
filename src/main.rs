@@ -117,38 +117,44 @@ async fn run_daemon(args: StartArgs) -> Result<()> {
 
     tokio::spawn(backfill_missing_embeddings(app_state.clone()));
 
-    let shutdown_token = tokio_util_cancel::CancelToken::new();
-    let shutdown_tcp = shutdown_token.child();
-    let shutdown_unix = shutdown_token.child();
+    // watch channel is level-triggered: a listener that calls `wait_for` after
+    // the signal has already been sent still observes it. `tokio::sync::Notify`
+    // would be edge-triggered — if cancel() ran before the graceful_shutdown
+    // future registered its waiter, SIGTERM would be lost and the daemon would
+    // hang forever, manifesting as a `clawket daemon restart` timeout.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_tcp = shutdown_rx.clone();
+    let shutdown_unix = shutdown_rx.clone();
 
-    let signal_task = tokio::spawn({
-        let token = shutdown_token.clone();
-        async move {
-            let ctrl_c = async {
-                let _ = tokio::signal::ctrl_c().await;
-            };
-            #[cfg(unix)]
-            let terminate = async {
-                use tokio::signal::unix::{signal, SignalKind};
-                if let Ok(mut sig) = signal(SignalKind::terminate()) {
-                    sig.recv().await;
-                }
-            };
-            #[cfg(not(unix))]
-            let terminate = std::future::pending::<()>();
-            tokio::select! {
-                _ = ctrl_c => {},
-                _ = terminate => {},
+    let signal_task = tokio::spawn(async move {
+        let ctrl_c = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        #[cfg(unix)]
+        let terminate = async {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut sig) = signal(SignalKind::terminate()) {
+                sig.recv().await;
             }
-            tracing::info!("shutdown signal received");
-            token.cancel();
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
         }
+        tracing::info!("shutdown signal received");
+        let _ = shutdown_tx.send(true);
     });
 
-    let tcp_fut = axum::serve(tcp_listener, app.clone())
-        .with_graceful_shutdown(async move { shutdown_tcp.wait().await });
-    let unix_fut = axum::serve(unix_listener, app)
-        .with_graceful_shutdown(async move { shutdown_unix.wait().await });
+    let tcp_fut = axum::serve(tcp_listener, app.clone()).with_graceful_shutdown(async move {
+        let mut rx = shutdown_tcp;
+        let _ = rx.wait_for(|v| *v).await;
+    });
+    let unix_fut = axum::serve(unix_listener, app).with_graceful_shutdown(async move {
+        let mut rx = shutdown_unix;
+        let _ = rx.wait_for(|v| *v).await;
+    });
 
     let port_file = paths_cfg.port_file.clone();
     let pid_file = paths_cfg.pid_file.clone();
@@ -366,34 +372,6 @@ async fn backfill_missing_embeddings(state: AppState) {
         }
     }
     tracing::info!(done, failed, "backfill complete");
-}
-
-mod tokio_util_cancel {
-    use std::sync::Arc;
-    use tokio::sync::Notify;
-
-    #[derive(Clone)]
-    pub struct CancelToken {
-        inner: Arc<Notify>,
-    }
-
-    impl CancelToken {
-        pub fn new() -> Self {
-            Self { inner: Arc::new(Notify::new()) }
-        }
-
-        pub fn child(&self) -> Self {
-            self.clone()
-        }
-
-        pub fn cancel(&self) {
-            self.inner.notify_waiters();
-        }
-
-        pub async fn wait(&self) {
-            self.inner.notified().await;
-        }
-    }
 }
 
 // Minimal libc bindings for kill(2); avoids pulling in the libc crate for one syscall.
