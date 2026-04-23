@@ -173,6 +173,7 @@ pub struct ListFilter<'a> {
     pub plan_id: Option<&'a str>,
     pub status: Option<&'a str>,
     pub cycle_id: Option<&'a str>,
+    pub no_cycle: bool,
     pub assignee: Option<&'a str>,
     pub agent_id: Option<&'a str>,
     pub parent_task_id: Option<Option<&'a str>>,
@@ -198,6 +199,8 @@ pub fn list(conn: &Connection, filter: ListFilter<'_>) -> Result<Vec<Task>> {
     if let Some(c) = filter.cycle_id {
         clauses.push("s.cycle_id = ?".into());
         vals.push(c.to_string().into());
+    } else if filter.no_cycle {
+        clauses.push("s.cycle_id IS NULL".into());
     }
     if let Some(a) = filter.assignee {
         clauses.push("s.assignee = ?".into());

@@ -4,8 +4,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use crate::models::TaskComment;
-use crate::repo::comments;
-use crate::routes::error::{json_or_404, ApiResult};
+use crate::repo::{comments, tasks};
+use crate::routes::error::{json_or_404, ApiError, ApiResult};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -18,7 +18,9 @@ async fn list(
     State(app): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<TaskComment>>> {
-    Ok(Json(comments::list(&app.conn(), &id)?))
+    let conn = app.conn();
+    let task = tasks::get(&conn, &id)?.ok_or_else(|| ApiError::not_found("Task not found"))?;
+    Ok(Json(comments::list(&conn, &task.id)?))
 }
 
 #[derive(Deserialize)]
@@ -32,7 +34,9 @@ async fn create(
     Path(id): Path<String>,
     Json(body): Json<CreateBody>,
 ) -> ApiResult<Json<TaskComment>> {
-    json_or_404(comments::create(&app.conn(), &id, &body.author, &body.body)?)
+    let conn = app.conn();
+    let task = tasks::get(&conn, &id)?.ok_or_else(|| ApiError::not_found("Task not found"))?;
+    json_or_404(comments::create(&conn, &task.id, &body.author, &body.body)?)
 }
 
 async fn delete_one(

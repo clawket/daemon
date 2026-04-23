@@ -40,13 +40,18 @@ async fn list(State(app): State<AppState>, Query(q): Query<ListQuery>) -> ApiRes
         .parent_task_id
         .as_deref()
         .map(|s| if s == "null" { None } else { Some(s) });
+    let (cycle_id_filter, no_cycle) = match q.cycle_id.as_deref() {
+        Some("null") | Some("") => (None, true),
+        other => (other, false),
+    };
     Ok(Json(tasks::list(
         &app.conn(),
         tasks::ListFilter {
             unit_id: q.unit_id.as_deref(),
             plan_id: q.plan_id.as_deref(),
             status: q.status.as_deref(),
-            cycle_id: q.cycle_id.as_deref(),
+            cycle_id: cycle_id_filter,
+            no_cycle,
             assignee: q.assignee.as_deref(),
             agent_id: q.agent_id.as_deref(),
             parent_task_id: parent,
@@ -266,7 +271,24 @@ async fn update(
         .as_object()
         .map(|o| o.contains_key("title") || o.contains_key("body"))
         .unwrap_or(false);
+    // Sidecar: `_comment` attaches a comment in the same request for audit-trail parity.
+    // Author precedence: explicit `_author` > `assignee` in the PATCH body > `_agent` hook marker > "main".
+    let sidecar_comment = body
+        .get("_comment")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_owned);
+    let sidecar_author = body
+        .get("_author")
+        .and_then(Value::as_str)
+        .or_else(|| body.get("assignee").and_then(Value::as_str))
+        .or_else(|| body.get("_agent").and_then(Value::as_str))
+        .unwrap_or("main")
+        .to_owned();
     let updated = tasks::update(&mut conn, &id, parse_update(&body)?)?;
+    if let (Some(text), Some(task)) = (sidecar_comment.as_deref(), updated.as_ref()) {
+        comments::create(&conn, &task.id, &sidecar_author, text)?;
+    }
     drop(conn);
     if let Some(t) = &updated {
         app.emit("task:updated", serde_json::json!({ "id": t.id }));
