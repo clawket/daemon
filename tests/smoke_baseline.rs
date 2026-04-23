@@ -438,66 +438,6 @@ async fn smoke_mcp_rag_tools_list() {
     }
 }
 
-// U7-T6: legacy lattice→clawket DB migration. Spawns daemon with a fake legacy DB
-// under $XDG_DATA_HOME/lattice/db.sqlite and verifies it's copied into the clawket path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn smoke_legacy_lattice_migration() {
-    let tmp = tempfile::tempdir().unwrap();
-    let xdg_data = tmp.path().join("xdg-data");
-    let legacy = xdg_data.join("lattice");
-    std::fs::create_dir_all(&legacy).unwrap();
-    let legacy_db = legacy.join("db.sqlite");
-
-    // Create a sentinel file that contains the SQLite magic so the daemon accepts it
-    // as a fresh DB on open. Using rusqlite would be cleaner but we don't depend on it
-    // from tests; writing an empty file is enough to trigger the copy path, and the
-    // daemon will then initialize the empty file as a new DB on first open.
-    std::fs::write(&legacy_db, b"").unwrap();
-
-    let bin = env!("CARGO_BIN_EXE_clawketd");
-    let cache_dir = tmp.path().join("cache");
-    std::fs::create_dir_all(&cache_dir).unwrap();
-    // Point CLAWKET_DATA_DIR explicitly so the migration knows the target,
-    // but keep XDG_DATA_HOME set so migrate_legacy_data sees the legacy path.
-    let data_dir = tmp.path().join("clawket-data");
-    let child = Command::new(bin)
-        .arg("--port")
-        .arg("0")
-        .env("CLAWKET_DATA_DIR", &data_dir)
-        .env("CLAWKET_CACHE_DIR", &cache_dir)
-        .env("CLAWKET_CONFIG_DIR", tmp.path().join("config"))
-        .env("CLAWKET_STATE_DIR", tmp.path().join("state"))
-        .env("XDG_DATA_HOME", &xdg_data)
-        .env("CLAWKETD_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn clawketd");
-    let mut child = child;
-
-    // Wait for port file to confirm boot.
-    let port_file = cache_dir.join("clawketd.port");
-    let mut ready = false;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if port_file.is_file() {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "daemon did not boot");
-
-    // Legacy db should have been renamed with .migrated-to-clawket suffix,
-    // and clawket db should now exist.
-    assert!(
-        legacy.join("db.sqlite.migrated-to-clawket").is_file(),
-        "legacy db should be renamed with .migrated-to-clawket suffix"
-    );
-    assert!(
-        data_dir.join("db.sqlite").is_file(),
-        "clawket db should exist after migration"
-    );
-
-    let _ = child.kill();
-    let _ = child.wait();
-}
+// Legacy lattice→clawket migration was removed. Clawket now treats every install
+// as a fresh start and only emits a stderr warning when legacy data is detected.
+// See paths::warn_legacy_data.

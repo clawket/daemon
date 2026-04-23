@@ -71,14 +71,14 @@ impl Paths {
             std::fs::create_dir_all(p)
                 .with_context(|| format!("failed to create directory: {}", p.display()))?;
         }
-        self.migrate_legacy_data();
+        self.warn_legacy_data();
         Ok(())
     }
 
-    // Migrate data from legacy Lattice paths (pre-rebrand) to Clawket paths.
-    // Only runs when legacy db.sqlite exists and current db does not. The legacy
-    // file is renamed with a `.migrated-to-clawket` suffix to avoid re-migration.
-    fn migrate_legacy_data(&self) {
+    // Detect a pre-rebrand Lattice data directory and print a one-shot warning.
+    // Migration is intentionally NOT performed: the schema has moved too far across
+    // versions, so Clawket treats every install as a fresh start.
+    fn warn_legacy_data(&self) {
         const LEGACY_APP: &str = "lattice";
         let legacy_base = if let Some(p) = env::var_os("XDG_DATA_HOME") {
             PathBuf::from(p)
@@ -89,42 +89,19 @@ impl Paths {
         };
         let legacy_db = legacy_base.join(LEGACY_APP).join("db.sqlite");
 
-        if !legacy_db.exists() || self.db.exists() {
-            return;
-        }
-
-        if let Some(parent) = self.db.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!(
-                    "[clawket] WARNING: failed to create {}: {}",
-                    parent.display(),
-                    e
-                );
-                return;
-            }
-        }
-
-        if let Err(e) = std::fs::copy(&legacy_db, &self.db) {
-            eprintln!(
-                "[clawket] WARNING: failed to migrate legacy database: {}",
-                e
-            );
-            return;
-        }
-
-        let marker = legacy_db.with_extension("sqlite.migrated-to-clawket");
-        if let Err(e) = std::fs::rename(&legacy_db, &marker) {
-            eprintln!(
-                "[clawket] WARNING: migrated DB copied but failed to rename legacy: {}",
-                e
-            );
+        if !legacy_db.exists() {
             return;
         }
 
         eprintln!(
-            "[clawket] Migrated database from {} -> {}",
-            legacy_db.display(),
-            self.db.display()
+            "[clawket] WARNING: legacy lattice data detected at {}",
+            legacy_db.display()
+        );
+        eprintln!(
+            "[clawket] WARNING: migration is NOT supported — schema changed too much across versions."
+        );
+        eprintln!(
+            "[clawket] WARNING: Clawket treats every install as a fresh start. Remove the legacy directory manually if you no longer need it."
         );
     }
 }
