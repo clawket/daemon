@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::models::{Plan, Project, Task, Unit};
-use crate::repo::{plans, projects, questions, runs, tasks, units};
+use crate::repo::{cycles, plans, projects, questions, runs, tasks, units};
 use crate::routes::error::ApiResult;
 use crate::state::AppState;
 
@@ -108,6 +108,30 @@ async fn dashboard(
         .cloned()
         .unwrap_or_else(|| visible_plans[0].clone());
 
+    // Active cycle (project-scoped). Surfaced before plan list because cycle is
+    // the time-boxed execution container the user is currently inside.
+    let active_cycle = cycles::list(
+        &conn,
+        cycles::ListFilter {
+            project_id: Some(&project.id),
+            status: Some("active"),
+        },
+    )?
+    .into_iter()
+    .next();
+    if let Some(cycle) = &active_cycle {
+        lines.push(format!(
+            "## Active Cycle: {} ({})",
+            cycle.title, cycle.id
+        ));
+        if let Some(goal) = cycle.goal.as_deref().filter(|s| !s.is_empty()) {
+            let snippet: String = goal.chars().take(200).collect();
+            let suffix = if goal.chars().count() > 200 { "…" } else { "" };
+            lines.push(format!("  Goal: {snippet}{suffix}"));
+        }
+        lines.push(String::new());
+    }
+
     for plan in &visible_plans {
         let is_active = plan.id == active_plan.id;
         lines.push(format!(
@@ -127,7 +151,22 @@ async fn dashboard(
         )?;
 
         let visible_units: Vec<&Unit> = match show {
-            "active" => all_units.iter().filter(|u| u.status == "active").collect(),
+            // Unit has no "active" status (pure grouping entity per project rules).
+            // Interpret show=active as "units containing in_progress tasks".
+            "active" => all_units
+                .iter()
+                .filter(|u| {
+                    tasks::list(
+                        &conn,
+                        tasks::ListFilter {
+                            unit_id: Some(&u.id),
+                            ..Default::default()
+                        },
+                    )
+                    .map(|ts| ts.iter().any(|t| t.status == "in_progress"))
+                    .unwrap_or(false)
+                })
+                .collect(),
             "next" => {
                 let active_idx = all_units.iter().position(|u| u.status == "active");
                 let next_pending_id = active_idx.and_then(|idx| {
