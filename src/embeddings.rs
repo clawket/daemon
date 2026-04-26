@@ -9,7 +9,6 @@ use std::sync::Arc;
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 use tokio::sync::Mutex;
 
-pub const EMBEDDING_DIM: usize = 384;
 const MODEL_REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
 const MAX_CHARS: usize = 2000;
 const MAX_TOKENS: usize = 256;

@@ -30,6 +30,12 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# Opt newer JS-action runtimes into Node 24 ahead of the 2026-09-16 forced cutover.
+# Removes "Node.js 20 actions are deprecated" annotations from
+# actions/{download,upload}-artifact and softprops/action-gh-release.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   bump:
     if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}

@@ -18,7 +18,6 @@ pub struct ParsedTask {
 pub struct ParsedUnit {
     pub idx: i64,
     pub title: String,
-    pub body: String,
     pub tasks: Vec<ParsedTask>,
 }
 
@@ -67,7 +66,6 @@ pub fn parse_plan_markdown(md: &str) -> ParsedPlan {
         plan.units.push(ParsedUnit {
             idx: 0,
             title: "Unit 1".to_string(),
-            body: lines.join("\n").trim().to_string(),
             tasks: extract_tasks_from_body(&lines, 0, lines.len()),
         });
     } else {
@@ -80,7 +78,6 @@ pub fn parse_plan_markdown(md: &str) -> ParsedPlan {
             plan.units.push(ParsedUnit {
                 idx: p as i64,
                 title: title.clone(),
-                body: lines[*line_idx..end].join("\n").trim().to_string(),
                 tasks: extract_tasks_from_body(&lines, *line_idx + 1, end),
             });
         }
@@ -91,8 +88,8 @@ pub fn parse_plan_markdown(md: &str) -> ParsedPlan {
 
 fn extract_tasks_from_body(lines: &[&str], start: usize, end: usize) -> Vec<ParsedTask> {
     let mut h3: Vec<(usize, String)> = Vec::new();
-    for i in start..end {
-        if let Some(caps) = H3_RE.captures(lines[i]) {
+    for (i, line) in lines.iter().enumerate().take(end).skip(start) {
+        if let Some(caps) = H3_RE.captures(line) {
             h3.push((i, caps[1].trim().to_string()));
         }
     }
@@ -135,11 +132,11 @@ fn extract_tasks_from_body(lines: &[&str], start: usize, end: usize) -> Vec<Pars
 
 fn gather_continuation(lines: &[&str], from: usize, end: usize) -> String {
     let mut out: Vec<&str> = Vec::new();
-    for i in from..end {
-        if HEADING_ANY_RE.is_match(lines[i]) || NUMBERED_START_RE.is_match(lines[i]) {
+    for line in lines.iter().take(end).skip(from) {
+        if HEADING_ANY_RE.is_match(line) || NUMBERED_START_RE.is_match(line) {
             break;
         }
-        out.push(lines[i]);
+        out.push(line);
     }
     out.join("\n")
 }

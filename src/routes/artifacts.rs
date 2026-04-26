@@ -236,11 +236,8 @@ fn schedule_embed(app: AppState, art: &Artifact) {
     let id = art.id.clone();
     let source = format!("{}\n{}", art.title, art.content);
     tokio::spawn(async move {
-        match embeddings::embed(&source).await {
-            Ok(Some(vec)) => {
-                let _ = artifacts::store_embedding(&app.conn(), &id, &vec);
-            }
-            _ => {}
+        if let Ok(Some(vec)) = embeddings::embed(&source).await {
+            let _ = artifacts::store_embedding(&app.conn(), &id, &vec);
         }
     });
 }
