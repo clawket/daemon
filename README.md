@@ -22,13 +22,14 @@ On first run, the daemon:
 ## Consumed by
 
 - `clawket` CLI — discovers the daemon via the port file, communicates over HTTP.
-- `@clawket/web` — React dashboard, served statically under `/` (built artifact bundled into `web/`).
-- `@clawket/mcp` — read-only MCP tools that hit the daemon's search endpoints.
+- `clawket mcp` — the embedded MCP stdio server inside the same `clawket` binary; hits the daemon's read-only search endpoints over HTTP.
+- `@clawket/web` — React dashboard, served statically under `/` (built artifact bundled into `web/dist/`).
+
+> The legacy `@clawket/mcp` Node stdio server is no longer in the chain — replaced by the embedded `clawket mcp` in plugin v2.3.2 and scheduled for archive in plugin v11 U4.
 
 ## Development
 
 ```sh
-cd rust
 cargo run -- --port 0
 ```
 
