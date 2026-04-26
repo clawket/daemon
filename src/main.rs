@@ -159,15 +159,51 @@ async fn run_daemon(args: StartArgs) -> Result<()> {
     let port_file = paths_cfg.port_file.clone();
     let pid_file = paths_cfg.pid_file.clone();
     let socket_file = paths_cfg.socket.clone();
-    let tcp_task = async move { tcp_fut.await };
-    let unix_task = async move { unix_fut.await };
-    let result = tokio::try_join!(tcp_task, unix_task);
-    let _ = signal_task.await;
-    paths::remove_port_file(&port_file);
-    paths::remove_pid_file(&pid_file);
-    paths::remove_socket_file(&socket_file);
-    result?;
+
+    // axum's with_graceful_shutdown only stops accepting NEW connections; it
+    // waits for existing keep-alive connections to close naturally. A single
+    // long-lived client (web dashboard tab, sticky proxy) blocks shutdown
+    // indefinitely. After the shutdown signal fires we give in-flight requests
+    // a short grace window and then force-exit. Clients can reconnect on the
+    // next start; preserving a wedged shutdown is worse than dropping a
+    // late-arriving response.
+    let serve = async move { tokio::try_join!(tcp_fut, unix_fut) };
+    let force_exit_after_grace = async move {
+        let mut rx = shutdown_rx;
+        let _ = rx.wait_for(|v| *v).await;
+        tokio::time::sleep(force_exit_grace()).await;
+    };
+
+    tokio::select! {
+        res = serve => {
+            let _ = signal_task.await;
+            paths::remove_port_file(&port_file);
+            paths::remove_pid_file(&pid_file);
+            paths::remove_socket_file(&socket_file);
+            res?;
+        }
+        _ = force_exit_after_grace => {
+            tracing::warn!(
+                "graceful shutdown grace period expired; forcing exit (clients holding keep-alive)"
+            );
+            paths::remove_port_file(&port_file);
+            paths::remove_pid_file(&pid_file);
+            paths::remove_socket_file(&socket_file);
+            std::process::exit(0);
+        }
+    }
     Ok(())
+}
+
+/// Maximum time to wait for in-flight HTTP requests to drain after a shutdown
+/// signal before forcing process exit. Override with CLAWKETD_SHUTDOWN_GRACE_MS
+/// (used by integration tests to keep total runtime bounded).
+fn force_exit_grace() -> Duration {
+    std::env::var("CLAWKETD_SHUTDOWN_GRACE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(3))
 }
 
 /// Bind a TCP listener on `host:port`. If `port == 0`, OS picks a random port.
