@@ -31,6 +31,10 @@ impl DaemonHandle {
             .env("CLAWKET_CACHE_DIR", &cache_dir)
             .env("CLAWKET_CONFIG_DIR", tmpdir.path().join("config"))
             .env("CLAWKET_STATE_DIR", tmpdir.path().join("state"))
+            // Pin to a nonexistent path so resolve_web_dir() can't fall back
+            // to a sibling workspace web/dist (test was failing when run from
+            // a tree that already had web/ built).
+            .env("CLAWKET_WEB_DIR", tmpdir.path().join("no-web"))
             .env("CLAWKETD_LOG", "warn")
             .stdout(Stdio::null())
             .stderr(Stdio::null())

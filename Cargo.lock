@@ -393,6 +393,7 @@ dependencies = [
  "clap",
  "futures",
  "hf-hub",
+ "libc",
  "once_cell",
  "rand 0.8.6",
  "regex",
