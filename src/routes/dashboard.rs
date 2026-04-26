@@ -210,14 +210,10 @@ async fn dashboard(
                 lines.push(format!("  Progress: {}/{}", done_count, all_tasks.len()));
             }
 
-            let non_done: Vec<&Task> = all_tasks.iter().filter(|t| t.status != "done").collect();
-            let tasks_to_show: &[&Task] = if unit.status == "completed" {
-                &non_done
-            } else {
-                &non_done
-            };
+            let tasks_to_show: Vec<&Task> =
+                all_tasks.iter().filter(|t| t.status != "done").collect();
 
-            for task in tasks_to_show {
+            for task in &tasks_to_show {
                 let icon = match task.status.as_str() {
                     "todo" => "[ ]",
                     "in_progress" => "[>]",

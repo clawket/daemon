@@ -1,7 +1,7 @@
 use crate::id::{new_id, now_ms};
 use crate::models::TaskRelation;
 use anyhow::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 
 pub fn create(
     conn: &Connection,
@@ -23,18 +23,6 @@ pub fn create(
         relation_type: relation_type.to_string(),
         created_at: ts,
     })
-}
-
-pub fn get(conn: &Connection, id: &str) -> Result<Option<TaskRelation>> {
-    let r = conn
-        .query_row(
-            "SELECT id, source_task_id, target_task_id, relation_type, created_at
-             FROM task_relations WHERE id = ?1",
-            params![id],
-            map_rel,
-        )
-        .optional()?;
-    Ok(r)
 }
 
 #[derive(Default)]

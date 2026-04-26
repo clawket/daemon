@@ -18,14 +18,6 @@ pub fn norm_opt(s: Option<String>) -> Option<String> {
     })
 }
 
-pub fn norm_str(s: &str) -> Option<&str> {
-    if s.trim().is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
-
 pub fn value_to_opt_string(v: &Value) -> Option<String> {
     match v {
         Value::Null => None,

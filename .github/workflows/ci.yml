@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# Opt newer JS-action runtimes into Node 24 ahead of the 2026-09-16 forced cutover.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   rust-build:
     strategy:

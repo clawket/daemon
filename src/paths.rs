@@ -29,8 +29,6 @@ pub struct Paths {
     pub port_file: PathBuf,
     pub pid_file: PathBuf,
     pub socket: PathBuf,
-    pub log_file: PathBuf,
-    pub config_file: PathBuf,
     pub web_dir: Option<PathBuf>,
 }
 
@@ -54,8 +52,6 @@ impl Paths {
         Ok(Self {
             port_file: cache.join("clawketd.port"),
             pid_file: cache.join("clawketd.pid"),
-            log_file: state.join("clawketd.log"),
-            config_file: config.join("config.toml"),
             socket,
             data,
             cache,
@@ -134,12 +130,7 @@ fn resolve_web_dir() -> Option<PathBuf> {
         candidates.push(cwd.join("../../web/dist"));
     }
 
-    for c in candidates {
-        if c.join("index.html").is_file() {
-            return Some(c);
-        }
-    }
-    None
+    candidates.into_iter().find(|c| c.join("index.html").is_file())
 }
 
 fn home_dir() -> Result<PathBuf> {
