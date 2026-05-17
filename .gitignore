@@ -3,5 +3,16 @@
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
-web/
 target/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
