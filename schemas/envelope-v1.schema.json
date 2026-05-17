@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://clawket.dev/schemas/envelope-v1.schema.json",
+  "title": "Execution Envelope (Clawket v11)",
+  "description": "19-field task contract attached to each clawket task. ADR-0001.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "intent",
+    "target_repo",
+    "success_criteria",
+    "verification_cmd",
+    "decomposition_policy",
+    "context_refs"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1,
+      "description": "Schema version. v1 only at M0 freeze. ADR-0011 owns forward-migration to v2+."
+    },
+    "intent": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "description": "One-paragraph statement of what this task changes and why. Markdown allowed."
+    },
+    "target_repo": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^([a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+|/.+|\\.{1,2}/.+|file:///.+)$",
+      "description": "Repository this task may mutate. <org>/<repo> for GitHub, or absolute/relative path for local."
+    },
+    "success_criteria": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512
+      },
+      "description": "Checkable outcomes. Each entry should be a link, command, or assertion."
+    },
+    "verification_cmd": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "description": "Single shell command. Exit 0 == success. Captured stdout/stderr attached to run."
+    },
+    "decomposition_policy": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^(atomic|tree\\(max_depth=[0-9]+\\)|linear\\(max_steps=[0-9]+\\)|custom\\(.+\\))$",
+      "description": "DSL per ADR-0004. atomic | tree(max_depth=N) | linear(max_steps=N) | custom(...)."
+    },
+    "context_refs": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "id"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["task", "artifact", "decision", "envelope", "run", "plan", "unit"]
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Z]+-[0-9A-HJKMNP-TV-Z]{26}$",
+            "description": "ULID-style identifier with type prefix."
+          },
+          "sha": {
+            "type": ["string", "null"],
+            "pattern": "^[0-9a-f]{40}$",
+            "description": "Optional git SHA pinning the referenced state."
+          }
+        }
+      },
+      "description": "Stable refs to artifacts/tasks/decisions the agent may consult. v1 schema per RL-U3-02."
+    },
+
+    "acceptance_criteria": {
+      "type": "array",
+      "default": [],
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512
+      },
+      "description": "Subset of success_criteria treated as gating-required (vs success_criteria as full set)."
+    },
+    "precondition": {
+      "type": ["string", "null"],
+      "default": null,
+      "maxLength": 1024,
+      "description": "Pre-run boolean DSL expression per RL-U2-05. null == always true."
+    },
+    "postcondition": {
+      "type": ["string", "null"],
+      "default": null,
+      "maxLength": 1024,
+      "description": "Post-run boolean DSL expression per RL-U2-05. null == verification_cmd exit 0."
+    },
+    "rollback_plan": {
+      "type": ["object", "null"],
+      "default": null,
+      "additionalProperties": false,
+      "properties": {
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+        },
+        "verify": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        }
+      },
+      "required": ["steps"],
+      "description": "Standard rollback format per RL-U2-08. null == no automated rollback."
+    },
+    "assigned_model": {
+      "type": ["string", "null"],
+      "default": null,
+      "enum": [null, "haiku", "sonnet", "opus", "claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"],
+      "description": "Declared model class for this task per ADR-0007. Declarative — runtime enforcement is via cycle.allowed_models, not at LLM-call layer. null == unspecified."
+    },
+    "retry_policy": {
+      "type": ["object", "null"],
+      "default": null,
+      "additionalProperties": false,
+      "properties": {
+        "max_attempts": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "backoff": { "type": "string", "enum": ["fixed", "linear", "exponential"] },
+        "jitter": { "type": "number", "minimum": 0, "maximum": 1 },
+        "checkpoint_interval": { "type": "string", "enum": ["per_turn", "per_file", "none"] }
+      },
+      "required": ["max_attempts", "backoff", "jitter", "checkpoint_interval"],
+      "description": "Retry behaviour per ADR-0008. null == defaults (3, exponential, 0.2, per_file)."
+    },
+    "secrets_ref": {
+      "type": "array",
+      "default": [],
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "lookup_order"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Z][A-Z0-9_]{0,127}$"
+          },
+          "lookup_order": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": ["user_config", "keyring", "env", "1password"]
+            }
+          }
+        }
+      },
+      "description": "Per-secret resolution chain per ADR-0009. Default order = [user_config, keyring, env, 1password]."
+    },
+    "planned_sha": {
+      "type": ["string", "null"],
+      "default": null,
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Git SHA captured at envelope sign time. null until first sign."
+    },
+    "superseded_by": {
+      "type": ["string", "null"],
+      "default": null,
+      "pattern": "^ENV-[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "Newer envelope id that supersedes this one (ADR-0011)."
+    },
+    "supersedes": {
+      "type": ["string", "null"],
+      "default": null,
+      "pattern": "^ENV-[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "Older envelope id this one supersedes (ADR-0011)."
+    },
+    "cross_project_rag": {
+      "type": "boolean",
+      "default": false,
+      "description": "Allow find_similar_tasks etc. to read across projects. Privacy default OFF per ADR-0010."
+    },
+    "flaky_quarantine_threshold": {
+      "type": "string",
+      "default": "2/3",
+      "pattern": "^[1-9][0-9]?/[1-9][0-9]?$",
+      "description": "M/N — quarantine after M failures over N runs. Provisional 2/3 per ADR-0012."
+    }
+  }
+}

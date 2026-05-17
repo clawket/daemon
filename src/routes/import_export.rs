@@ -6,16 +6,19 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::import_plan::{import_plan_file, ImportOptions, ImportResult};
-use crate::repo::{artifacts, projects};
+use crate::import_plan::{
+    import_parsed_plan, import_plan_file, parse_plan_strict, ImportOptions, ImportResult,
+};
+use crate::repo::{knowledge, projects};
 use crate::routes::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/plans/import", post(plans_import))
-        .route("/artifacts/import", post(artifacts_import))
-        .route("/artifacts/export", post(artifacts_export))
+        .route("/plans/import/strict", post(plans_import_strict))
+        .route("/knowledge/import", post(knowledge_import))
+        .route("/knowledge/export", post(knowledge_export))
 }
 
 #[derive(Deserialize)]
@@ -44,6 +47,72 @@ async fn plans_import(
             project_name: body.project.as_deref(),
             cwd: body.cwd.as_deref(),
             source,
+            source_path: None,
+            dry_run: body.dry_run,
+        },
+    )?;
+    Ok(Json(result))
+}
+
+// LM-260 / L1.1.a — strict-mode import gate.
+//
+// The hook (`adapters/claude/plan-sync.cjs`) shells through this route to
+// validate Plan Mode markdown. On 400 it surfaces line/column/kind/hint to
+// the user; on 200 with `dry_run=true` it follows up with a real import.
+//
+// Why a separate route: `/plans/import` reads from a file path on disk.
+// The hook receives markdown inline (or in `~/.claude/plans/`) and we do not
+// want every hook invocation to round-trip through the filesystem.
+
+#[derive(Deserialize)]
+struct StrictImportBody {
+    content: String,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default, rename = "dryRun")]
+    dry_run: bool,
+}
+
+async fn plans_import_strict(
+    State(app): State<AppState>,
+    Json(body): Json<StrictImportBody>,
+) -> ApiResult<Json<ImportResult>> {
+    if body.content.trim().is_empty() {
+        return Err(ApiError::bad_request("content required"));
+    }
+    let parsed = match parse_plan_strict(&body.content) {
+        Ok(p) => p,
+        Err(e) => {
+            // Surface as 400 with structured body so the hook can format
+            // a helpful message. The route never panics on parse error.
+            return Err(ApiError::bad_request_with_details(
+                "strict_format_violation",
+                json!({
+                    "line": e.line,
+                    "column": e.column,
+                    "kind": format!("{:?}", e.kind),
+                    "hint": e.hint,
+                }),
+            ));
+        }
+    };
+
+    // LM-264 / L1.2.d — wire the strict path through the same
+    // persistence as `/plans/import`. `source` is "strict-import" so
+    // the audit trail distinguishes hook-driven imports from the
+    // legacy file-based flow; `source_path` is `None` because the
+    // payload arrived inline.
+    let mut conn = app.conn();
+    let result = import_parsed_plan(
+        &mut conn,
+        parsed,
+        ImportOptions {
+            project_name: body.project.as_deref(),
+            cwd: body.cwd.as_deref(),
+            source: "strict-import",
+            source_path: None,
             dry_run: body.dry_run,
         },
     )?;
@@ -85,7 +154,7 @@ fn extract_title(content: &str, fallback: &str) -> String {
 }
 
 #[derive(Deserialize)]
-struct ArtifactImportBody {
+struct KnowledgeImportBody {
     cwd: String,
     #[serde(default)]
     plan_id: Option<String>,
@@ -93,18 +162,12 @@ struct ArtifactImportBody {
     unit_id: Option<String>,
     #[serde(default)]
     project_id: Option<String>,
-    #[serde(default = "default_scope")]
-    scope: String,
     #[serde(default)]
     dry_run: bool,
 }
 
-fn default_scope() -> String {
-    "reference".into()
-}
-
 #[derive(Serialize)]
-struct ArtifactImportItem {
+struct KnowledgeImportItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     path: String,
@@ -119,10 +182,10 @@ struct SkippedItem {
 }
 
 #[derive(Serialize)]
-struct ArtifactImportResult {
+struct KnowledgeImportResult {
     imported: usize,
     skipped: usize,
-    items: Vec<ArtifactImportItem>,
+    items: Vec<KnowledgeImportItem>,
     #[serde(rename = "skippedItems")]
     skipped_items: Vec<SkippedItem>,
     dry_run: bool,
@@ -131,11 +194,10 @@ struct ArtifactImportResult {
 struct ImportScanCtx<'a> {
     cwd: &'a Path,
     existing: &'a mut HashSet<String>,
-    imported: &'a mut Vec<ArtifactImportItem>,
+    imported: &'a mut Vec<KnowledgeImportItem>,
     skipped: &'a mut Vec<SkippedItem>,
     plan_id: Option<&'a str>,
     unit_id: Option<&'a str>,
-    scope: &'a str,
     dry_run: bool,
 }
 
@@ -191,16 +253,16 @@ fn scan_import_dir(
         }
 
         if ctx.dry_run {
-            ctx.imported.push(ArtifactImportItem {
+            ctx.imported.push(KnowledgeImportItem {
                 id: None,
                 path: rel,
                 title: title.clone(),
             });
         } else {
             let fmt = ext_of(&name);
-            let art = artifacts::create(
+            let art = knowledge::create(
                 conn,
-                artifacts::CreateInput {
+                knowledge::CreateInput {
                     task_id: None,
                     unit_id: ctx.unit_id,
                     plan_id: ctx.plan_id,
@@ -209,11 +271,10 @@ fn scan_import_dir(
                     content: Some(&content),
                     content_format: Some(fmt),
                     parent_id: None,
-                    scope: Some(ctx.scope),
                 },
             )?;
             if let Some(a) = art {
-                ctx.imported.push(ArtifactImportItem {
+                ctx.imported.push(KnowledgeImportItem {
                     id: Some(a.id),
                     path: rel,
                     title: title.clone(),
@@ -225,19 +286,19 @@ fn scan_import_dir(
     Ok(())
 }
 
-async fn artifacts_import(
+async fn knowledge_import(
     State(app): State<AppState>,
-    Json(body): Json<ArtifactImportBody>,
-) -> ApiResult<Json<ArtifactImportResult>> {
+    Json(body): Json<KnowledgeImportBody>,
+) -> ApiResult<Json<KnowledgeImportResult>> {
     let cwd = PathBuf::from(&body.cwd);
     if body.cwd.is_empty() || !cwd.exists() {
         return Err(ApiError::bad_request("cwd required"));
     }
     let conn = app.conn();
 
-    let mut existing: HashSet<String> = artifacts::list(
+    let mut existing: HashSet<String> = knowledge::list(
         &conn,
-        artifacts::ListFilter {
+        knowledge::ListFilter {
             plan_id: body.plan_id.as_deref(),
             unit_id: body.unit_id.as_deref(),
             ..Default::default()
@@ -247,7 +308,7 @@ async fn artifacts_import(
     .map(|a| a.title)
     .collect();
 
-    let mut imported: Vec<ArtifactImportItem> = Vec::new();
+    let mut imported: Vec<KnowledgeImportItem> = Vec::new();
     let mut skipped: Vec<SkippedItem> = Vec::new();
 
     let wiki_paths: Vec<String> = if let Some(pid) = body.project_id.as_deref() {
@@ -275,13 +336,12 @@ async fn artifacts_import(
             skipped: &mut skipped,
             plan_id: body.plan_id.as_deref(),
             unit_id: body.unit_id.as_deref(),
-            scope: &body.scope,
             dry_run: body.dry_run,
         };
         scan_import_dir(&conn, &wiki_dir, 0, &mut ctx)?;
     }
 
-    Ok(Json(ArtifactImportResult {
+    Ok(Json(KnowledgeImportResult {
         imported: imported.len(),
         skipped: skipped.len(),
         items: imported,
@@ -291,7 +351,7 @@ async fn artifacts_import(
 }
 
 #[derive(Deserialize)]
-struct ArtifactExportBody {
+struct KnowledgeExportBody {
     cwd: String,
     #[serde(default)]
     plan_id: Option<String>,
@@ -312,9 +372,9 @@ fn slugify(s: &str) -> String {
     collapsed.to_ascii_lowercase()
 }
 
-async fn artifacts_export(
+async fn knowledge_export(
     State(app): State<AppState>,
-    Json(body): Json<ArtifactExportBody>,
+    Json(body): Json<KnowledgeExportBody>,
 ) -> ApiResult<Json<Value>> {
     if body.cwd.is_empty() {
         return Err(ApiError::bad_request("cwd required"));
@@ -338,9 +398,9 @@ async fn artifacts_export(
     std::fs::create_dir_all(&docs_dir)
         .map_err(|e| ApiError::internal(format!("create docs dir: {e}")))?;
 
-    let list = artifacts::list(
+    let list = knowledge::list(
         &conn,
-        artifacts::ListFilter {
+        knowledge::ListFilter {
             plan_id: body.plan_id.as_deref(),
             unit_id: body.unit_id.as_deref(),
             ..Default::default()

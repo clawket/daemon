@@ -59,7 +59,8 @@ pub fn list(conn: &Connection, filter: ListFilter<'_>) -> Result<Vec<ActivityLog
         sql.push_str(" WHERE ");
         sql.push_str(&clauses.join(" AND "));
     }
-    sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+    // FIX-DAEMON-107: audit log should read in chronological order (ASC)
+    sql.push_str(" ORDER BY created_at ASC LIMIT ?");
     vals.push(filter.limit.unwrap_or(50).into());
 
     let mut stmt = conn.prepare(&sql)?;

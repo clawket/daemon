@@ -63,7 +63,6 @@ async fn dashboard(
                         &conn,
                         units::ListFilter {
                             plan_id: Some(&p.id),
-                            status: None,
                         },
                     )
                     .unwrap_or_default();
@@ -102,6 +101,31 @@ async fn dashboard(
     ));
     lines.push(String::new());
 
+    // R3 DOGFOOD-009 fix: surface active-plan-count warning in dashboard render
+    // (the discover-loop:start emit covers /discover-loop/start path; dashboard
+    // is the CLI surface PDD §X1 cares about). Threshold: >1 active plan triggers
+    // warning, >2 triggers stronger warning. Also emit tracing::warn! for daemon log.
+    let active_plan_count = visible_plans
+        .iter()
+        .filter(|p| p.status == "active")
+        .count();
+    if active_plan_count > 1 {
+        let level = if active_plan_count > 2 { "ERROR" } else { "WARN" };
+        let line = format!(
+            "[{level}] active plan {} (>1) — PDD recommends ≤ 1 (≤ 2 in transition). Consider closing or completing extra plans.",
+            active_plan_count
+        );
+        tracing::warn!(
+            project_id = %project.id,
+            active_plan_count,
+            recommended_max = 1,
+            transition_max = 2,
+            "dashboard: {}", line
+        );
+        lines.push(line);
+        lines.push(String::new());
+    }
+
     let active_plan = visible_plans
         .iter()
         .find(|p| p.status == "active")
@@ -115,6 +139,7 @@ async fn dashboard(
         cycles::ListFilter {
             project_id: Some(&project.id),
             status: Some("active"),
+            unit_id: None,
         },
     )?
     .into_iter()
@@ -146,14 +171,13 @@ async fn dashboard(
             &conn,
             units::ListFilter {
                 plan_id: Some(&plan.id),
-                status: None,
             },
         )?;
 
         let visible_units: Vec<&Unit> = match show {
-            // Unit has no "active" status (pure grouping entity per project rules).
+            // Units are pure grouping entities (no status field since FIX-DAEMON-004).
             // Interpret show=active as "units containing in_progress tasks".
-            "active" => all_units
+            "active" | "next" => all_units
                 .iter()
                 .filter(|u| {
                     tasks::list(
@@ -167,35 +191,13 @@ async fn dashboard(
                     .unwrap_or(false)
                 })
                 .collect(),
-            "next" => {
-                let active_idx = all_units.iter().position(|u| u.status == "active");
-                let next_pending_id = active_idx.and_then(|idx| {
-                    all_units
-                        .iter()
-                        .enumerate()
-                        .find(|(i, u)| *i > idx && u.status == "pending")
-                        .map(|(_, u)| u.id.clone())
-                });
-                all_units
-                    .iter()
-                    .filter(|u| {
-                        u.status == "active"
-                            || next_pending_id.as_deref() == Some(u.id.as_str())
-                    })
-                    .collect()
-            }
             _ => all_units.iter().collect(),
         };
 
         for unit in &visible_units {
-            let approval = if unit.approval_required != 0 && unit.approved_at.is_none() {
-                " [needs approval]"
-            } else {
-                ""
-            };
             lines.push(format!(
-                "## {} ({}) — {}{}",
-                unit.title, unit.id, unit.status, approval
+                "## {} ({})",
+                unit.title, unit.id
             ));
 
             let all_tasks = tasks::list(
@@ -298,7 +300,6 @@ async fn dashboard(
             &conn,
             units::ListFilter {
                 plan_id: Some(&p.id),
-                status: None,
             },
         )?;
         for u in &pu {
@@ -326,6 +327,97 @@ async fn dashboard(
         lines.push(String::new());
     }
 
+    // R3 DOGFOOD-040 fix: discover-loop round summary block. When any visible
+    // plan title matches "<Domain> Round <N>", emit a per-round snapshot:
+    // "Round N: D defect, S scenario_error, decision=<continue|converged|regression>".
+    // The decision string is derived from the same rules as
+    // /discover-loop/status (defect>0 ∧ defect>prev → regression; defect=0 ∧
+    // scenario_error=0 → converged; else continue). Surfacing this on the
+    // dashboard satisfies qa-flow §7 hand-off visibility.
+    {
+        // Collect all "Round N" plans for the project (active or completed).
+        let all_round_plans: Vec<Plan> = plans::list(
+            &conn,
+            plans::ListFilter {
+                project_id: Some(&project.id),
+                status: None,
+            },
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| {
+            let title = p.title.as_str();
+            // Cheap regex-free check: ends with " Round <digits>"
+            title.rfind(" Round ").is_some_and(|idx| {
+                title[idx + 7..].chars().all(|c| c.is_ascii_digit()) && idx + 7 < title.len()
+            })
+        })
+        .collect();
+
+        if !all_round_plans.is_empty() {
+            // Sort by round number ascending.
+            let mut indexed: Vec<(u32, &Plan)> = all_round_plans
+                .iter()
+                .filter_map(|p| {
+                    let title = p.title.as_str();
+                    let idx = title.rfind(" Round ")?;
+                    let num: u32 = title[idx + 7..].parse().ok()?;
+                    Some((num, p))
+                })
+                .collect();
+            indexed.sort_by_key(|(n, _)| *n);
+
+            lines.push("## Discover-Loop Rounds".into());
+            let mut prev_defect: Option<i64> = None;
+            for (round_num, plan) in &indexed {
+                // Tally task qa_status.
+                let plan_units = units::list(
+                    &conn,
+                    units::ListFilter {
+                        plan_id: Some(&plan.id),
+                    },
+                )
+                .unwrap_or_default();
+                let mut defect = 0i64;
+                let mut scenario_error = 0i64;
+                let mut pass = 0i64;
+                for u in &plan_units {
+                    let ts = tasks::list(
+                        &conn,
+                        tasks::ListFilter {
+                            unit_id: Some(&u.id),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap_or_default();
+                    for t in &ts {
+                        match t.qa_status.as_deref() {
+                            Some("defect") => defect += 1,
+                            Some("scenario_error") => scenario_error += 1,
+                            Some("pass") => pass += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                let decision = if defect == 0 && scenario_error == 0 {
+                    "converged"
+                } else if defect > 0
+                    && prev_defect.map(|prev| defect > prev).unwrap_or(false)
+                {
+                    "regression"
+                } else {
+                    "continue"
+                };
+                lines.push(format!(
+                    "  Round {}: {} defect, {} scenario_error, {} pass, decision={}",
+                    round_num, defect, scenario_error, pass, decision
+                ));
+                prev_defect = Some(defect);
+            }
+            lines.push(String::new());
+        }
+    }
+
     // Pending questions (active plan only)
     let pending_qs = questions::list(
         &conn,
@@ -349,9 +441,20 @@ async fn dashboard(
             .into(),
     );
 
-    Ok(Json(json!({
+    let mut response = json!({
         "context": lines.join("\n"),
         "project": project.id,
         "plan": active_plan.id,
-    })))
+    });
+    // R3 DOGFOOD-009 fix: expose machine-readable active-plan warning so CLI
+    // can mirror it to stderr (separate from the human-readable context body).
+    if active_plan_count > 1 {
+        response["active_plan_warning"] = json!({
+            "active_plan_count": active_plan_count,
+            "recommended_max": 1,
+            "transition_max": 2,
+            "level": if active_plan_count > 2 { "error" } else { "warn" },
+        });
+    }
+    Ok(Json(response))
 }

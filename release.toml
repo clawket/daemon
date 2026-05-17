@@ -1,0 +1,15 @@
+# cargo-release configuration.
+#
+# The CI workflow (.github/workflows/release.yml) bumps + tags + publishes
+# automatically on every release-worthy push to main. This file is for
+# maintainer ad-hoc use: run `cargo release <level>` locally to dry-run, then
+# `--execute` to apply. The `pre-release-replacements` block is intentionally
+# empty — versions live only in Cargo.toml, no embedded version strings.
+
+allow-branch = ["main"]
+sign-tag = false
+publish = true
+push = true
+tag-name = "v{{version}}"
+tag-message = "Release {{tag_name}}"
+pre-release-commit-message = "chore: release {{tag_name}}"

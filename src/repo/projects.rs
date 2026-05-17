@@ -36,6 +36,39 @@ pub fn create(conn: &mut Connection, input: CreateInput<'_>) -> Result<Option<Pr
         None => generate_key_from_name(input.name),
     };
 
+    // FIX-DAEMON-111: ticket_key unique check → 409
+    let key_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM projects WHERE key = ?1",
+            params![final_key],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if key_exists {
+        anyhow::bail!(
+            "TICKET_KEY_CONFLICT: ticket key '{}' is already used by another project. \
+             Choose a different key.",
+            final_key
+        );
+    }
+
+    // FIX-DAEMON-111: CWD duplicate check → 409
+    if let Some(cwd) = input.cwd {
+        let cwd_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM project_cwds WHERE cwd = ?1",
+                params![cwd],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if cwd_exists {
+            anyhow::bail!(
+                "CWD_ALREADY_REGISTERED: cwd '{}' is already registered to another project.",
+                cwd
+            );
+        }
+    }
+
     let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO projects (id, name, description, created_at, updated_at, key)
@@ -180,6 +213,25 @@ pub fn list(conn: &Connection) -> Result<Vec<Project>> {
 }
 
 pub fn add_cwd(conn: &Connection, id: &str, cwd: &str) -> Result<Option<Project>> {
+    // FIX-DAEMON-111: prevent a CWD from being registered to two different projects
+    let existing_project: Option<String> = conn
+        .query_row(
+            "SELECT project_id FROM project_cwds WHERE cwd = ?1",
+            params![cwd],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(ref existing_id) = existing_project {
+        if existing_id != id {
+            anyhow::bail!(
+                "CWD_ALREADY_REGISTERED: cwd '{}' is already registered to project '{}'.",
+                cwd,
+                existing_id
+            );
+        }
+        // Already registered to this project — idempotent, just return
+        return get(conn, id);
+    }
     conn.execute(
         "INSERT OR IGNORE INTO project_cwds (project_id, cwd) VALUES (?1, ?2)",
         params![id, cwd],

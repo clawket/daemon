@@ -48,7 +48,7 @@ pub fn list(conn: &Connection, f: ListFilter<'_>) -> Result<Vec<TimelineEvent>> 
                 al.old_value AS detail_old_value,
                 al.new_value AS detail_new_value,
                 NULL AS detail_body,
-                NULL AS detail_artifact_type,
+                NULL AS detail_knowledge_type,
                 NULL AS detail_agent,
                 NULL AS detail_duration_ms,
                 NULL AS detail_result
@@ -70,7 +70,7 @@ pub fn list(conn: &Connection, f: ListFilter<'_>) -> Result<Vec<TimelineEvent>> 
                 cmt.author AS actor, cmt.created_at,
                 NULL AS detail_field, NULL AS detail_old_value, NULL AS detail_new_value,
                 cmt.body AS detail_body,
-                NULL AS detail_artifact_type, NULL AS detail_agent,
+                NULL AS detail_knowledge_type, NULL AS detail_agent,
                 NULL AS detail_duration_ms, NULL AS detail_result
              FROM task_comments cmt
              JOIN tasks s ON cmt.task_id = s.id
@@ -82,18 +82,18 @@ pub fn list(conn: &Connection, f: ListFilter<'_>) -> Result<Vec<TimelineEvent>> 
         vals.push(Box::new(f.project_id.to_string()));
     }
 
-    if wants("artifact") {
+    if wants("knowledge") {
         parts.push(
-            r"SELECT art.id, 'artifact' AS event_type, 'task' AS entity_type,
+            r"SELECT art.id, 'knowledge' AS event_type, 'task' AS entity_type,
                 COALESCE(art.task_id, art.unit_id, art.plan_id) AS entity_id,
                 COALESCE(s.title, ph2.title, pl2.title, '') AS entity_title,
                 NULL AS actor, art.created_at,
                 NULL AS detail_field, NULL AS detail_old_value, NULL AS detail_new_value,
                 art.title AS detail_body,
-                art.type AS detail_artifact_type,
+                art.type AS detail_knowledge_type,
                 NULL AS detail_agent,
                 NULL AS detail_duration_ms, NULL AS detail_result
-             FROM artifacts art
+             FROM knowledge art
              LEFT JOIN tasks s ON art.task_id = s.id
              LEFT JOIN units ph ON s.unit_id = ph.id
              LEFT JOIN plans pl ON ph.plan_id = pl.id
@@ -112,7 +112,7 @@ pub fn list(conn: &Connection, f: ListFilter<'_>) -> Result<Vec<TimelineEvent>> 
                 COALESCE(s.title, '') AS entity_title,
                 r.agent AS actor, r.started_at AS created_at,
                 NULL AS detail_field, NULL AS detail_old_value, NULL AS detail_new_value,
-                NULL AS detail_body, NULL AS detail_artifact_type,
+                NULL AS detail_body, NULL AS detail_knowledge_type,
                 r.agent AS detail_agent,
                 NULL AS detail_duration_ms, NULL AS detail_result
              FROM runs r
@@ -129,7 +129,7 @@ pub fn list(conn: &Connection, f: ListFilter<'_>) -> Result<Vec<TimelineEvent>> 
                 COALESCE(s.title, '') AS entity_title,
                 r.agent AS actor, r.ended_at AS created_at,
                 NULL AS detail_field, NULL AS detail_old_value, NULL AS detail_new_value,
-                NULL AS detail_body, NULL AS detail_artifact_type,
+                NULL AS detail_body, NULL AS detail_knowledge_type,
                 r.agent AS detail_agent,
                 (r.ended_at - r.started_at) AS detail_duration_ms,
                 r.result AS detail_result
@@ -154,7 +154,7 @@ pub fn list(conn: &Connection, f: ListFilter<'_>) -> Result<Vec<TimelineEvent>> 
                 q.asked_by AS actor, q.created_at,
                 NULL AS detail_field, NULL AS detail_old_value, NULL AS detail_new_value,
                 q.body AS detail_body,
-                NULL AS detail_artifact_type, NULL AS detail_agent,
+                NULL AS detail_knowledge_type, NULL AS detail_agent,
                 NULL AS detail_duration_ms, NULL AS detail_result
              FROM questions q
              LEFT JOIN tasks s ON q.task_id = s.id
@@ -193,7 +193,7 @@ pub fn list(conn: &Connection, f: ListFilter<'_>) -> Result<Vec<TimelineEvent>> 
         let detail_old_value: Option<String> = r.get(8)?;
         let detail_new_value: Option<String> = r.get(9)?;
         let detail_body: Option<String> = r.get(10)?;
-        let detail_artifact_type: Option<String> = r.get(11)?;
+        let detail_knowledge_type: Option<String> = r.get(11)?;
         let detail_agent: Option<String> = r.get(12)?;
         let detail_duration_ms: Option<i64> = r.get(13)?;
         let detail_result: Option<String> = r.get(14)?;
@@ -211,8 +211,8 @@ pub fn list(conn: &Connection, f: ListFilter<'_>) -> Result<Vec<TimelineEvent>> 
         if let Some(v) = detail_body {
             detail.insert("body".into(), Value::String(v));
         }
-        if let Some(v) = detail_artifact_type {
-            detail.insert("artifact_type".into(), Value::String(v));
+        if let Some(v) = detail_knowledge_type {
+            detail.insert("knowledge_type".into(), Value::String(v));
         }
         if let Some(v) = detail_agent {
             detail.insert("agent".into(), Value::String(v));

@@ -11,6 +11,7 @@ use std::time::Duration;
 struct Daemon {
     child: Child,
     base: String,
+    token: String,
     tmp: tempfile::TempDir,
 }
 
@@ -50,14 +51,49 @@ impl Daemon {
         let port = port.expect("port file not written");
         let base = format!("http://127.0.0.1:{port}");
 
-        let c = reqwest::Client::new();
+        // FIX-DAEMON-108: read the TCP auth token written by the daemon to
+        // {cache}/clawketd.token. Required on every non-/health request.
+        let token_file = cache_dir.join("clawketd.token");
+        let mut token: Option<String> = None;
+        for _ in 0..50 {
+            if let Ok(s) = std::fs::read_to_string(&token_file) {
+                let t = s.trim().to_string();
+                if !t.is_empty() {
+                    token = Some(t);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let token = token.expect("daemon token file not written");
+
+        let probe = reqwest::Client::new();
         for _ in 0..30 {
-            if c.get(format!("{base}/health")).send().await.is_ok() {
+            if probe.get(format!("{base}/health")).send().await.is_ok() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Self { child, base, tmp }
+        Self {
+            child,
+            base,
+            token,
+            tmp,
+        }
+    }
+
+    /// Build a reqwest client that injects the `X-Clawket-Token` header on
+    /// every request (FIX-DAEMON-108).
+    fn client(&self) -> reqwest::Client {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-clawket-token",
+            reqwest::header::HeaderValue::from_str(&self.token).expect("token header value"),
+        );
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("build reqwest client")
     }
 }
 
@@ -72,7 +108,7 @@ impl Drop for Daemon {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smoke_crud_plan_unit_task_approve() {
     let d = Daemon::spawn().await;
-    let c = reqwest::Client::new();
+    let c = d.client();
 
     let project: serde_json::Value = c
         .post(format!("{}/projects", d.base))
@@ -98,10 +134,31 @@ async fn smoke_crud_plan_unit_task_approve() {
     let plan_id = plan["id"].as_str().unwrap().to_string();
     assert_eq!(plan["status"], "draft");
 
+    // Approve plan unlocks unit+task creation.
+    assert!(c
+        .post(format!("{}/plans/{}/approve", d.base, plan_id))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+
+    // Unit is required before cycle (PDD A4: Cycle ⊂ Unit).
+    let unit: serde_json::Value = c
+        .post(format!("{}/units", d.base))
+        .json(&serde_json::json!({"plan_id": plan_id, "title": "u"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let uid = unit["id"].as_str().unwrap().to_string();
+
     // A cycle is required for tasks to be startable — create + activate.
     let cycle: serde_json::Value = c
         .post(format!("{}/cycles", d.base))
-        .json(&serde_json::json!({"project_id": pid, "title": "c"}))
+        .json(&serde_json::json!({"project_id": pid, "unit_id": uid, "title": "c"}))
         .send()
         .await
         .unwrap()
@@ -117,29 +174,9 @@ async fn smoke_crud_plan_unit_task_approve() {
         .status()
         .is_success());
 
-    // Approve plan unlocks unit+task creation.
-    assert!(c
-        .post(format!("{}/plans/{}/approve", d.base, plan_id))
-        .send()
-        .await
-        .unwrap()
-        .status()
-        .is_success());
-
-    let unit: serde_json::Value = c
-        .post(format!("{}/units", d.base))
-        .json(&serde_json::json!({"plan_id": plan_id, "title": "u"}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let uid = unit["id"].as_str().unwrap().to_string();
-
     let task: serde_json::Value = c
         .post(format!("{}/tasks", d.base))
-        .json(&serde_json::json!({"unit_id": uid, "title": "t"}))
+        .json(&serde_json::json!({"unit_id": uid, "cycle_id": cid, "title": "t"}))
         .send()
         .await
         .unwrap()
@@ -165,7 +202,7 @@ async fn smoke_crud_plan_unit_task_approve() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smoke_cycle_lifecycle_and_task_mapping() {
     let d = Daemon::spawn().await;
-    let c = reqwest::Client::new();
+    let c = d.client();
 
     let project: serde_json::Value = c
         .post(format!("{}/projects", d.base))
@@ -178,36 +215,7 @@ async fn smoke_cycle_lifecycle_and_task_mapping() {
         .unwrap();
     let pid = project["id"].as_str().unwrap().to_string();
 
-    // Create two cycles; only one can be active at a time.
-    let c1: serde_json::Value = c
-        .post(format!("{}/cycles", d.base))
-        .json(&serde_json::json!({"project_id": pid, "title": "one"}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let c1_id = c1["id"].as_str().unwrap().to_string();
-    let _c2: serde_json::Value = c
-        .post(format!("{}/cycles", d.base))
-        .json(&serde_json::json!({"project_id": pid, "title": "two"}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    assert!(c
-        .post(format!("{}/cycles/{}/activate", d.base, c1_id))
-        .send()
-        .await
-        .unwrap()
-        .status()
-        .is_success());
-
-    // Create plan→approve→unit→task; new task should get cycle_id=c1.
+    // Plan → approve → unit (cycle requires unit_id per PDD A4).
     let plan: serde_json::Value = c
         .post(format!("{}/plans", d.base))
         .json(&serde_json::json!({"project_id": pid, "title": "p"}))
@@ -233,9 +241,39 @@ async fn smoke_cycle_lifecycle_and_task_mapping() {
         .unwrap();
     let uid = unit["id"].as_str().unwrap().to_string();
 
+    // Create two cycles in the unit. Only one can be active at a time.
+    let c1: serde_json::Value = c
+        .post(format!("{}/cycles", d.base))
+        .json(&serde_json::json!({"project_id": pid, "unit_id": uid, "title": "one"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let c1_id = c1["id"].as_str().unwrap().to_string();
+    let _c2: serde_json::Value = c
+        .post(format!("{}/cycles", d.base))
+        .json(&serde_json::json!({"project_id": pid, "unit_id": uid, "title": "two"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(c
+        .post(format!("{}/cycles/{}/activate", d.base, c1_id))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+
+    // API-TASK-001: cycle_id is required at task creation; no auto-infer.
     let task: serde_json::Value = c
         .post(format!("{}/tasks", d.base))
-        .json(&serde_json::json!({"unit_id": uid, "title": "t"}))
+        .json(&serde_json::json!({"unit_id": uid, "cycle_id": c1_id, "title": "t"}))
         .send()
         .await
         .unwrap()
@@ -243,6 +281,15 @@ async fn smoke_cycle_lifecycle_and_task_mapping() {
         .await
         .unwrap();
     assert_eq!(task["cycle_id"].as_str(), Some(c1_id.as_str()));
+
+    // Resolve the task before completing the cycle (LM-241 residue guard).
+    // EVIDENCE_REQUIRED: done transitions need evidence.
+    let tid = task["id"].as_str().unwrap().to_string();
+    c.patch(format!("{}/tasks/{}", d.base, tid))
+        .json(&serde_json::json!({"status": "done", "evidence": "test:done"}))
+        .send()
+        .await
+        .unwrap();
 
     // Complete the cycle → tasks should survive but no new cycle is active.
     assert!(c
@@ -254,12 +301,12 @@ async fn smoke_cycle_lifecycle_and_task_mapping() {
         .is_success());
 }
 
-// U7-T3: artifacts + embeddings path. Search may fall back to keyword if embeddings
+// U7-T3: knowledge + embeddings path. Search may fall back to keyword if embeddings
 // are unavailable in CI, so we test the keyword path which is always present.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn smoke_artifacts_keyword_search() {
+async fn smoke_knowledge_keyword_search() {
     let d = Daemon::spawn().await;
-    let c = reqwest::Client::new();
+    let c = d.client();
 
     let project: serde_json::Value = c
         .post(format!("{}/projects", d.base))
@@ -287,14 +334,13 @@ async fn smoke_artifacts_keyword_search() {
         .unwrap();
 
     let _a: serde_json::Value = c
-        .post(format!("{}/artifacts", d.base))
+        .post(format!("{}/knowledge", d.base))
         .json(&serde_json::json!({
             "plan_id": plan_id,
             "title": "RAG chunking strategy",
             "content": "We will chunk by 512 tokens overlapping 64. Decision: confirmed.",
             "type": "decision",
-            "content_format": "md",
-            "scope": "rag"
+            "content_format": "md"
         }))
         .send()
         .await
@@ -304,9 +350,11 @@ async fn smoke_artifacts_keyword_search() {
         .unwrap();
 
     // Keyword search should match on content.
-    let hits: Vec<serde_json::Value> = c
+    // Response shape: { hits: [...], total_returned, limit, truncated } per
+    // SearchResponse in routes/knowledge.rs.
+    let resp: serde_json::Value = c
         .get(format!(
-            "{}/artifacts/search?q=chunking&mode=keyword&scope=rag",
+            "{}/knowledge/search?q=chunking&mode=keyword",
             d.base
         ))
         .send()
@@ -315,9 +363,12 @@ async fn smoke_artifacts_keyword_search() {
         .json()
         .await
         .unwrap();
+    // KnowledgeHit serializes its fields flat (`#[serde(flatten)]`),
+    // so `title` is on the hit itself, not under a nested key.
+    let hits = resp["hits"].as_array().expect("hits array");
     assert!(
         hits.iter().any(|h| h["title"] == "RAG chunking strategy"),
-        "keyword search should find chunking artifact; got {hits:?}"
+        "keyword search should find chunking entry; got {resp:?}"
     );
 }
 
@@ -325,7 +376,7 @@ async fn smoke_artifacts_keyword_search() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smoke_dashboard_picks_up_project_by_cwd() {
     let d = Daemon::spawn().await;
-    let c = reqwest::Client::new();
+    let c = d.client();
 
     let dir = d.tmp.path().join("cwd-project");
     std::fs::create_dir_all(&dir).unwrap();

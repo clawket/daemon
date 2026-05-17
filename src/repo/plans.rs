@@ -88,6 +88,23 @@ pub fn update(conn: &Connection, id: &str, f: UpdateFields) -> Result<Option<Pla
                 status
             );
         }
+
+        // FIX-DAEMON-003: completion residue gate
+        if status == "completed" {
+            let pending_tasks: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tasks t
+                 JOIN units u ON t.unit_id = u.id
+                 WHERE u.plan_id = ?1 AND t.status NOT IN ('done', 'cancelled')",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )?;
+            if pending_tasks > 0 {
+                bail!(
+                    "Cannot complete plan: {} task(s) are not in done/cancelled state",
+                    pending_tasks
+                );
+            }
+        }
     }
 
     let mut sets: Vec<&'static str> = Vec::new();

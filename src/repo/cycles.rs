@@ -1,3 +1,5 @@
+// FIX-DAEMON-002: cycles.unit_id NOT NULL + FK to units(id)
+// A4 axiom: 1 Cycle ⊂ 1 Unit. unit_id required on create; daemon enforces.
 use crate::id::{new_id, now_ms};
 use crate::models::Cycle;
 use anyhow::{bail, Context, Result};
@@ -5,12 +7,16 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 pub struct CreateInput<'a> {
     pub project_id: &'a str,
+    pub unit_id: &'a str,
     pub title: &'a str,
     pub goal: Option<&'a str>,
     pub idx: Option<i64>,
 }
 
 pub fn create(conn: &Connection, input: CreateInput<'_>) -> Result<Option<Cycle>> {
+    if input.unit_id.is_empty() {
+        bail!("unit_id is required for cycle creation (PDD A4: Cycle ⊂ Unit)");
+    }
     let id = new_id("CYC");
     let ts = now_ms();
     let idx = match input.idx {
@@ -21,10 +27,28 @@ pub fn create(conn: &Connection, input: CreateInput<'_>) -> Result<Option<Cycle>
             |r| r.get::<_, i64>(0),
         )?,
     };
+    // API-CYCLE-005: cycles in the same unit must be planned in order. Reject creating
+    // a cycle with idx N when an existing planning cycle already has idx > N.
+    let blocking_idx: Option<i64> = conn
+        .query_row(
+            "SELECT idx FROM cycles
+             WHERE unit_id = ?1 AND status = 'planning' AND idx > ?2
+             ORDER BY idx DESC LIMIT 1",
+            params![input.unit_id, idx],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?;
+    if let Some(other) = blocking_idx {
+        bail!(
+            "INVALID_REQUEST: previous cycles must be planned in order (unit has a planning cycle at idx={}, new idx={} is out of order)",
+            other,
+            idx
+        );
+    }
     conn.execute(
-        "INSERT INTO cycles (id, project_id, title, goal, idx, created_at, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planning')",
-        params![id, input.project_id, input.title, input.goal, idx, ts],
+        "INSERT INTO cycles (id, project_id, unit_id, title, goal, idx, created_at, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'planning')",
+        params![id, input.project_id, input.unit_id, input.title, input.goal, idx, ts],
     )
     .context("insert cycle")?;
     get(conn, &id)
@@ -33,7 +57,7 @@ pub fn create(conn: &Connection, input: CreateInput<'_>) -> Result<Option<Cycle>
 pub fn get(conn: &Connection, id: &str) -> Result<Option<Cycle>> {
     let c = conn
         .query_row(
-            "SELECT id, project_id, idx, title, goal, created_at, started_at, ended_at, status
+            "SELECT id, project_id, unit_id, idx, title, goal, created_at, started_at, ended_at, status
              FROM cycles WHERE id = ?1",
             params![id],
             map_cycle,
@@ -45,18 +69,23 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<Cycle>> {
 #[derive(Default)]
 pub struct ListFilter<'a> {
     pub project_id: Option<&'a str>,
+    pub unit_id: Option<&'a str>,
     pub status: Option<&'a str>,
 }
 
 pub fn list(conn: &Connection, filter: ListFilter<'_>) -> Result<Vec<Cycle>> {
     let mut sql = String::from(
-        "SELECT id, project_id, idx, title, goal, created_at, started_at, ended_at, status FROM cycles",
+        "SELECT id, project_id, unit_id, idx, title, goal, created_at, started_at, ended_at, status FROM cycles",
     );
     let mut clauses: Vec<&'static str> = Vec::new();
     let mut vals: Vec<rusqlite::types::Value> = Vec::new();
     if let Some(pid) = filter.project_id {
         clauses.push("project_id = ?");
         vals.push(pid.to_string().into());
+    }
+    if let Some(uid) = filter.unit_id {
+        clauses.push("unit_id = ?");
+        vals.push(uid.to_string().into());
     }
     if let Some(status) = filter.status {
         clauses.push("status = ?");
@@ -101,6 +130,25 @@ pub fn update(conn: &Connection, id: &str, f: UpdateFields) -> Result<Option<Cyc
                     c.title
                 );
             }
+            if status == "completed" && c.status != "completed" {
+                assert_no_todo_residue(conn, id)?;
+            }
+            // A4/A8: same-unit cycle serialization — reject if same unit already has active cycle
+            if status == "active" {
+                if let Some(uid) = &c.unit_id {
+                    let active_count: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM cycles WHERE unit_id = ?1 AND status = 'active' AND id != ?2",
+                        params![uid, id],
+                        |r| r.get(0),
+                    )?;
+                    if active_count > 0 {
+                        bail!(
+                            "UNIT_HAS_ACTIVE_CYCLE: unit {} already has an active cycle (PDD A8: same-unit cycles are serial). Complete the existing active cycle first.",
+                            uid
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -142,6 +190,34 @@ pub fn update(conn: &Connection, id: &str, f: UpdateFields) -> Result<Option<Cyc
 }
 
 pub fn activate(conn: &Connection, id: &str) -> Result<Option<Cycle>> {
+    // US-CLAWKET-API-CYCLE-005: activating cycle C in unit U auto-deactivates
+    // any prior active cycle in the same unit by completing it. Same-unit
+    // cycles are serial (PDD A8); the previous behavior of rejecting the
+    // activation forced callers to script a two-step transition. We collapse
+    // it into a single atomic operation here.
+    if let Some(current) = get(conn, id)? {
+        if let Some(uid) = &current.unit_id {
+            if current.status != "active" {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM cycles
+                     WHERE unit_id = ?1 AND status = 'active' AND id != ?2",
+                )?;
+                let prior_ids: Vec<String> = stmt
+                    .query_map(params![uid, id], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                drop(stmt);
+                for prior_id in prior_ids {
+                    // Use a direct UPDATE so we bypass the no-todo-residue
+                    // gate inside update(): auto-deactivation must always
+                    // succeed regardless of the prior cycle's task fanout.
+                    conn.execute(
+                        "UPDATE cycles SET status = 'completed', ended_at = ?1 WHERE id = ?2",
+                        params![now_ms(), prior_id],
+                    )?;
+                }
+            }
+        }
+    }
     update(
         conn,
         id,
@@ -163,6 +239,42 @@ pub fn complete(conn: &Connection, id: &str) -> Result<Option<Cycle>> {
     )
 }
 
+/// PDD-230: Reject completion when the cycle still has tasks NOT in terminal status.
+/// Terminal statuses: done, cancelled, blocked. (`blocked` is treated terminal because
+/// it indicates external dependency — the cycle Exit Gate can pass on tracked blockers.)
+/// Sentinel phrase "cannot complete cycle:" maps to HTTP 409 in routes/error.rs.
+fn assert_no_todo_residue(conn: &Connection, cycle_id: &str) -> Result<()> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks
+         WHERE cycle_id = ?1 AND status NOT IN ('done', 'cancelled', 'blocked')",
+        params![cycle_id],
+        |r| r.get(0),
+    )?;
+    if count == 0 {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(ticket_number, id) FROM tasks
+         WHERE cycle_id = ?1 AND status NOT IN ('done', 'cancelled', 'blocked')
+         ORDER BY idx
+         LIMIT 5",
+    )?;
+    let labels: Vec<String> = stmt
+        .query_map(params![cycle_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let suffix = if count > 5 {
+        format!(" (+{} more)", count - 5)
+    } else {
+        String::new()
+    };
+    bail!(
+        "CYCLE_HAS_NON_TERMINAL_TASKS: cannot complete cycle: {} task(s) still non-terminal (todo/in_progress): {}{}",
+        count,
+        labels.join(", "),
+        suffix
+    );
+}
+
 pub fn delete(conn: &Connection, id: &str) -> Result<()> {
     conn.execute(
         "UPDATE tasks SET cycle_id = NULL WHERE cycle_id = ?1",
@@ -176,13 +288,14 @@ fn map_cycle(r: &rusqlite::Row<'_>) -> rusqlite::Result<Cycle> {
     Ok(Cycle {
         id: r.get(0)?,
         project_id: r.get(1)?,
-        idx: r.get(2)?,
-        title: r.get(3)?,
-        goal: r.get(4)?,
-        created_at: r.get(5)?,
-        started_at: r.get(6)?,
-        ended_at: r.get(7)?,
-        status: r.get(8)?,
+        unit_id: r.get(2)?,
+        idx: r.get(3)?,
+        title: r.get(4)?,
+        goal: r.get(5)?,
+        created_at: r.get(6)?,
+        started_at: r.get(7)?,
+        ended_at: r.get(8)?,
+        status: r.get(9)?,
     })
 }
 
@@ -190,7 +303,7 @@ fn map_cycle(r: &rusqlite::Row<'_>) -> rusqlite::Result<Cycle> {
 mod tests {
     use super::*;
     use crate::db::Db;
-    use crate::repo::projects;
+    use crate::repo::{plans, projects, tasks, units};
 
     fn setup() -> (tempfile::TempDir, Db, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -209,14 +322,115 @@ mod tests {
         (dir, db, project.id)
     }
 
+    fn setup_with_unit() -> (tempfile::TempDir, Db, String, String, String) {
+        let (dir, db, pid) = setup();
+        let plan = plans::create(
+            &db.conn,
+            plans::CreateInput {
+                project_id: &pid,
+                title: "v1",
+                description: None,
+                source: None,
+                source_path: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        plans::approve(&db.conn, &plan.id).unwrap();
+        let unit = units::create(
+            &db.conn,
+            units::CreateInput {
+                plan_id: &plan.id,
+                title: "U1",
+                goal: None,
+                idx: None,
+                execution_mode: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let cycle = create(
+            &db.conn,
+            CreateInput {
+                project_id: &pid,
+                unit_id: &unit.id,
+                title: "C1",
+                goal: None,
+                idx: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        activate(&db.conn, &cycle.id).unwrap();
+        (dir, db, plan.id, unit.id, cycle.id)
+    }
+
+    fn add_task(db: &mut Db, unit_id: &str, cycle_id: &str, title: &str) -> String {
+        let t = tasks::create(
+            &mut db.conn,
+            tasks::CreateInput {
+                unit_id,
+                title,
+                body: None,
+                assignee: None,
+                idx: None,
+                depends_on: vec![],
+                parent_task_id: None,
+                priority: None,
+                complexity: None,
+                estimated_edits: None,
+                cycle_id: Some(cycle_id),
+                reporter: None,
+                type_: None,
+                atomic_size_hint: None,
+                decomposition_policy: None,
+                tier: None,
+                qa_status: None,
+                scenario_id: None,
+                defect_task: None,
+                scenario_amendment: None,
+                evidence: None,
+                batch_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        t.id
+    }
+
     #[test]
     fn lifecycle() {
         let (_d, db, pid) = setup();
+        let plan = plans::create(
+            &db.conn,
+            plans::CreateInput {
+                project_id: &pid,
+                title: "v1",
+                description: None,
+                source: None,
+                source_path: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let unit = units::create(
+            &db.conn,
+            units::CreateInput {
+                plan_id: &plan.id,
+                title: "U1",
+                goal: None,
+                idx: None,
+                execution_mode: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
 
         let c = create(
             &db.conn,
             CreateInput {
                 project_id: &pid,
+                unit_id: &unit.id,
                 title: "Cycle 1",
                 goal: Some("first sprint"),
                 idx: None,
@@ -227,6 +441,7 @@ mod tests {
         assert_eq!(c.idx, 0);
         assert_eq!(c.status, "planning");
         assert!(c.started_at.is_none());
+        assert_eq!(c.unit_id.as_deref(), Some(unit.id.as_str()));
 
         let active = activate(&db.conn, &c.id).unwrap().unwrap();
         assert_eq!(active.status, "active");
@@ -238,29 +453,128 @@ mod tests {
 
         let err = activate(&db.conn, &c.id).unwrap_err();
         assert!(err.to_string().contains("cannot be restarted"));
+    }
 
-        let err2 = update(
+    #[test]
+    fn rejects_cycle_without_unit_id() {
+        let (_d, db, pid) = setup();
+        let err = create(
             &db.conn,
-            &c.id,
-            UpdateFields {
-                status: Some("bogus".into()),
-                ..Default::default()
+            CreateInput {
+                project_id: &pid,
+                unit_id: "",
+                title: "bad",
+                goal: None,
+                idx: None,
             },
         )
         .unwrap_err();
-        assert!(err2.to_string().contains("Invalid cycle status"));
+        assert!(err.to_string().contains("unit_id is required"));
+    }
 
-        let all = list(
+    #[test]
+    fn activating_second_cycle_in_unit_auto_completes_prior() {
+        // US-CLAWKET-API-CYCLE-005: activating C2 on a unit that already has an
+        // active C1 atomically completes C1 instead of rejecting (PDD A8 — same
+        // unit cycles are serial, but the daemon collapses the deactivate +
+        // activate into one operation).
+        let (_d, db, pid) = setup();
+        let plan = plans::create(
             &db.conn,
-            ListFilter {
-                project_id: Some(&pid),
-                status: None,
+            plans::CreateInput {
+                project_id: &pid,
+                title: "v1",
+                description: None,
+                source: None,
+                source_path: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let unit = units::create(
+            &db.conn,
+            units::CreateInput {
+                plan_id: &plan.id,
+                title: "U1",
+                goal: None,
+                idx: None,
+                execution_mode: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        let c1 = create(
+            &db.conn,
+            CreateInput {
+                project_id: &pid,
+                unit_id: &unit.id,
+                title: "C1",
+                goal: None,
+                idx: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        activate(&db.conn, &c1.id).unwrap();
+
+        let c2 = create(
+            &db.conn,
+            CreateInput {
+                project_id: &pid,
+                unit_id: &unit.id,
+                title: "C2",
+                goal: None,
+                idx: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        activate(&db.conn, &c2.id).unwrap().unwrap();
+
+        let c1_after = get(&db.conn, &c1.id).unwrap().unwrap();
+        assert_eq!(c1_after.status, "completed");
+        let c2_after = get(&db.conn, &c2.id).unwrap().unwrap();
+        assert_eq!(c2_after.status, "active");
+    }
+
+    #[test]
+    fn complete_blocks_with_todo_residue() {
+        let (_d, mut db, _plan_id, unit_id, cycle_id) = setup_with_unit();
+
+        let t1 = add_task(&mut db, &unit_id, &cycle_id, "T1");
+        let t2 = add_task(&mut db, &unit_id, &cycle_id, "T2");
+        let _t3 = add_task(&mut db, &unit_id, &cycle_id, "T3");
+
+        tasks::update(
+            &mut db.conn,
+            &t1,
+            tasks::UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:done".into())),
+                ..Default::default()
             },
         )
         .unwrap();
-        assert_eq!(all.len(), 1);
+        tasks::update(
+            &mut db.conn,
+            &t2,
+            tasks::UpdateFields {
+                status: Some("blocked".into()),
+                blocked_reason: Some(Some("test:waiting on external".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
-        delete(&db.conn, &c.id).unwrap();
-        assert!(get(&db.conn, &c.id).unwrap().is_none());
+        let err = complete(&db.conn, &cycle_id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot complete cycle:"),
+            "expected sentinel phrase, got: {msg}"
+        );
+        // PDD-230: `blocked` is treated terminal (cycle Exit Gate may pass on
+        // tracked external blockers). Only T3 (todo) remains as residue.
+        assert!(msg.contains("1 task(s)"), "expected residue count 1, got: {msg}");
     }
 }

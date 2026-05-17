@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::models::Project;
-use crate::repo::{artifacts, plans, projects, questions, tasks, units};
+use crate::repo::{knowledge, plans, projects, questions, tasks, units};
 use crate::routes::error::ApiResult;
 use crate::state::AppState;
 
@@ -106,7 +106,6 @@ async fn handoff(
         &conn,
         units::ListFilter {
             plan_id: Some(&active_plan.id),
-            status: None,
         },
     )?;
 
@@ -134,14 +133,8 @@ async fn handoff(
     ));
     lines.push(String::new());
 
-    let completed_units: Vec<_> = all_units.iter().filter(|u| u.status == "completed").collect();
-    if !completed_units.is_empty() {
-        lines.push("## Completed".into());
-        for u in &completed_units {
-            lines.push(format!("- [x] {}", u.title));
-        }
-        lines.push(String::new());
-    }
+    // Units are pure grouping entities (no status field since FIX-DAEMON-004).
+    // "Completed units" concept is removed; completion is tracked at the task level.
 
     let in_progress: Vec<_> = all_tasks
         .iter()
@@ -170,12 +163,9 @@ async fn handoff(
         lines.push(String::new());
     }
 
-    let active_units: Vec<_> = all_units
-        .iter()
-        .filter(|u| matches!(u.status.as_str(), "active" | "pending"))
-        .collect();
+    // Show next todo tasks across all units (units have no status; show all).
     let mut next_todo: Vec<_> = Vec::new();
-    for u in &active_units {
+    for u in &all_units {
         let ts = tasks::list(
             &conn,
             tasks::ListFilter {
@@ -218,9 +208,9 @@ async fn handoff(
         lines.push(String::new());
     }
 
-    let decisions = artifacts::list(
+    let decisions = knowledge::list(
         &conn,
-        artifacts::ListFilter {
+        knowledge::ListFilter {
             plan_id: Some(&active_plan.id),
             type_: Some("decision"),
             ..Default::default()

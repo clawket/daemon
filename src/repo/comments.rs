@@ -59,6 +59,26 @@ pub fn list(conn: &Connection, task_id: &str) -> Result<Vec<TaskComment>> {
     Ok(out)
 }
 
+/// FIX-DAEMON-111: PATCH body — update comment body text.
+pub fn update_body(conn: &Connection, id: &str, body: &str) -> Result<Option<TaskComment>> {
+    conn.execute(
+        "UPDATE task_comments SET body = ?1 WHERE id = ?2",
+        params![body, id],
+    )?;
+    get(conn, id)
+}
+
+/// FIX-DAEMON-111: soft-delete — prefix body with "[DELETED] " to preserve audit trail.
+/// Use hard delete only if the comment does not exist in the audit trail context.
+pub fn soft_delete(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE task_comments SET body = '[DELETED] ' || body WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub fn delete(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM task_comments WHERE id = ?1", params![id])?;
     Ok(())

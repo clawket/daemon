@@ -1,10 +1,13 @@
+// FIX-DAEMON-004: Units are pure grouping entities — removed approve endpoint,
+// status/approval_required from CreateBody.
+// FIX-DAEMON-101: /units/:id/counts with SQL aggregate
 use axum::extract::{Path, Query, State};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::models::Unit;
+use crate::models::{SingleUnitCounts, Unit};
 use crate::repo::units;
 use crate::routes::error::{json_or_404, ApiError, ApiResult};
 use crate::state::AppState;
@@ -16,13 +19,14 @@ pub fn router() -> Router<AppState> {
             "/units/{id}",
             get(get_one).patch(update).delete(delete_one),
         )
-        .route("/units/{id}/approve", post(approve))
+        .route("/units/{id}/counts", get(counts))
+    // NOTE: /units/{id}/approve endpoint removed in v3.0 (FIX-DAEMON-004).
+    // Units are pure grouping entities with no approval lifecycle.
 }
 
 #[derive(Deserialize)]
 struct ListQuery {
     plan_id: Option<String>,
-    status: Option<String>,
 }
 
 async fn list(State(app): State<AppState>, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Unit>>> {
@@ -30,7 +34,6 @@ async fn list(State(app): State<AppState>, Query(q): Query<ListQuery>) -> ApiRes
         &app.conn(),
         units::ListFilter {
             plan_id: q.plan_id.as_deref(),
-            status: q.status.as_deref(),
         },
     )?))
 }
@@ -41,7 +44,6 @@ struct CreateBody {
     title: String,
     goal: Option<String>,
     idx: Option<i64>,
-    approval_required: Option<bool>,
     execution_mode: Option<String>,
 }
 
@@ -53,7 +55,6 @@ async fn create(State(app): State<AppState>, Json(body): Json<CreateBody>) -> Ap
             title: &body.title,
             goal: body.goal.as_deref(),
             idx: body.idx,
-            approval_required: body.approval_required.unwrap_or(false),
             execution_mode: body.execution_mode.as_deref(),
         },
     )?)
@@ -71,22 +72,38 @@ async fn delete_one(
     Ok(Json(serde_json::json!({ "ok": true, "deleted": id })))
 }
 
-#[derive(Deserialize, Default)]
-struct ApproveBody {
-    by: Option<String>,
-}
-
-async fn approve(
+/// FIX-DAEMON-101: /units/:id/counts — SQL aggregate task counts for one unit
+async fn counts(
     State(app): State<AppState>,
     Path(id): Path<String>,
-    body: Option<Json<ApproveBody>>,
-) -> ApiResult<Json<Unit>> {
-    let by = body.and_then(|b| b.0.by).unwrap_or_else(|| "human".into());
-    let result = units::approve(&app.conn(), &id, &by)?;
-    if result.is_some() {
-        app.emit("unit:updated", serde_json::json!({ "id": id }));
-    }
-    json_or_404(result)
+) -> ApiResult<Json<SingleUnitCounts>> {
+    let conn = app.conn();
+    let unit = units::get(&conn, &id)?
+        .ok_or_else(|| ApiError::not_found("unit not found"))?;
+
+    let row: (i64, i64, i64, i64, i64, i64) = conn.query_row(
+        "SELECT
+            SUM(CASE WHEN status = 'todo'        THEN 1 ELSE 0 END),
+            SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN status = 'done'        THEN 1 ELSE 0 END),
+            SUM(CASE WHEN status = 'blocked'     THEN 1 ELSE 0 END),
+            SUM(CASE WHEN status = 'cancelled'   THEN 1 ELSE 0 END),
+            COUNT(id)
+         FROM tasks WHERE unit_id = ?1",
+        rusqlite::params![id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+    ).map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(Json(SingleUnitCounts {
+        unit_id: unit.id,
+        unit_title: unit.title,
+        todo: row.0,
+        in_progress: row.1,
+        done: row.2,
+        blocked: row.3,
+        cancelled: row.4,
+        total: row.5,
+    }))
 }
 
 async fn update(
@@ -103,9 +120,6 @@ async fn update(
     }
     if let Some(v) = obj.get("goal") {
         f.goal = Some(v.as_str().map(String::from));
-    }
-    if let Some(s) = obj.get("status").and_then(Value::as_str) {
-        f.status = Some(s.into());
     }
     if let Some(s) = obj.get("execution_mode").and_then(Value::as_str) {
         f.execution_mode = Some(s.into());

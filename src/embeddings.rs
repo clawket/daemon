@@ -9,8 +9,12 @@ use std::sync::Arc;
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 use tokio::sync::Mutex;
 
-const MODEL_REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
+// FIX-DAEMON-012: multilingual model — supports Korean, Japanese, and 50+ languages.
+// Dimension = 384 (same as predecessor); no vec_tasks/vec_knowledge schema change needed.
+const MODEL_REPO: &str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2";
 const MAX_CHARS: usize = 2000;
+// paraphrase-multilingual-MiniLM-L12-v2 supports up to 128 tokens;
+// keep 256 as upper clamp — the tokenizer will truncate at its actual max.
 const MAX_TOKENS: usize = 256;
 
 struct Embedder {
@@ -82,7 +86,11 @@ pub async fn embed(text: &str) -> Result<Option<Vec<f32>>> {
         return Ok(None);
     }
     let truncated = if trimmed.len() > MAX_CHARS {
-        &trimmed[..MAX_CHARS]
+        let mut end = MAX_CHARS;
+        while end > 0 && !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        &trimmed[..end]
     } else {
         trimmed
     };

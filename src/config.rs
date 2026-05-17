@@ -37,4 +37,9 @@ pub struct StartArgs {
     /// Override database path
     #[arg(long)]
     pub db: Option<PathBuf>,
+
+    /// FIX-DAEMON-022: Enable /metrics endpoint (Prometheus text format).
+    /// Also enabled via CLAWKETD_METRICS=1 environment variable.
+    #[arg(long)]
+    pub metrics: bool,
 }

@@ -1,12 +1,16 @@
 pub mod activity_log;
-pub mod artifacts;
+pub mod audit_log;
 pub mod comments;
+pub mod knowledge;
 pub mod cycles;
+pub mod locks;
 pub mod plans;
 pub mod projects;
 pub mod questions;
 pub mod runs;
+pub mod task_envelopes;
 pub mod task_relations;
 pub mod tasks;
 pub mod timeline;
 pub mod units;
+pub mod usage;

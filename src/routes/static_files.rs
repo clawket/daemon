@@ -96,6 +96,29 @@ async fn spa_index(State(app): State<AppState>) -> Response<Body> {
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
+    // LM-10833: don't cache the index, the bootstrap cookie below rotates
+    // every daemon restart so a stale 304 would hand the browser a dead token.
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    // LM-10833: bootstrap the SPA's auth channel. The browser receives an
+    // HttpOnly + SameSite=Strict cookie carrying the same token the CLI reads
+    // from the token file. SPA `fetch` calls with `credentials: 'include'`
+    // then send it back automatically, and `tcp_auth_layer` accepts it
+    // alongside the existing `X-Clawket-Token` header. HttpOnly means JS
+    // can't exfiltrate the token via XSS the way it could a window/local-
+    // storage value; SameSite=Strict blocks the cross-site CSRF case in
+    // browsers that honor it.
+    let token = app.tcp_token();
+    if !token.is_empty() {
+        let cookie = format!(
+            "clawket_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
+        );
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            resp.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
     resp
 }
 

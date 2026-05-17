@@ -2,18 +2,38 @@ use crate::id::{new_id, now_ms};
 use crate::models::Run;
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::Value;
 
-pub fn create(
-    conn: &Connection,
-    task_id: &str,
-    session_id: Option<&str>,
-    agent: &str,
-) -> Result<Option<Run>> {
+pub struct CreateInput<'a> {
+    pub task_id: &'a str,
+    pub session_id: Option<&'a str>,
+    pub agent: &'a str,
+    pub status: Option<&'a str>,
+    pub envelope_id: Option<&'a str>,
+    pub envelope_snapshot: Option<&'a Value>,
+}
+
+pub fn create(conn: &Connection, input: CreateInput<'_>) -> Result<Option<Run>> {
     let id = new_id("RUN");
+    let status = input.status.unwrap_or("started");
+    let snapshot_json = input
+        .envelope_snapshot
+        .map(|v| serde_json::to_string(v))
+        .transpose()?;
     conn.execute(
-        "INSERT INTO runs (id, task_id, session_id, agent, started_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, task_id, session_id, agent, now_ms()],
+        "INSERT INTO runs
+            (id, task_id, session_id, agent, started_at, status, envelope_id, envelope_snapshot)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            id,
+            input.task_id,
+            input.session_id,
+            input.agent,
+            now_ms(),
+            status,
+            input.envelope_id,
+            snapshot_json,
+        ],
     )?;
     get(conn, &id)
 }
@@ -21,7 +41,8 @@ pub fn create(
 pub fn get(conn: &Connection, id: &str) -> Result<Option<Run>> {
     let r = conn
         .query_row(
-            "SELECT id, task_id, session_id, agent, started_at, ended_at, result, notes
+            "SELECT id, task_id, session_id, agent, started_at, ended_at, result, notes,
+                    status, envelope_id, envelope_snapshot
              FROM runs WHERE id = ?1",
             params![id],
             map_run,
@@ -40,7 +61,8 @@ pub struct ListFilter<'a> {
 pub fn list(conn: &Connection, filter: ListFilter<'_>) -> Result<Vec<Run>> {
     if let Some(pid) = filter.project_id {
         let mut stmt = conn.prepare(
-            "SELECT r.id, r.task_id, r.session_id, r.agent, r.started_at, r.ended_at, r.result, r.notes
+            "SELECT r.id, r.task_id, r.session_id, r.agent, r.started_at, r.ended_at, r.result, r.notes,
+                    r.status, r.envelope_id, r.envelope_snapshot
              FROM runs r
              JOIN tasks s ON s.id = r.task_id
              JOIN units u ON u.id = s.unit_id
@@ -57,7 +79,9 @@ pub fn list(conn: &Connection, filter: ListFilter<'_>) -> Result<Vec<Run>> {
     }
 
     let mut sql = String::from(
-        "SELECT id, task_id, session_id, agent, started_at, ended_at, result, notes FROM runs",
+        "SELECT id, task_id, session_id, agent, started_at, ended_at, result, notes,
+                status, envelope_id, envelope_snapshot
+         FROM runs",
     );
     let mut clauses: Vec<&'static str> = Vec::new();
     let mut vals: Vec<rusqlite::types::Value> = Vec::new();
@@ -91,13 +115,26 @@ pub fn finish(
     notes: Option<&str>,
 ) -> Result<Option<Run>> {
     conn.execute(
-        "UPDATE runs SET ended_at = ?1, result = ?2, notes = ?3 WHERE id = ?4",
+        "UPDATE runs SET ended_at = ?1, result = ?2, notes = ?3, status = 'finished'
+         WHERE id = ?4",
         params![now_ms(), result, notes, id],
     )?;
     get(conn, id)
 }
 
+pub fn mark_started(conn: &Connection, id: &str) -> Result<Option<Run>> {
+    conn.execute(
+        "UPDATE runs SET status = 'started' WHERE id = ?1 AND status = 'pending'",
+        params![id],
+    )?;
+    get(conn, id)
+}
+
 fn map_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
+    let snapshot_str: Option<String> = r.get(10)?;
+    let envelope_snapshot = snapshot_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok());
     Ok(Run {
         id: r.get(0)?,
         task_id: r.get(1)?,
@@ -107,5 +144,8 @@ fn map_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         ended_at: r.get(5)?,
         result: r.get(6)?,
         notes: r.get(7)?,
+        status: r.get(8)?,
+        envelope_id: r.get(9)?,
+        envelope_snapshot,
     })
 }

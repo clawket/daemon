@@ -1,3 +1,4 @@
+// FIX-DAEMON-004: Units are pure grouping entities — no status/approval lifecycle.
 use crate::id::{new_id, now_ms};
 use crate::models::Unit;
 use anyhow::{Context, Result};
@@ -8,7 +9,6 @@ pub struct CreateInput<'a> {
     pub title: &'a str,
     pub goal: Option<&'a str>,
     pub idx: Option<i64>,
-    pub approval_required: bool,
     pub execution_mode: Option<&'a str>,
 }
 
@@ -25,9 +25,9 @@ pub fn create(conn: &Connection, input: CreateInput<'_>) -> Result<Option<Unit>>
     };
     let mode = input.execution_mode.unwrap_or("sequential");
     conn.execute(
-        "INSERT INTO units (id, plan_id, idx, title, goal, created_at, status, approval_required, execution_mode)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
-        params![id, input.plan_id, idx, input.title, input.goal, ts, input.approval_required as i64, mode],
+        "INSERT INTO units (id, plan_id, idx, title, goal, created_at, execution_mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id, input.plan_id, idx, input.title, input.goal, ts, mode],
     )
     .context("insert unit")?;
     get(conn, &id)
@@ -36,8 +36,7 @@ pub fn create(conn: &Connection, input: CreateInput<'_>) -> Result<Option<Unit>>
 pub fn get(conn: &Connection, id: &str) -> Result<Option<Unit>> {
     let unit = conn
         .query_row(
-            "SELECT id, plan_id, idx, title, goal, execution_mode, approval_required,
-                    approved_at, approved_by, created_at, started_at, completed_at, status
+            "SELECT id, plan_id, idx, title, goal, execution_mode, created_at
              FROM units WHERE id = ?1",
             params![id],
             map_unit,
@@ -49,13 +48,11 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<Unit>> {
 #[derive(Default)]
 pub struct ListFilter<'a> {
     pub plan_id: Option<&'a str>,
-    pub status: Option<&'a str>,
 }
 
 pub fn list(conn: &Connection, filter: ListFilter<'_>) -> Result<Vec<Unit>> {
     let mut sql = String::from(
-        "SELECT id, plan_id, idx, title, goal, execution_mode, approval_required,
-                approved_at, approved_by, created_at, started_at, completed_at, status
+        "SELECT id, plan_id, idx, title, goal, execution_mode, created_at
          FROM units",
     );
     let mut clauses: Vec<&'static str> = Vec::new();
@@ -63,10 +60,6 @@ pub fn list(conn: &Connection, filter: ListFilter<'_>) -> Result<Vec<Unit>> {
     if let Some(pid) = filter.plan_id {
         clauses.push("plan_id = ?");
         vals.push(pid.to_string().into());
-    }
-    if let Some(status) = filter.status {
-        clauses.push("status = ?");
-        vals.push(status.to_string().into());
     }
     if !clauses.is_empty() {
         sql.push_str(" WHERE ");
@@ -88,7 +81,6 @@ pub fn list(conn: &Connection, filter: ListFilter<'_>) -> Result<Vec<Unit>> {
 pub struct UpdateFields {
     pub title: Option<String>,
     pub goal: Option<Option<String>>,
-    pub status: Option<String>,
     pub execution_mode: Option<String>,
 }
 
@@ -107,10 +99,6 @@ pub fn update(conn: &Connection, id: &str, f: UpdateFields) -> Result<Option<Uni
             None => rusqlite::types::Value::Null,
         });
     }
-    if let Some(status) = f.status {
-        sets.push("status = ?");
-        vals.push(status.into());
-    }
     if let Some(mode) = f.execution_mode {
         sets.push("execution_mode = ?");
         vals.push(mode.into());
@@ -127,17 +115,6 @@ pub fn update(conn: &Connection, id: &str, f: UpdateFields) -> Result<Option<Uni
     get(conn, id)
 }
 
-pub fn approve(conn: &Connection, id: &str, by: &str) -> Result<Option<Unit>> {
-    let ts = now_ms();
-    conn.execute(
-        "UPDATE units SET status = 'active', approved_by = ?1, approved_at = ?2,
-                          started_at = COALESCE(started_at, ?2)
-         WHERE id = ?3",
-        params![by, ts, id],
-    )?;
-    get(conn, id)
-}
-
 pub fn delete(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM units WHERE id = ?1", params![id])?;
     Ok(())
@@ -151,13 +128,7 @@ fn map_unit(r: &rusqlite::Row<'_>) -> rusqlite::Result<Unit> {
         title: r.get(3)?,
         goal: r.get(4)?,
         execution_mode: r.get(5)?,
-        approval_required: r.get(6)?,
-        approved_at: r.get(7)?,
-        approved_by: r.get(8)?,
-        created_at: r.get(9)?,
-        started_at: r.get(10)?,
-        completed_at: r.get(11)?,
-        status: r.get(12)?,
+        created_at: r.get(6)?,
     })
 }
 
@@ -197,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn create_autoidx_list_update_approve_delete() {
+    fn create_autoidx_list_update_delete() {
         let (_d, db, plan_id) = setup();
 
         let u1 = create(
@@ -207,15 +178,12 @@ mod tests {
                 title: "U1",
                 goal: Some("first"),
                 idx: None,
-                approval_required: true,
                 execution_mode: None,
             },
         )
         .unwrap()
         .unwrap();
         assert_eq!(u1.idx, 0);
-        assert_eq!(u1.status, "pending");
-        assert_eq!(u1.approval_required, 1);
         assert_eq!(u1.execution_mode, "sequential");
 
         let u2 = create(
@@ -225,7 +193,6 @@ mod tests {
                 title: "U2",
                 goal: None,
                 idx: None,
-                approval_required: false,
                 execution_mode: Some("parallel"),
             },
         )
@@ -238,7 +205,6 @@ mod tests {
             &db.conn,
             ListFilter {
                 plan_id: Some(&plan_id),
-                status: None,
             },
         )
         .unwrap();
@@ -258,12 +224,6 @@ mod tests {
         let u1b = get(&db.conn, &u1.id).unwrap().unwrap();
         assert_eq!(u1b.title, "U1 renamed");
         assert!(u1b.goal.is_none());
-
-        let approved = approve(&db.conn, &u1.id, "human").unwrap().unwrap();
-        assert_eq!(approved.status, "active");
-        assert_eq!(approved.approved_by.as_deref(), Some("human"));
-        assert!(approved.approved_at.is_some());
-        assert!(approved.started_at.is_some());
 
         delete(&db.conn, &u2.id).unwrap();
         assert!(get(&db.conn, &u2.id).unwrap().is_none());
