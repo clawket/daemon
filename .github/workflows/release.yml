@@ -135,10 +135,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             canonical: darwin-arm64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            canonical: windows-x64
-            ext: '.exe'
     steps:
       - uses: actions/checkout@v5
         with:
@@ -247,7 +243,12 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish --locked
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::notice::CRATES_IO_TOKEN secret not set — skipping crates.io publish (set in org secrets to enable)"
+            exit 0
+          fi
+          cargo publish --locked
 
   bump-manifest:
     needs: [bump, publish]
