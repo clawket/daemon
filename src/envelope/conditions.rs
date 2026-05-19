@@ -386,7 +386,7 @@ mod tests {
         let t = make_task(&mut f, "dep");
         let ctx = EvalContext::new(&f.db.conn, None);
         let pred = json!({"type": "task_status", "task_id": t.id, "equals": "done"});
-        let v = evaluate(&[pred.clone()], &ctx).unwrap_err();
+        let v = evaluate(std::slice::from_ref(&pred), &ctx).unwrap_err();
         assert_eq!(v.predicate, pred);
         assert!(v.reason.contains("expected"));
     }
@@ -414,11 +414,7 @@ mod tests {
         let f = fixture();
         let dir = tempfile::tempdir().unwrap();
         let ctx = EvalContext::new(&f.db.conn, Some(dir.path().to_path_buf()));
-        let v = evaluate(
-            &[json!({"type": "file_exists", "path": "nope.txt"})],
-            &ctx,
-        )
-        .unwrap_err();
+        let v = evaluate(&[json!({"type": "file_exists", "path": "nope.txt"})], &ctx).unwrap_err();
         assert!(v.reason.contains("does not exist"));
     }
 

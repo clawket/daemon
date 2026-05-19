@@ -119,7 +119,10 @@ async fn create(
     json_or_404(created)
 }
 
-async fn get_one(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Knowledge>> {
+async fn get_one(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Knowledge>> {
     json_or_404(knowledge::get(&app.conn(), &id)?)
 }
 
@@ -132,7 +135,9 @@ async fn delete_one(
         Some(_) => {
             knowledge::soft_delete(&app.conn(), &id)?;
             app.emit("knowledge:deleted", serde_json::json!({ "id": id }));
-            Ok(Json(serde_json::json!({ "ok": true, "deleted": id, "soft": true })))
+            Ok(Json(
+                serde_json::json!({ "ok": true, "deleted": id, "soft": true }),
+            ))
         }
         None => Err(ApiError::not_found("knowledge not found")),
     }
@@ -180,10 +185,12 @@ async fn update(
 
     // Update wiki_idx if provided.
     if let Some(idx) = body.wiki_idx {
-        app.conn().execute(
-            "UPDATE knowledge SET wiki_idx = ?1 WHERE id = ?2",
-            rusqlite::params![idx, id],
-        ).ok();
+        app.conn()
+            .execute(
+                "UPDATE knowledge SET wiki_idx = ?1 WHERE id = ?2",
+                rusqlite::params![idx, id],
+            )
+            .ok();
     }
 
     app.emit("knowledge:updated", serde_json::json!({ "id": updated.id }));
@@ -238,7 +245,11 @@ async fn search(
     let project_id = q.project_id.as_deref();
 
     // Fetch extra results when a project filter narrows the set post-hoc.
-    let fetch_limit = if project_id.is_some() { limit * 3 } else { limit };
+    let fetch_limit = if project_id.is_some() {
+        limit * 3
+    } else {
+        limit
+    };
 
     if mode == "semantic" || mode == "hybrid" {
         if let Ok(Some(vec)) = embeddings::embed(&query).await {
@@ -268,22 +279,27 @@ async fn search(
             // Hybrid: merge BM25 + vector.
             let fts = knowledge::keyword_search(&app.conn(), &query, fetch_limit)?;
 
-            let mut bm25_map: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+            let mut bm25_map: std::collections::HashMap<String, f32> =
+                std::collections::HashMap::new();
             let n_fts = fts.len() as f32;
             for (rank, a) in fts.iter().enumerate() {
                 let score = 1.0 - (rank as f32 / n_fts.max(1.0));
                 bm25_map.insert(a.id.clone(), score);
             }
 
-            let mut vec_map: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-            let mut knowledge_map: std::collections::HashMap<String, Knowledge> = std::collections::HashMap::new();
-            for (_rank, (a, distance)) in vec_hits.iter().enumerate() {
+            let mut vec_map: std::collections::HashMap<String, f32> =
+                std::collections::HashMap::new();
+            let mut knowledge_map: std::collections::HashMap<String, Knowledge> =
+                std::collections::HashMap::new();
+            for (a, distance) in vec_hits.iter() {
                 let score = 1.0 - (distance / 2.0).clamp(0.0, 1.0);
                 vec_map.insert(a.id.clone(), score);
                 knowledge_map.insert(a.id.clone(), a.clone());
             }
             for a in &fts {
-                knowledge_map.entry(a.id.clone()).or_insert_with(|| a.clone());
+                knowledge_map
+                    .entry(a.id.clone())
+                    .or_insert_with(|| a.clone());
             }
 
             let mut merged: Vec<KnowledgeHit> = knowledge_map
@@ -313,7 +329,8 @@ async fn search(
                 .collect();
 
             merged.sort_by(|a, b| {
-                b.hybrid_score.unwrap_or(0.0)
+                b.hybrid_score
+                    .unwrap_or(0.0)
                     .partial_cmp(&a.hybrid_score.unwrap_or(0.0))
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
@@ -370,31 +387,46 @@ fn project_id_matches(kn: &Knowledge, project_id: Option<&str>, app: &AppState) 
     }
     let conn = app.conn();
     if let Some(plan_id) = &kn.plan_id {
-        let ok: bool = conn.query_row(
-            "SELECT COUNT(*) FROM plans WHERE id = ?1 AND project_id = ?2",
-            rusqlite::params![plan_id, pid],
-            |r| r.get::<_, i64>(0),
-        ).unwrap_or(0) > 0;
-        if ok { return true; }
+        let ok: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM plans WHERE id = ?1 AND project_id = ?2",
+                rusqlite::params![plan_id, pid],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if ok {
+            return true;
+        }
     }
     if let Some(unit_id) = &kn.unit_id {
-        let ok: bool = conn.query_row(
-            "SELECT COUNT(*) FROM plans pl JOIN units u ON u.plan_id = pl.id
+        let ok: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM plans pl JOIN units u ON u.plan_id = pl.id
              WHERE u.id = ?1 AND pl.project_id = ?2",
-            rusqlite::params![unit_id, pid],
-            |r| r.get::<_, i64>(0),
-        ).unwrap_or(0) > 0;
-        if ok { return true; }
+                rusqlite::params![unit_id, pid],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if ok {
+            return true;
+        }
     }
     if let Some(task_id) = &kn.task_id {
-        let ok: bool = conn.query_row(
-            "SELECT COUNT(*) FROM plans pl JOIN units u ON u.plan_id = pl.id
+        let ok: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM plans pl JOIN units u ON u.plan_id = pl.id
              JOIN tasks t ON t.unit_id = u.id
              WHERE t.id = ?1 AND pl.project_id = ?2",
-            rusqlite::params![task_id, pid],
-            |r| r.get::<_, i64>(0),
-        ).unwrap_or(0) > 0;
-        if ok { return true; }
+                rusqlite::params![task_id, pid],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if ok {
+            return true;
+        }
     }
     false
 }
@@ -447,7 +479,9 @@ async fn snapshot_version(
         app.emit("knowledge:updated", serde_json::json!({ "id": id }));
     }
     match version {
-        Some(v) => Ok(Json(serde_json::to_value(v).map_err(|e| ApiError::internal(e.to_string()))?)),
+        Some(v) => Ok(Json(
+            serde_json::to_value(v).map_err(|e| ApiError::internal(e.to_string()))?,
+        )),
         None => Err(ApiError::not_found("knowledge not found")),
     }
 }

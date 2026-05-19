@@ -47,22 +47,30 @@ async fn replay_at(
         )
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let rows: Vec<(String, String, Option<String>, Option<String>, Option<String>, String, String)> =
-        stmt
-            .query_map(rusqlite::params![id, cutoff], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                ))
-            })
-            .map_err(|e| ApiError::internal(e.to_string()))?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+    type AuditRow = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+    );
+    let rows: Vec<AuditRow> = stmt
+        .query_map(rusqlite::params![id, cutoff], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let audit_count = rows.len() as i64;
     let mut snapshot = serde_json::Map::new();
@@ -112,7 +120,10 @@ struct ListQuery {
     project_id: Option<String>,
 }
 
-async fn list(State(app): State<AppState>, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Run>>> {
+async fn list(
+    State(app): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> ApiResult<Json<Vec<Run>>> {
     Ok(Json(runs::list(
         &app.conn(),
         runs::ListFilter {
@@ -202,10 +213,7 @@ async fn create(State(app): State<AppState>, Json(body): Json<CreateBody>) -> Ap
     json_or_404(created)
 }
 
-fn freeze_resolved_envelope(
-    conn: &rusqlite::Connection,
-    task_id: &str,
-) -> ApiResult<Value> {
+fn freeze_resolved_envelope(conn: &rusqlite::Connection, task_id: &str) -> ApiResult<Value> {
     const RESOLVE_CHAIN_MAX_DEPTH: i64 = 32;
     let chain = task_envelopes::resolve_chain(conn, task_id, RESOLVE_CHAIN_MAX_DEPTH)?;
     Ok(task_envelopes::resolve_chain_active(&chain))
@@ -237,12 +245,7 @@ async fn finish(
     Path(id): Path<String>,
     Json(body): Json<FinishBody>,
 ) -> ApiResult<Json<Run>> {
-    let updated = runs::finish(
-        &app.conn(),
-        &id,
-        &body.result,
-        body.notes.as_deref(),
-    )?;
+    let updated = runs::finish(&app.conn(), &id, &body.result, body.notes.as_deref())?;
     if let Some(ref run) = updated {
         app.emit(
             "run:updated",
@@ -394,7 +397,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "body: {v}");
         assert_eq!(v["status"], "started");
         assert!(v.get("envelope_id").map(|x| x.is_null()).unwrap_or(true));
-        assert!(v.get("envelope_snapshot").map(|x| x.is_null()).unwrap_or(true));
+        assert!(v
+            .get("envelope_snapshot")
+            .map(|x| x.is_null())
+            .unwrap_or(true));
     }
 
     #[tokio::test]

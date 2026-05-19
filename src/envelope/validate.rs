@@ -54,18 +54,12 @@ pub fn validate_envelope(envelope: &Value, strict: bool) -> ValidateResult {
             Some(Value::Null) | None => v.push(Violation {
                 field: required.to_string(),
                 severity: Severity::Error,
-                message: format!(
-                    "required field `{}` missing on resolved envelope",
-                    required
-                ),
+                message: format!("required field `{}` missing on resolved envelope", required),
             }),
             _ => v.push(Violation {
                 field: required.to_string(),
                 severity: Severity::Error,
-                message: format!(
-                    "required field `{}` must be a non-empty string",
-                    required
-                ),
+                message: format!("required field `{}` must be a non-empty string", required),
             }),
         }
     }
@@ -125,7 +119,7 @@ pub fn validate_envelope(envelope: &Value, strict: bool) -> ValidateResult {
 
     if let Some(hint) = envelope.get("atomic_size_hint") {
         match hint.as_str() {
-            Some(s) if matches!(s, "tiny" | "small" | "medium" | "large") => {}
+            Some("tiny" | "small" | "medium" | "large") => {}
             Some(other) => v.push(Violation {
                 field: "atomic_size_hint".into(),
                 severity: Severity::Error,
@@ -167,10 +161,7 @@ pub fn validate_envelope(envelope: &Value, strict: bool) -> ValidateResult {
                 v.push(Violation {
                     field: cond_field.into(),
                     severity: Severity::Error,
-                    message: format!(
-                        "{} must be an array of expression strings",
-                        cond_field
-                    ),
+                    message: format!("{} must be an array of expression strings", cond_field),
                 });
             }
         }
@@ -243,7 +234,11 @@ mod tests {
             "decomposition_policy": "auto",
         });
         let result = validate_envelope(&env, true);
-        assert!(result.valid, "expected valid envelope: {:?}", result.violations);
+        assert!(
+            result.valid,
+            "expected valid envelope: {:?}",
+            result.violations
+        );
         assert!(result.violations.is_empty());
     }
 
@@ -283,7 +278,10 @@ mod tests {
         });
         let result = validate_envelope(&env, false);
         assert!(!result.valid);
-        assert!(result.violations.iter().any(|v| v.field == "success_criteria"));
+        assert!(result
+            .violations
+            .iter()
+            .any(|v| v.field == "success_criteria"));
     }
 
     #[test]
@@ -314,7 +312,10 @@ mod tests {
         });
         let result = validate_envelope(&env, false);
         assert!(!result.valid);
-        assert!(result.violations.iter().any(|v| v.field == "preconditions[0]"));
+        assert!(result
+            .violations
+            .iter()
+            .any(|v| v.field == "preconditions[0]"));
     }
 
     #[test]

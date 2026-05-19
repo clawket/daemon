@@ -147,10 +147,16 @@ impl From<rusqlite::Error> for ApiError {
         if matches!(
             err,
             rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error { code: rusqlite::ErrorCode::DatabaseBusy, .. },
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DatabaseBusy,
+                    ..
+                },
                 _
             ) | rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error { code: rusqlite::ErrorCode::DatabaseLocked, .. },
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DatabaseLocked,
+                    ..
+                },
                 _
             )
         ) {
@@ -194,6 +200,9 @@ impl From<anyhow::Error> for ApiError {
         }
         if msg.starts_with("INVALID_QA_STATUS:") {
             return ApiError::bad_request_coded("INVALID_QA_STATUS", msg);
+        }
+        if msg.starts_with("INVALID_TITLE:") {
+            return ApiError::bad_request_coded("INVALID_TITLE", msg);
         }
         if msg.starts_with("CYCLE_UNIT_MISMATCH:") {
             return ApiError::bad_request_coded("CYCLE_UNIT_MISMATCH", msg);

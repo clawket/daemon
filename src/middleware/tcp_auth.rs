@@ -196,10 +196,7 @@ fn authority_of(url: &str) -> Option<&str> {
     // Accept "scheme://authority[/path...]". For an exact host:port match we
     // strip the scheme and any path/fragment.
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    let authority = after_scheme
-        .split(|c: char| c == '/' || c == '?' || c == '#')
-        .next()
-        .unwrap_or("");
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() {
         None
     } else {
@@ -214,7 +211,10 @@ mod tests {
     #[test]
     fn extract_cookie_finds_named_value() {
         let raw = "foo=bar; clawket_session=abc123; baz=qux";
-        assert_eq!(extract_cookie(raw, "clawket_session"), Some("abc123".into()));
+        assert_eq!(
+            extract_cookie(raw, "clawket_session"),
+            Some("abc123".into())
+        );
         assert_eq!(extract_cookie(raw, "foo"), Some("bar".into()));
         assert_eq!(extract_cookie(raw, "missing"), None);
     }
@@ -229,9 +229,15 @@ mod tests {
 
     #[test]
     fn authority_of_strips_scheme_and_path() {
-        assert_eq!(authority_of("http://localhost:19400/foo"), Some("localhost:19400"));
+        assert_eq!(
+            authority_of("http://localhost:19400/foo"),
+            Some("localhost:19400")
+        );
         assert_eq!(authority_of("https://example.com"), Some("example.com"));
-        assert_eq!(authority_of("http://127.0.0.1:5174/?x=1"), Some("127.0.0.1:5174"));
+        assert_eq!(
+            authority_of("http://127.0.0.1:5174/?x=1"),
+            Some("127.0.0.1:5174")
+        );
     }
 
     #[test]
@@ -246,6 +252,10 @@ mod tests {
             None,
             Some("localhost:19400"),
         ));
-        assert!(!origin_or_referer_matches_host(None, None, Some("localhost:19400")));
+        assert!(!origin_or_referer_matches_host(
+            None,
+            None,
+            Some("localhost:19400")
+        ));
     }
 }

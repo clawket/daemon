@@ -18,7 +18,7 @@ pub fn create(conn: &Connection, input: CreateInput<'_>) -> Result<Option<Run>> 
     let status = input.status.unwrap_or("started");
     let snapshot_json = input
         .envelope_snapshot
-        .map(|v| serde_json::to_string(v))
+        .map(serde_json::to_string)
         .transpose()?;
     conn.execute(
         "INSERT INTO runs

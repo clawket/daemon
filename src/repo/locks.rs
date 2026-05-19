@@ -138,8 +138,20 @@ pub fn release(conn: &Connection, task_id: &str, session_id: &str) -> Result<boo
 /// use only. Production wiring lands alongside `clawket doctor` (LM-69+).
 #[allow(dead_code)]
 pub fn force_release(conn: &Connection, task_id: &str) -> Result<bool> {
-    let n = conn.execute("DELETE FROM task_locks WHERE task_id = ?1", params![task_id])?;
+    let n = conn.execute(
+        "DELETE FROM task_locks WHERE task_id = ?1",
+        params![task_id],
+    )?;
     Ok(n > 0)
+}
+
+impl std::fmt::Debug for AcquireOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AcquireOutcome::Acquired(l) => write!(f, "Acquired(session={})", l.session_id),
+            AcquireOutcome::Conflict(l) => write!(f, "Conflict(session={})", l.session_id),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -334,14 +346,5 @@ mod tests {
         let _ = acquire(&db.conn, &task_id, "session-A", 60_000).unwrap();
         assert!(force_release(&db.conn, &task_id).unwrap());
         assert!(get(&db.conn, &task_id).unwrap().is_none());
-    }
-}
-
-impl std::fmt::Debug for AcquireOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AcquireOutcome::Acquired(l) => write!(f, "Acquired(session={})", l.session_id),
-            AcquireOutcome::Conflict(l) => write!(f, "Conflict(session={})", l.session_id),
-        }
     }
 }

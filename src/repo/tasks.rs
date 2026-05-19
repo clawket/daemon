@@ -42,6 +42,10 @@ pub fn create(conn: &mut Connection, input: CreateInput<'_>) -> Result<Option<Ta
         bail!("unit_id is required");
     }
 
+    if input.title.trim().is_empty() {
+        bail!("INVALID_TITLE: title cannot be empty");
+    }
+
     // FIX-DAEMON-r2-tier: validate tier if explicitly provided. Empty/None falls
     // through and the SQL DEFAULT (then the application fallback below) supplies 'med'.
     if let Some(t) = input.tier {
@@ -79,16 +83,6 @@ pub fn create(conn: &mut Connection, input: CreateInput<'_>) -> Result<Option<Ta
     }
 
     let unit = units::get(conn, input.unit_id)?;
-    if let Some(ref u) = unit {
-        if let Some(plan) = plans::get(conn, &u.plan_id)? {
-            if plan.status == "draft" {
-                bail!(
-                    "Cannot create tasks under draft plan \"{}\" ({}). Approve it first: clawket plan approve {}",
-                    plan.title, plan.id, plan.id
-                );
-            }
-        }
-    }
 
     let mut cycle_id = input.cycle_id.map(String::from);
     if cycle_id.is_none() {
@@ -213,8 +207,9 @@ pub fn create(conn: &mut Connection, input: CreateInput<'_>) -> Result<Option<Ta
             // Find round number = position of `cid` in the unit's cycle list
             // ordered by created_at ASC (1-indexed). The unit_id comes from
             // the task being inserted (input.unit_id).
-            let prior_cycle_id: Option<String> = tx.query_row(
-                "SELECT prev.id
+            let prior_cycle_id: Option<String> = tx
+                .query_row(
+                    "SELECT prev.id
                  FROM cycles cur
                  JOIN cycles prev ON prev.unit_id = cur.unit_id
                  WHERE cur.id = ?1
@@ -222,10 +217,10 @@ pub fn create(conn: &mut Connection, input: CreateInput<'_>) -> Result<Option<Ta
                    AND prev.created_at < cur.created_at
                  ORDER BY prev.created_at DESC, prev.id DESC
                  LIMIT 1",
-                params![cid, input.unit_id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?;
+                    params![cid, input.unit_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
             if let Some(prev_cid) = prior_cycle_id {
                 let prior_defect_exists: bool = tx
                     .query_row(
@@ -449,9 +444,8 @@ pub fn stats_by_batch(conn: &Connection, batch_id: &str) -> Result<BatchStats> {
     // Validation of batch_id format is the route layer's responsibility — repo
     // simply parameterizes the lookup. The partial index idx_tasks_batch_id
     // (migration 022) covers the WHERE clause for O(log n) execution.
-    let mut stmt = conn.prepare(
-        "SELECT qa_status, COUNT(*) FROM tasks WHERE batch_id = ?1 GROUP BY qa_status",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT qa_status, COUNT(*) FROM tasks WHERE batch_id = ?1 GROUP BY qa_status")?;
     let rows = stmt.query_map([batch_id], |r| {
         let qs: Option<String> = r.get(0)?;
         let n: i64 = r.get(1)?;
@@ -523,12 +517,22 @@ pub struct UpdateFields {
     pub actor: Option<String>,
 }
 
-/// FIX-DAEMON-106: returns (task, cascade_events) where cascade_events is a list of
-/// (event_name, entity_id) that the route layer should emit via SSE.
-pub fn update(conn: &mut Connection, id: &str, f: UpdateFields) -> Result<(Option<Task>, Vec<(&'static str, String)>)> {
-    let canonical = resolve_id(conn, id)?
-        .ok_or_else(|| anyhow::anyhow!("Task not found: {}", id))?;
+pub type CascadeEvent = (&'static str, String);
+
+pub fn update(
+    conn: &mut Connection,
+    id: &str,
+    f: UpdateFields,
+) -> Result<(Option<Task>, Vec<CascadeEvent>)> {
+    let canonical =
+        resolve_id(conn, id)?.ok_or_else(|| anyhow::anyhow!("Task not found: {}", id))?;
     let old = get(conn, &canonical)?;
+
+    if let Some(ref new_title) = f.title {
+        if new_title.trim().is_empty() {
+            bail!("INVALID_TITLE: title cannot be empty");
+        }
+    }
 
     // FIX-DAEMON-r2-tier: validate tier on update before any other work.
     if let Some(Some(ref new_tier)) = f.tier {
@@ -541,9 +545,7 @@ pub fn update(conn: &mut Connection, id: &str, f: UpdateFields) -> Result<(Optio
     }
     // FIX-DAEMON-r2-qa: validate qa_status on update.
     if let Some(Some(ref new_qa)) = f.qa_status {
-        if !new_qa.is_empty()
-            && !matches!(new_qa.as_str(), "pass" | "defect" | "scenario_error")
-        {
+        if !new_qa.is_empty() && !matches!(new_qa.as_str(), "pass" | "defect" | "scenario_error") {
             bail!(
                 "INVALID_QA_STATUS: qa_status='{}' is not allowed. Valid: pass, defect, scenario_error",
                 new_qa
@@ -596,12 +598,13 @@ pub fn update(conn: &mut Connection, id: &str, f: UpdateFields) -> Result<(Optio
                 | ("blocked",   "cancelled")
                 | ("done",      "todo")     // re-open
                 | ("done",      "cancelled")
-                | ("cancelled", "todo")     // re-open
+                | ("cancelled", "todo") // re-open
             );
             if !valid && from != to {
                 bail!(
                     "INVALID_TRANSITION: task cannot transition from '{}' to '{}'",
-                    from, to
+                    from,
+                    to
                 );
             }
         }
@@ -720,11 +723,21 @@ pub fn update(conn: &mut Connection, id: &str, f: UpdateFields) -> Result<(Optio
     push_str_opt(&mut sets, &mut vals, "tier = ?", &f.tier);
     // TIER-042: tier_used + escalation_reason
     push_str_opt(&mut sets, &mut vals, "tier_used = ?", &f.tier_used);
-    push_str_opt(&mut sets, &mut vals, "escalation_reason = ?", &f.escalation_reason);
+    push_str_opt(
+        &mut sets,
+        &mut vals,
+        "escalation_reason = ?",
+        &f.escalation_reason,
+    );
     push_str_opt(&mut sets, &mut vals, "qa_status = ?", &f.qa_status);
     push_str_opt(&mut sets, &mut vals, "scenario_id = ?", &f.scenario_id);
     push_str_opt(&mut sets, &mut vals, "defect_task = ?", &f.defect_task);
-    push_str_opt(&mut sets, &mut vals, "scenario_amendment = ?", &f.scenario_amendment);
+    push_str_opt(
+        &mut sets,
+        &mut vals,
+        "scenario_amendment = ?",
+        &f.scenario_amendment,
+    );
     // US-CKT-SCHEMA-011/021: evidence + batch_id
     push_str_opt(&mut sets, &mut vals, "evidence = ?", &f.evidence);
     push_str_opt(&mut sets, &mut vals, "batch_id = ?", &f.batch_id);
@@ -769,7 +782,9 @@ pub fn update(conn: &mut Connection, id: &str, f: UpdateFields) -> Result<(Optio
                     "SELECT COUNT(*) FROM runs WHERE task_id = ?1 AND ended_at IS NULL",
                     params![canonical],
                     |r| r.get::<_, i64>(0),
-                ).unwrap_or(0) > 0
+                )
+                .unwrap_or(0)
+                    > 0
             };
             if !has_open_run {
                 let agent = f
@@ -801,14 +816,16 @@ pub fn update(conn: &mut Connection, id: &str, f: UpdateFields) -> Result<(Optio
         }
         if status == "in_progress" {
             // Check plan active guard
-            let (plan_status, plan_title, plan_id): (String, String, String) = tx.query_row(
-                "SELECT pl.status, pl.title, pl.id FROM plans pl
+            let (plan_status, plan_title, plan_id): (String, String, String) = tx
+                .query_row(
+                    "SELECT pl.status, pl.title, pl.id FROM plans pl
                  JOIN units u ON u.plan_id = pl.id
                  JOIN tasks t ON t.unit_id = u.id
                  WHERE t.id = ?1",
-                params![canonical],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            ).unwrap_or_else(|_| ("active".into(), "".into(), "".into()));
+                    params![canonical],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap_or_else(|_| ("active".into(), "".into(), "".into()));
             if plan_status != "active" {
                 bail!(
                     "Cannot start task: plan \"{}\" is {}. Approve it first: clawket plan approve {}",
@@ -816,13 +833,15 @@ pub fn update(conn: &mut Connection, id: &str, f: UpdateFields) -> Result<(Optio
                 );
             }
             // Check cycle active guard
-            let cycle_check: Option<(String, String, String)> = tx.query_row(
-                "SELECT c.id, c.status, c.title FROM cycles c
+            let cycle_check: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT c.id, c.status, c.title FROM cycles c
                  JOIN tasks t ON t.cycle_id = c.id
                  WHERE t.id = ?1",
-                params![canonical],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            ).optional()?;
+                    params![canonical],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
             match cycle_check {
                 None => bail!(
                     "MISSING_CYCLE_ID: Cannot start task: no cycle assigned. Assign a cycle first: clawket task update {} --cycle <CYC-ID>",
@@ -844,12 +863,8 @@ pub fn update(conn: &mut Connection, id: &str, f: UpdateFields) -> Result<(Optio
         let actor = f
             .actor
             .as_deref()
-            .or_else(|| {
-                f.assignee
-                    .as_ref()
-                    .and_then(|a| a.as_deref())
-            })
-            .or_else(|| old_task.assignee.as_deref())
+            .or_else(|| f.assignee.as_ref().and_then(|a| a.as_deref()))
+            .or(old_task.assignee.as_deref())
             .unwrap_or("system");
         let actor = match actor {
             "claude" | "cli" | "external-api" | "system" => actor,
@@ -878,7 +893,12 @@ pub fn update(conn: &mut Connection, id: &str, f: UpdateFields) -> Result<(Optio
                      VALUES (?1, 'task', ?2, 'status_change', 'status', ?3, ?4, ?5, ?6)",
                     params![log_id, canonical, old_task.status, new_status, actor, ts],
                 );
-                write_audit("status", "status_change", Some(&old_task.status), Some(new_status));
+                write_audit(
+                    "status",
+                    "status_change",
+                    Some(&old_task.status),
+                    Some(new_status),
+                );
             }
         }
         // title change
@@ -976,7 +996,7 @@ pub fn update(conn: &mut Connection, id: &str, f: UpdateFields) -> Result<(Optio
 
     // Post-commit: cascade completion (requires conn, not tx)
     // FIX-DAEMON-106: cascade returns (event_name, entity_id) pairs for SSE emit at route layer
-    let cascade_events: Vec<(&'static str, String)> = if let Some(status) = &f.status {
+    let cascade_events: Vec<CascadeEvent> = if let Some(status) = &f.status {
         if TERMINAL.contains(&status.as_str()) {
             cascade_complete(conn, &canonical)?
         } else {
@@ -1007,8 +1027,8 @@ pub fn delete(conn: &Connection, id: &str) -> Result<()> {
 }
 
 pub fn add_label(conn: &Connection, id: &str, label: &str) -> Result<Option<Task>> {
-    let canonical = resolve_id(conn, id)?
-        .ok_or_else(|| anyhow::anyhow!("Task not found: {}", id))?;
+    let canonical =
+        resolve_id(conn, id)?.ok_or_else(|| anyhow::anyhow!("Task not found: {}", id))?;
     conn.execute(
         "INSERT OR IGNORE INTO task_labels (task_id, label) VALUES (?1, ?2)",
         params![canonical, label],
@@ -1017,8 +1037,8 @@ pub fn add_label(conn: &Connection, id: &str, label: &str) -> Result<Option<Task
 }
 
 pub fn remove_label(conn: &Connection, id: &str, label: &str) -> Result<Option<Task>> {
-    let canonical = resolve_id(conn, id)?
-        .ok_or_else(|| anyhow::anyhow!("Task not found: {}", id))?;
+    let canonical =
+        resolve_id(conn, id)?.ok_or_else(|| anyhow::anyhow!("Task not found: {}", id))?;
     conn.execute(
         "DELETE FROM task_labels WHERE task_id = ?1 AND label = ?2",
         params![canonical, label],
@@ -1027,8 +1047,8 @@ pub fn remove_label(conn: &Connection, id: &str, label: &str) -> Result<Option<T
 }
 
 /// FIX-DAEMON-106: cascade_complete returns list of (event_name, entity_id) for SSE emit
-pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<(&'static str, String)>> {
-    let mut cascaded: Vec<(&'static str, String)> = Vec::new();
+pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<CascadeEvent>> {
+    let mut cascaded: Vec<CascadeEvent> = Vec::new();
     let task = match get(conn, task_id)? {
         Some(t) => t,
         None => return Ok(cascaded),
@@ -1062,17 +1082,20 @@ pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<(&'s
                 plan_id: Some(&unit.plan_id),
             },
         )?;
-        let all_plan_done = !plan_units.is_empty() && plan_units.iter().all(|u| {
-            list(
-                conn,
-                ListFilter {
-                    unit_id: Some(&u.id),
-                    ..Default::default()
-                },
-            )
-            .map(|tasks| !tasks.is_empty() && tasks.iter().all(|t| TERMINAL.contains(&t.status.as_str())))
-            .unwrap_or(false)
-        });
+        let all_plan_done = !plan_units.is_empty()
+            && plan_units.iter().all(|u| {
+                list(
+                    conn,
+                    ListFilter {
+                        unit_id: Some(&u.id),
+                        ..Default::default()
+                    },
+                )
+                .map(|tasks| {
+                    !tasks.is_empty() && tasks.iter().all(|t| TERMINAL.contains(&t.status.as_str()))
+                })
+                .unwrap_or(false)
+            });
         if all_plan_done {
             if let Some(plan) = plans::get(conn, &unit.plan_id)? {
                 if plan.status == "active" {
@@ -1154,12 +1177,15 @@ fn extract_decisions(conn: &Connection, task: &Task, body: &str) -> Result<()> {
         let hash_tag = format!("decision-hash:{:016x}", hash);
 
         // Check if a knowledge entry with this hash already exists for this task.
-        let exists: bool = conn.query_row(
-            "SELECT COUNT(*) FROM knowledge WHERE task_id = ?1 AND type = 'decision'
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge WHERE task_id = ?1 AND type = 'decision'
              AND content LIKE ?2",
-            params![task.id, format!("%{}%", hash_tag)],
-            |r| r.get::<_, i64>(0),
-        ).unwrap_or(0) > 0;
+                params![task.id, format!("%{}%", hash_tag)],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
 
         if exists {
             continue;
@@ -1173,7 +1199,10 @@ fn extract_decisions(conn: &Connection, task: &Task, body: &str) -> Result<()> {
                 unit_id: None,
                 plan_id: None,
                 type_: "decision",
-                title: &format!("Decision: {}", &decision_text[..decision_text.len().min(80)]),
+                title: &format!(
+                    "Decision: {}",
+                    &decision_text[..decision_text.len().min(80)]
+                ),
                 content: Some(&content),
                 content_format: Some("md"),
                 parent_id: None,
@@ -1296,14 +1325,15 @@ pub fn descendants(
         Some(c) => c,
         None => return Ok(Vec::new()),
     };
-    let depth_cap = max_depth.max(1).min(TREE_WALK_MAX_DEPTH);
+    let depth_cap = max_depth.clamp(1, TREE_WALK_MAX_DEPTH);
     let cap = node_cap.max(1);
     let mut out: Vec<DescendantNode> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     seen.insert(canonical.clone());
 
     if bfs {
-        let mut queue: std::collections::VecDeque<(String, i64)> = std::collections::VecDeque::new();
+        let mut queue: std::collections::VecDeque<(String, i64)> =
+            std::collections::VecDeque::new();
         queue.push_back((canonical, 0));
         while let Some((parent_id, parent_depth)) = queue.pop_front() {
             if parent_depth as usize >= depth_cap {
@@ -1351,9 +1381,7 @@ pub fn descendants(
 }
 
 fn children_of(conn: &Connection, parent_id: &str) -> Result<Vec<Task>> {
-    let mut stmt = conn.prepare(
-        "SELECT id FROM tasks WHERE parent_task_id = ?1 ORDER BY idx",
-    )?;
+    let mut stmt = conn.prepare("SELECT id FROM tasks WHERE parent_task_id = ?1 ORDER BY idx")?;
     let rows = stmt.query_map(params![parent_id], |r| r.get::<_, String>(0))?;
     let mut out = Vec::new();
     for r in rows {
@@ -1412,9 +1440,8 @@ fn next_ticket_number(conn: &Connection, project_key: &str) -> Result<String> {
 }
 
 fn list_dependencies(conn: &Connection, task_id: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT depends_on_task_id FROM task_depends_on WHERE task_id = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT depends_on_task_id FROM task_depends_on WHERE task_id = ?1")?;
     let rows = stmt.query_map(params![task_id], |r| r.get::<_, String>(0))?;
     let mut out = Vec::new();
     for r in rows {
@@ -1439,7 +1466,10 @@ fn list_labels(conn: &Connection, task_id: &str) -> Result<Vec<String>> {
 // whitespace and append a prefix wildcard to each term so that "rust clap"
 // matches "rustfmt claps" style prefixes.
 fn build_fts_query(trimmed: &str) -> String {
-    if trimmed.chars().any(|c| matches!(c, '*' | '"' | ':' | '(' | ')')) {
+    if trimmed
+        .chars()
+        .any(|c| matches!(c, '*' | '"' | ':' | '(' | ')'))
+    {
         return trimmed.to_string();
     }
     let terms: Vec<String> = trimmed
@@ -1544,11 +1574,7 @@ pub fn store_embedding(conn: &Connection, task_id: &str, embedding: &[f32]) -> R
     Ok(())
 }
 
-pub fn vector_search(
-    conn: &Connection,
-    embedding: &[f32],
-    limit: i64,
-) -> Result<Vec<(Task, f32)>> {
+pub fn vector_search(conn: &Connection, embedding: &[f32], limit: i64) -> Result<Vec<(Task, f32)>> {
     let bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(
             embedding.as_ptr() as *const u8,
@@ -1659,9 +1685,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tasks_under_draft_plan() {
+    fn allows_task_creation_under_draft_plan_but_blocks_start() {
         let mut s = setup(false);
-        let err = create(
+        let task = create(
             &mut s.db.conn,
             CreateInput {
                 unit_id: &s.unit_id,
@@ -1674,7 +1700,7 @@ mod tests {
                 priority: None,
                 complexity: None,
                 estimated_edits: None,
-                cycle_id: None,
+                cycle_id: Some(&s.cycle_id),
                 reporter: None,
                 type_: None,
                 atomic_size_hint: None,
@@ -1688,8 +1714,18 @@ mod tests {
                 batch_id: None,
             },
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("draft plan"));
+        .unwrap()
+        .unwrap();
+        let f = UpdateFields {
+            status: Some("in_progress".to_string()),
+            ..UpdateFields::default()
+        };
+        let err = update(&mut s.db.conn, &task.id, f).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plan") && msg.contains("draft"),
+            "expected start-time draft guard, got: {msg}"
+        );
     }
 
     #[test]
@@ -1762,6 +1798,99 @@ mod tests {
 
         let by_ticket = get(&s.db.conn, "TB-1").unwrap().unwrap();
         assert_eq!(by_ticket.id, t.id);
+    }
+
+    #[test]
+    fn create_rejects_empty_title() {
+        let mut s = setup(true);
+        for empty in ["", "   ", "\t\n"] {
+            let err = create(
+                &mut s.db.conn,
+                CreateInput {
+                    unit_id: &s.unit_id,
+                    title: empty,
+                    body: None,
+                    assignee: None,
+                    idx: None,
+                    depends_on: vec![],
+                    parent_task_id: None,
+                    priority: None,
+                    complexity: None,
+                    estimated_edits: None,
+                    cycle_id: Some(&s.cycle_id),
+                    reporter: None,
+                    type_: None,
+                    atomic_size_hint: None,
+                    decomposition_policy: None,
+                    tier: None,
+                    qa_status: None,
+                    scenario_id: None,
+                    defect_task: None,
+                    scenario_amendment: None,
+                    evidence: None,
+                    batch_id: None,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().starts_with("INVALID_TITLE:"),
+                "expected INVALID_TITLE prefix, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_rejects_empty_title() {
+        let mut s = setup(true);
+        let t = create(
+            &mut s.db.conn,
+            CreateInput {
+                unit_id: &s.unit_id,
+                title: "T1",
+                body: None,
+                assignee: None,
+                idx: None,
+                depends_on: vec![],
+                parent_task_id: None,
+                priority: None,
+                complexity: None,
+                estimated_edits: None,
+                cycle_id: Some(&s.cycle_id),
+                reporter: None,
+                type_: None,
+                atomic_size_hint: None,
+                decomposition_policy: None,
+                tier: None,
+                qa_status: None,
+                scenario_id: None,
+                defect_task: None,
+                scenario_amendment: None,
+                evidence: None,
+                batch_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        for empty in ["", "   ", "\t\n"] {
+            let f = UpdateFields {
+                title: Some(empty.to_string()),
+                ..UpdateFields::default()
+            };
+            let err = update(&mut s.db.conn, &t.id, f).unwrap_err();
+            assert!(
+                err.to_string().starts_with("INVALID_TITLE:"),
+                "expected INVALID_TITLE prefix, got: {err}"
+            );
+        }
+
+        // Sanity check: non-empty title still works.
+        let f = UpdateFields {
+            title: Some("T1-renamed".to_string()),
+            ..UpdateFields::default()
+        };
+        let (updated, _events) = update(&mut s.db.conn, &t.id, f).unwrap();
+        assert_eq!(updated.unwrap().title, "T1-renamed");
     }
 
     #[test]
@@ -2055,10 +2184,9 @@ mod tests {
         // Sign a v2 envelope that intentionally omits "sigma". sign_for_task
         // (the route helper) would mark v1 as superseded; here we replicate
         // the behavior via supersede + create.
-        let active_v1 =
-            crate::repo::task_envelopes::active_for_task(&s.db.conn, &t_id)
-                .unwrap()
-                .unwrap();
+        let active_v1 = crate::repo::task_envelopes::active_for_task(&s.db.conn, &t_id)
+            .unwrap()
+            .unwrap();
         crate::repo::task_envelopes::supersede(&s.db.conn, &active_v1.id, "ENV-NEXT-PLACEHOLDER")
             .ok();
         let v2 = crate::repo::task_envelopes::create(

@@ -121,7 +121,7 @@ async fn smoke_crud_plan_unit_task_approve() {
         .unwrap();
     let pid = project["id"].as_str().unwrap().to_string();
 
-    // Plan starts in draft. Creating tasks under draft plan should fail.
+    // Happy path: approve plan → create unit → create+activate cycle → create task.
     let plan: serde_json::Value = c
         .post(format!("{}/plans", d.base))
         .json(&serde_json::json!({"project_id": pid, "title": "p"}))
@@ -433,7 +433,9 @@ async fn smoke_mcp_rag_tools_list() {
         "../mcp/rust/target/release/clawket-mcp-rs",
         "../mcp/rust/target/debug/clawket-mcp-rs",
     ];
-    let bin = candidates.iter().find(|p| std::path::Path::new(p).is_file());
+    let bin = candidates
+        .iter()
+        .find(|p| std::path::Path::new(p).is_file());
     let bin = match bin {
         Some(p) => *p,
         None => {

@@ -442,8 +442,8 @@ async fn dispatch_plan(
     }
 
     let conn = app.conn();
-    let plan = plans::get(&conn, &q.plan_id)?
-        .ok_or_else(|| ApiError::not_found("plan not found"))?;
+    let plan =
+        plans::get(&conn, &q.plan_id)?.ok_or_else(|| ApiError::not_found("plan not found"))?;
 
     let plan_units = units::list(
         &conn,
@@ -576,8 +576,7 @@ async fn verify_tsv(Json(body): Json<VerifyTsvBody>) -> ApiResult<Json<TsvValida
 ///     justification per qa-flow §2.5).
 fn validate_tsv_content(tsv: &str) -> TsvValidationResult {
     static SCENARIO_ID_RE: OnceLock<Regex> = OnceLock::new();
-    let sc_re =
-        SCENARIO_ID_RE.get_or_init(|| Regex::new(r"^US-[A-Z][A-Z0-9-]*-\d{3,}$").unwrap());
+    let sc_re = SCENARIO_ID_RE.get_or_init(|| Regex::new(r"^US-[A-Z][A-Z0-9-]*-\d{3,}$").unwrap());
 
     static BATCH_ID_RE: OnceLock<Regex> = OnceLock::new();
     let batch_re =
@@ -680,17 +679,15 @@ fn validate_tsv_content(tsv: &str) -> TsvValidationResult {
             errors.push(TsvRowError {
                 row: row_num,
                 field: "batch_id".to_string(),
-                message: "batch_id is required (R2 DOGFOOD-044 fix — expected BATCH-<26-char-ULID>)"
-                    .to_string(),
+                message:
+                    "batch_id is required (R2 DOGFOOD-044 fix — expected BATCH-<26-char-ULID>)"
+                        .to_string(),
             });
         } else if !batch_re.is_match(batch_id) {
             errors.push(TsvRowError {
                 row: row_num,
                 field: "batch_id".to_string(),
-                message: format!(
-                    "expected BATCH-<26-char-ULID>, got {:?}",
-                    batch_id
-                ),
+                message: format!("expected BATCH-<26-char-ULID>, got {:?}", batch_id),
             });
         }
 
@@ -831,8 +828,7 @@ async fn bulk_sync(
     let mut sync_errors: Vec<SyncRowError> = Vec::new();
 
     static SCENARIO_ID_RE: OnceLock<Regex> = OnceLock::new();
-    let sc_re =
-        SCENARIO_ID_RE.get_or_init(|| Regex::new(r"^US-[A-Z][A-Z0-9-]*-\d{3,}$").unwrap());
+    let sc_re = SCENARIO_ID_RE.get_or_init(|| Regex::new(r"^US-[A-Z][A-Z0-9-]*-\d{3,}$").unwrap());
 
     let mut data_row: u32 = 0;
     let mut failed_scenario_ids: Vec<String> = Vec::new();
@@ -937,16 +933,17 @@ async fn bulk_sync(
             .unwrap_or(None);
 
         if let Some(ref eid) = existing_id {
-            // Update existing task (transcription only — no reasoning).
-            let mut uf = tasks::UpdateFields::default();
-            uf.status = Some(task_status.to_string());
-            uf.qa_status = Some(qa_status_val.map(|s| s.to_string()));
-            uf.evidence = Some(evidence_opt.map(|s| s.to_string()));
-            uf.tier_used = Some(tier_opt.map(|s| s.to_string()));
-            uf.batch_id = Some(batch_opt.map(|s| s.to_string()));
-            uf.escalation_reason = Some(escalation_opt.map(|s| s.to_string()));
-            uf.scenario_amendment = Some(scenario_amendment_opt.map(|s| s.to_string()));
-            uf.body = Some(Some(reasoning.to_string()));
+            let uf = tasks::UpdateFields {
+                status: Some(task_status.to_string()),
+                qa_status: Some(qa_status_val.map(|s| s.to_string())),
+                evidence: Some(evidence_opt.map(|s| s.to_string())),
+                tier_used: Some(tier_opt.map(|s| s.to_string())),
+                batch_id: Some(batch_opt.map(|s| s.to_string())),
+                escalation_reason: Some(escalation_opt.map(|s| s.to_string())),
+                scenario_amendment: Some(scenario_amendment_opt.map(|s| s.to_string())),
+                body: Some(Some(reasoning.to_string())),
+                ..Default::default()
+            };
 
             match tasks::update(&mut conn, eid, uf) {
                 Ok((_, _cascade)) => {
@@ -997,14 +994,11 @@ async fn bulk_sync(
                 },
             ) {
                 Ok(Some(task)) => {
-                    // Transition todo → target status (X9: pure transcription).
-                    // Also persist escalation_reason (DOGFOOD-017 fix —
-                    // CreateInput lacks the field, so we set it on transition).
-                    let mut sf = tasks::UpdateFields::default();
-                    sf.status = Some(task_status.to_string());
-                    if let Some(er) = escalation_opt {
-                        sf.escalation_reason = Some(Some(er.to_string()));
-                    }
+                    let sf = tasks::UpdateFields {
+                        status: Some(task_status.to_string()),
+                        escalation_reason: escalation_opt.map(|er| Some(er.to_string())),
+                        ..Default::default()
+                    };
                     if let Err(e) = tasks::update(&mut conn, &task.id, sf) {
                         sync_errors.push(SyncRowError {
                             row: data_row,
@@ -1151,8 +1145,7 @@ async fn bulk_sync(
                 };
                 // Threshold per PDD A8 / qa-flow §8: back ≥ 1.5× front (and
                 // absolute back-defect ≥ 2 to avoid noise on tiny batches).
-                let attention_dilution_suspected =
-                    b_defect >= 2 && b_ratio >= f_ratio * 1.5;
+                let attention_dilution_suspected = b_defect >= 2 && b_ratio >= f_ratio * 1.5;
                 per_batch_stats.push(serde_json::json!({
                     "batch_id": bid,
                     "row_count": n,
@@ -1305,10 +1298,7 @@ async fn convergence_status(
         },
     )
     .ok()
-    .and_then(|list| {
-        list.into_iter()
-            .find(|a| a.title == audit_title)
-    });
+    .and_then(|list| list.into_iter().find(|a| a.title == audit_title));
     if let Some(a) = existing_audit {
         // Append (idempotent on identical line — only append if last differs).
         let prev_body = a.content.clone();
@@ -1392,11 +1382,9 @@ async fn converged(
     // last-2-rounds-zero check.
     let prev_zero = match current_round {
         None | Some(0) | Some(1) => false,
-        Some(r) => {
-            find_prev_round_plan(&conn, &plan.project_id, &plan.title, r - 1)?
-                .map(|p| p.counts.defect == 0 && p.counts.scenario_error == 0)
-                .unwrap_or(false)
-        }
+        Some(r) => find_prev_round_plan(&conn, &plan.project_id, &plan.title, r - 1)?
+            .map(|p| p.counts.defect == 0 && p.counts.scenario_error == 0)
+            .unwrap_or(false),
     };
 
     let c = cur_zero && prev_zero;
@@ -1444,7 +1432,9 @@ async fn converged(
         converged: c,
         reason,
         current_round,
-        previous_round: current_round.map(|r| r.saturating_sub(1)).filter(|&r| r > 0),
+        previous_round: current_round
+            .map(|r| r.saturating_sub(1))
+            .filter(|&r| r > 0),
     }))
 }
 
@@ -1504,8 +1494,7 @@ fn resolve_plan(
     project_id: Option<&str>,
 ) -> ApiResult<Plan> {
     if let Some(pid) = plan_id {
-        plans::get(conn, pid)?
-            .ok_or_else(|| ApiError::not_found("plan not found"))
+        plans::get(conn, pid)?.ok_or_else(|| ApiError::not_found("plan not found"))
     } else if let Some(proj_id) = project_id {
         let active = plans::list(
             conn,

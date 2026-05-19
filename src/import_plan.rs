@@ -146,9 +146,8 @@ pub struct ParsedPlan {
     pub units: Vec<ParsedUnit>,
 }
 
-static UNIT_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^##\s+Unit\s*(\d+)?\s*[:.]?\s*(.*)$").unwrap()
-});
+static UNIT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)^##\s+Unit\s*(\d+)?\s*[:.]?\s*(.*)$").unwrap());
 static H3_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^###\s+(.+)$").unwrap());
 static NUMBERED_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^\s*\d+\.\s+\*?\*?([^*]+)\*?\*?(.*)$").unwrap());
@@ -174,7 +173,10 @@ pub fn parse_plan_markdown(md: &str) -> ParsedPlan {
                 .map(|m| m.as_str().trim().to_string())
                 .filter(|s| !s.is_empty());
             let title = name.unwrap_or_else(|| {
-                format!("Unit {}", num.unwrap_or_else(|| (unit_markers.len() + 1).to_string()))
+                format!(
+                    "Unit {}",
+                    num.unwrap_or_else(|| (unit_markers.len() + 1).to_string())
+                )
             });
             unit_markers.push((i, title));
         }
@@ -361,9 +363,8 @@ static STRICT_UNIT_HEADING_RE: Lazy<Regex> =
 
 /// Mermaid node line: `  {id}["{label}"]` — two-space indent (or any
 /// leading whitespace), an identifier, a bracketed quoted label.
-static MERMAID_NODE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"^\s*([A-Za-z][A-Za-z0-9_-]*)\["([^"]+)"\]\s*$"#).unwrap()
-});
+static MERMAID_NODE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"^\s*([A-Za-z][A-Za-z0-9_-]*)\["([^"]+)"\]\s*$"#).unwrap());
 
 /// Mermaid edge line: `  {from} --> {to}` — single-headed arrow.
 static MERMAID_EDGE_RE: Lazy<Regex> = Lazy::new(|| {
@@ -405,10 +406,7 @@ pub fn parse_plan_strict(md: &str) -> Result<ParsedPlan, ImportError> {
             });
         }
     };
-    let title = lines[title_line]
-        .trim_start_matches('#')
-        .trim()
-        .to_string();
+    let title = lines[title_line].trim_start_matches('#').trim().to_string();
 
     // ## Meta — required, before any unit heading.
     let meta_idx = find_h2(&lines, "Meta");
@@ -726,8 +724,8 @@ fn parse_envelope_value(
                 j += 1;
                 continue;
             }
-            if l.starts_with("    ") {
-                buf.push(l[4..].to_string());
+            if let Some(stripped) = l.strip_prefix("    ") {
+                buf.push(stripped.to_string());
                 j += 1;
                 continue;
             }
@@ -745,13 +743,12 @@ fn parse_envelope_value(
     }
 
     // Single-line JSON literal: string ("..."), number, bool, array, object.
-    let parsed: serde_json::Value =
-        serde_json::from_str(value_str).map_err(|e| ImportError {
-            line: bullet_line + 1,
-            column: 1,
-            kind: ImportErrorKind::BadEnvelopeValue,
-            hint: format!("envelope value not a valid JSON literal: {e}"),
-        })?;
+    let parsed: serde_json::Value = serde_json::from_str(value_str).map_err(|e| ImportError {
+        line: bullet_line + 1,
+        column: 1,
+        kind: ImportErrorKind::BadEnvelopeValue,
+        hint: format!("envelope value not a valid JSON literal: {e}"),
+    })?;
     Ok((parsed, 1))
 }
 
@@ -820,9 +817,7 @@ fn parse_dependency_graph(
             line: fence_line + 1,
             column: 1,
             kind: ImportErrorKind::BadDepsGraphFence,
-            hint: format!(
-                "dependency graph fence must be ```mermaid, got ```{fence_lang}"
-            ),
+            hint: format!("dependency graph fence must be ```mermaid, got ```{fence_lang}"),
         });
     }
     // Find the closing fence.
@@ -869,8 +864,7 @@ fn parse_dependency_graph(
     let mut node_to_label: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut edges: Vec<(String, String, usize)> = Vec::new();
-    for li in (first + 1)..body_end {
-        let raw = lines[li];
+    for (li, &raw) in lines.iter().enumerate().take(body_end).skip(first + 1) {
         if raw.trim().is_empty() {
             continue;
         }
@@ -925,9 +919,7 @@ fn parse_dependency_graph(
             line: ln + 1,
             column: 1,
             kind: ImportErrorKind::UnknownDependsOnRef,
-            hint: format!(
-                "dependency reference `{raw}` does not match any task in this plan"
-            ),
+            hint: format!("dependency reference `{raw}` does not match any task in this plan"),
         })
     };
     let mut resolved: Vec<(String, String, usize)> = Vec::new();
@@ -944,10 +936,7 @@ fn parse_dependency_graph(
     let mut graph_deps: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for (from, to, _) in &resolved {
-        graph_deps
-            .entry(from.clone())
-            .or_default()
-            .push(to.clone());
+        graph_deps.entry(from.clone()).or_default().push(to.clone());
     }
     for u in units.iter_mut() {
         for t in u.tasks.iter_mut() {
@@ -994,9 +983,7 @@ fn parse_dependency_graph(
 /// Iterative DFS cycle detector. Returns `Err(DependencyCycle)` with a
 /// human-readable cycle path on the first cycle found; `Ok(())` if the
 /// graph is a DAG.
-fn detect_dependency_cycle(
-    resolved: &[(String, String, usize)],
-) -> Result<(), ImportError> {
+fn detect_dependency_cycle(resolved: &[(String, String, usize)]) -> Result<(), ImportError> {
     use std::collections::{HashMap, HashSet};
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     let mut nodes: HashSet<String> = HashSet::new();
@@ -1035,10 +1022,7 @@ fn detect_dependency_cycle(
                 1 => {
                     // Back edge — cycle. Build the path slice from
                     // where `nxt` first appears in the stack.
-                    let cycle_start = stack
-                        .iter()
-                        .position(|(n, _)| n == nxt)
-                        .unwrap_or(0);
+                    let cycle_start = stack.iter().position(|(n, _)| n == nxt).unwrap_or(0);
                     let mut path: Vec<String> = stack[cycle_start..]
                         .iter()
                         .map(|(n, _)| n.clone())
@@ -1145,14 +1129,11 @@ pub fn import_parsed_plan(
         bail!("no plan title (first # heading) found");
     };
 
-    let effective_cwd = opts
-        .cwd
-        .map(String::from)
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        });
+    let effective_cwd = opts.cwd.map(String::from).unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
 
     let project = if let Some(name) = opts.project_name {
         match projects::get_by_name(conn, name)? {
@@ -1174,7 +1155,12 @@ pub fn import_parsed_plan(
             None => {
                 let fallback = opts
                     .source_path
-                    .and_then(|p| Path::new(p).file_stem().and_then(|s| s.to_str()).map(String::from))
+                    .and_then(|p| {
+                        Path::new(p)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(String::from)
+                    })
                     .unwrap_or_else(|| title.clone())
                     .chars()
                     .take(40)
@@ -1438,7 +1424,10 @@ mod strict_tests {
     #[test]
     fn strict_happy_path_parses_skeleton() {
         let plan = parse_plan_strict(HAPPY_PLAN).expect("happy plan must parse");
-        assert_eq!(plan.title.as_deref(), Some("v11 — Structured Task Contracts"));
+        assert_eq!(
+            plan.title.as_deref(),
+            Some("v11 — Structured Task Contracts")
+        );
         assert_eq!(plan.units.len(), 1);
         assert_eq!(plan.units[0].title, "Foundations");
         assert_eq!(plan.units[0].tasks.len(), 1);
@@ -1637,7 +1626,10 @@ graph LR
             let err = parse_plan_strict(&wrap_with_envelope(bullets))
                 .expect_err("unknown key must reject");
             assert_eq!(err.kind, ImportErrorKind::BadEnvelopeKey);
-            assert!(err.hint.contains("mood"), "hint must name the bad key: {err:?}");
+            assert!(
+                err.hint.contains("mood"),
+                "hint must name the bad key: {err:?}"
+            );
         }
 
         /// Required-tier omission → `MissingRequiredKey`. Test both
@@ -1654,7 +1646,10 @@ graph LR
             let err = parse_plan_strict(&wrap_with_envelope(bullets))
                 .expect_err("missing intent must reject");
             assert_eq!(err.kind, ImportErrorKind::MissingRequiredKey);
-            assert!(err.hint.contains("intent"), "hint must name `intent`: {err:?}");
+            assert!(
+                err.hint.contains("intent"),
+                "hint must name `intent`: {err:?}"
+            );
         }
 
         #[test]
@@ -1682,8 +1677,8 @@ graph LR
 - `success_criteria`: [a, b]
 - `verification_cmd`: "x"
 - `decomposition_policy`: "atomic""#;
-            let err = parse_plan_strict(&wrap_with_envelope(bullets))
-                .expect_err("bad JSON must reject");
+            let err =
+                parse_plan_strict(&wrap_with_envelope(bullets)).expect_err("bad JSON must reject");
             assert_eq!(err.kind, ImportErrorKind::BadEnvelopeValue);
         }
 
@@ -1730,7 +1725,10 @@ graph LR
             let err = parse_plan_strict(&wrap_with_envelope(bullets))
                 .expect_err("out-of-order must reject");
             assert_eq!(err.kind, ImportErrorKind::EnvelopeOrderMismatch);
-            assert!(err.hint.contains("version"), "hint must name the late key: {err:?}");
+            assert!(
+                err.hint.contains("version"),
+                "hint must name the late key: {err:?}"
+            );
         }
 
         /// Bullet without backticks around the key → `BadEnvelopeBullet`.
@@ -1841,10 +1839,7 @@ graph LR
   TASK-BBBBBBBBBBBBBBBBBBBBBBBBBB --> TASK-AAAAAAAAAAAAAAAAAAAAAAAAAA"#,
             );
             let plan = parse_plan_strict(&md).expect("ULID-edge form must parse");
-            assert_eq!(
-                plan.units[0].tasks[1].depends_on,
-                vec!["LM-1".to_string()]
-            );
+            assert_eq!(plan.units[0].tasks[1].depends_on, vec!["LM-1".to_string()]);
         }
 
         #[test]
@@ -1852,7 +1847,10 @@ graph LR
             let md = two_task_plan(r#"[]"#, "  LM-2 --> LM-9999");
             let err = parse_plan_strict(&md).expect_err("unknown ref must reject");
             assert_eq!(err.kind, ImportErrorKind::UnknownDependsOnRef);
-            assert!(err.hint.contains("LM-9999"), "hint must name the bad ref: {err:?}");
+            assert!(
+                err.hint.contains("LM-9999"),
+                "hint must name the bad ref: {err:?}"
+            );
         }
 
         #[test]
@@ -1860,13 +1858,13 @@ graph LR
             // Self-loop is the smallest cycle. We use it because the
             // bullet/graph cross-check requires consistent declaration on
             // both sides; a self-edge needs a self-claim in the bullet.
-            let md = two_task_plan(
-                r#"["LM-1", "LM-2"]"#,
-                "  LM-2 --> LM-1\n  LM-2 --> LM-2",
-            );
+            let md = two_task_plan(r#"["LM-1", "LM-2"]"#, "  LM-2 --> LM-1\n  LM-2 --> LM-2");
             let err = parse_plan_strict(&md).expect_err("cycle must reject");
             assert_eq!(err.kind, ImportErrorKind::DependencyCycle);
-            assert!(err.hint.contains("cycle"), "hint must describe the cycle: {err:?}");
+            assert!(
+                err.hint.contains("cycle"),
+                "hint must describe the cycle: {err:?}"
+            );
         }
 
         #[test]
@@ -1880,16 +1878,16 @@ graph LR
 
         #[test]
         fn deps_graph_rejects_wrong_fence_language() {
-            let md = two_task_plan(r#"["LM-1"]"#, "  LM-2 --> LM-1")
-                .replace("```mermaid", "```dot");
+            let md =
+                two_task_plan(r#"["LM-1"]"#, "  LM-2 --> LM-1").replace("```mermaid", "```dot");
             let err = parse_plan_strict(&md).expect_err("non-mermaid fence must reject");
             assert_eq!(err.kind, ImportErrorKind::BadDepsGraphFence);
         }
 
         #[test]
         fn deps_graph_rejects_flowchart_directive() {
-            let md = two_task_plan(r#"["LM-1"]"#, "  LM-2 --> LM-1")
-                .replace("graph LR", "flowchart LR");
+            let md =
+                two_task_plan(r#"["LM-1"]"#, "  LM-2 --> LM-1").replace("graph LR", "flowchart LR");
             let err = parse_plan_strict(&md).expect_err("flowchart must reject");
             assert_eq!(err.kind, ImportErrorKind::BadDepsGraph);
         }
@@ -1901,11 +1899,7 @@ graph LR
             let md = two_task_plan(r#"[]"#, "  LM-2 --> LM-1");
             // Strip the entire `## Dependency Graph` block from the
             // fixture so we exercise the omission path.
-            let md = md
-                .split("## Dependency Graph")
-                .next()
-                .unwrap()
-                .to_string();
+            let md = md.split("## Dependency Graph").next().unwrap().to_string();
             let plan = parse_plan_strict(&md).expect("omission must parse");
             assert_eq!(plan.units[0].tasks[1].depends_on, Vec::<String>::new());
         }
@@ -1970,8 +1964,7 @@ graph LR
 - `success_criteria`: []
 - `verification_cmd`: "x"
 - `decomposition_policy`: "tree(max_depth=3)""#;
-            let plan = parse_plan_strict(&wrap(bullets))
-                .expect("explicit hint/policy must parse");
+            let plan = parse_plan_strict(&wrap(bullets)).expect("explicit hint/policy must parse");
             let t = &plan.units[0].tasks[0];
             assert_eq!(t.atomic_size_hint, "medium");
             assert_eq!(t.decomposition_policy, "tree(max_depth=3)");
@@ -1992,8 +1985,8 @@ graph LR
 - `success_criteria`: []
 - `verification_cmd`: "x"
 - `decomposition_policy`: "atomic""#;
-            let plan = parse_plan_strict(&wrap(bullets))
-                .expect("missing atomic_size_hint must default");
+            let plan =
+                parse_plan_strict(&wrap(bullets)).expect("missing atomic_size_hint must default");
             let t = &plan.units[0].tasks[0];
             assert_eq!(t.atomic_size_hint, DEFAULT_ATOMIC_SIZE_HINT);
             assert_eq!(t.atomic_size_hint, "small");
@@ -2013,8 +2006,7 @@ graph LR
 - `success_criteria`: []
 - `verification_cmd`: "x"
 - `decomposition_policy`: "atomic""#;
-            let err = parse_plan_strict(&wrap(bullets))
-                .expect_err("non-enum value must reject");
+            let err = parse_plan_strict(&wrap(bullets)).expect_err("non-enum value must reject");
             assert_eq!(err.kind, ImportErrorKind::BadAtomicSizeHint);
             assert!(
                 err.hint.contains("gigantic"),
