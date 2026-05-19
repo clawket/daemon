@@ -67,8 +67,13 @@ main push 직전에 다음을 답할 수 있어야 한다:
 2. release 가 발사되면 `components.json["daemon"]` 가 어떤 버전으로 올라가는가? `clawket/docs/COMPATIBILITY.md` 의 CLI / 웹 / plugin 핀 범위가 그 버전을 수용하는가?
 3. daemon 의 wire contract (응답 shape, SSE 이벤트, error code, schema) 가 바뀌었는가? 바뀌었다면 호환성 매트릭스 갱신이 같은 release cycle 에 포함되는가?
 4. release order 상 daemon 이 먼저 풀리고 나서 후속 (cli → web → …) 이 진행되는 흐름이 사용자 의도와 일치하는가?
+5. **(직렬화 게이트) 같은 사이클에 cli (또는 web) 도 push 대상인가?** daemon push 가 release 발사 prefix 라면, cli / web push 는 다음 단계가 끝날 때까지 시작하지 않는다:
+   - daemon 의 release.yml `bump` → `build` → `publish` → `bump-manifest` 가 모두 끝나 `clawket/clawket` 에 `bump/daemon-vX.Y.Z` PR 이 생성됨.
+   - 사용자가 그 PR 을 머지해 `clawket/clawket/main` 의 `components.json["daemon"]` 이 새 버전으로 갱신됨.
+   - 두 단계가 끝나야 cli push 의 `bump-manifest` 가 fresh `components.json` 을 base 로 분기해 `components.json["cli"]` 만 추가 수정하는 깨끗한 PR 을 만든다. 그렇지 않으면 stale base 에서 분기한 두 PR 이 같은 파일을 동시 수정해 한쪽이 다른 쪽의 갱신을 덮어쓸 위험.
+   - daemon push 가 release 미발사 (`docs:` / `chore:` 등) 인 경우에는 `bump-manifest` 가 실행되지 않으므로 race 없음 — 그래도 workflow run 이 `completed` 인지 확인 후 cli push 로 넘어간다.
 
-넷 중 하나라도 명확하지 않으면 push 하지 않고 사용자에게 보고한다.
+다섯 중 하나라도 명확하지 않으면 push 하지 않고 사용자에게 보고한다. **두 레포의 main push 를 같은 응답에 묶지 않는다.**
 
 ## Cross-reference
 
