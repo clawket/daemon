@@ -8,6 +8,7 @@
 | `response-shape-backwards-compat.md` | `models.rs` 의 `Serialize` 구조체와 라우트 응답 JSON 의 필드는 추가만 허용. 기존 필드 제거 / 리네임 / `Option<T>` 좁힘 / `serde(rename)` 변경 금지. |
 | `schema-migration-discipline.md` | `SCHEMA_VERSION_MAX`, `MIGRATIONS` 배열, `migrations/` 디렉터리 SQL 의 셋 동기. 과거 마이그레이션 본문 사후 편집 / 순서 변경 / 단독 bump 금지. |
 | `error-code-stability.md` | `repo` 의 `bail!("CODE: ...")` prefix 와 `routes/error.rs` 의 매핑은 외부 wire contract. prefix / HTTP status / `code` 문자열 단독 변경 금지. |
+| `release-cascade-to-plugin-manifest.md` | `main` push 는 release.yml 을 trigger 해 `clawket/clawket` 에 components.json bump PR 을 자동 생성. 사용자 명시 지시 없이 push 금지. |
 
 ## 적용 우선순위
 1. 이 디렉터리의 룰
