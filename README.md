@@ -23,7 +23,10 @@ On first run, the daemon:
 - applies pending migrations (embedded in the binary)
 - enforces the **path-separation invariant**: refuses to start if data/cache/config/state/db paths overlap with `~/.claude/plugins/` (override only via `CLAWKET_ALLOW_PLUGIN_OVERLAP=1`)
 
-## v3.0 baseline
+## Plugin v3.0 baseline
+
+The "v3.0" below refers to the **plugin contract version** ([`clawket/clawket`](https://github.com/clawket/clawket)) that this daemon must satisfy — not the daemon binary's own version (see `Cargo.toml`).
+
 
 | Surface | Behavior |
 |---|---|
