@@ -12,8 +12,8 @@ use crate::git;
 use crate::models::{Task, TaskEnvelope};
 use crate::repo::{comments, locks, plans, projects, task_envelopes, tasks, units};
 use crate::routes::error::{json_or_404, ApiError, ApiResult};
-use crate::secrets::redact::reject_high_entropy_in_value;
 use crate::routes::util::{norm_opt, value_to_opt_string};
+use crate::secrets::redact::reject_high_entropy_in_value;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -22,10 +22,7 @@ pub fn router() -> Router<AppState> {
         .route("/tasks/search", get(search))
         .route("/tasks/stats", get(stats))
         .route("/tasks/bulk-update", post(bulk_update))
-        .route(
-            "/tasks/{id}",
-            get(get_one).patch(update).delete(delete_one),
-        )
+        .route("/tasks/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/tasks/{id}/body", post(append_body))
         .route("/tasks/{id}/similar", get(similar))
         .route(
@@ -33,7 +30,10 @@ pub fn router() -> Router<AppState> {
             get(get_envelope).delete(clear_envelope),
         )
         .route("/tasks/{id}/envelope/history", get(envelope_history))
-        .route("/tasks/{id}/envelope/validate", post(validate_envelope_route))
+        .route(
+            "/tasks/{id}/envelope/validate",
+            post(validate_envelope_route),
+        )
         .route("/tasks/{id}/decompose", post(decompose_route))
         .route("/tasks/{id}/subtasks", post(create_subtask))
         .route("/tasks/{id}/ancestors", get(get_ancestors))
@@ -70,7 +70,10 @@ struct ListQuery {
     offset: Option<i64>,
 }
 
-async fn list(State(app): State<AppState>, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Task>>> {
+async fn list(
+    State(app): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> ApiResult<Json<Vec<Task>>> {
     let parent = q
         .parent_task_id
         .as_deref()
@@ -258,7 +261,8 @@ async fn create(
         }
     }
 
-    let unit_id = unit_id.ok_or_else(|| ApiError::bad_request("unit_id required (or supply cwd for auto-infer)"))?;
+    let unit_id = unit_id
+        .ok_or_else(|| ApiError::bad_request("unit_id required (or supply cwd for auto-infer)"))?;
     // API-TASK-001: hard-require cycle_id.
     if cycle_id.is_none() {
         return Err(ApiError::bad_request_coded(
@@ -279,14 +283,13 @@ async fn create(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-    let decomposition_policy_str =
-        norm_opt(body.decomposition_policy).or_else(|| {
-            body.envelope
-                .as_ref()
-                .and_then(|e| e.get("decomposition_policy"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        });
+    let decomposition_policy_str = norm_opt(body.decomposition_policy).or_else(|| {
+        body.envelope
+            .as_ref()
+            .and_then(|e| e.get("decomposition_policy"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
 
     // FIX-DAEMON-r2-tier / FIX-DAEMON-r2-qa: forward optional explicit fields
     // through the create path. Validation happens inside repo::tasks::create.
@@ -366,7 +369,10 @@ async fn create(
 
     let with_env = task_with_envelope(&conn, task)?;
     drop(conn);
-    app.emit("task:created", serde_json::json!({ "id": with_env.task.id }));
+    app.emit(
+        "task:created",
+        serde_json::json!({ "id": with_env.task.id }),
+    );
     schedule_task_embed(app.clone(), &with_env.task);
     Ok(Json(with_env))
 }
@@ -389,8 +395,7 @@ async fn delete_one(
     body: Option<Json<DeleteBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let conn = app.conn();
-    let task = tasks::get(&conn, &id)?
-        .ok_or_else(|| ApiError::not_found("Task not found"))?;
+    let task = tasks::get(&conn, &id)?.ok_or_else(|| ApiError::not_found("Task not found"))?;
     let canonical = task.id.clone();
 
     if task.status == "todo" {
@@ -434,7 +439,10 @@ async fn delete_one(
     app.emit("task:updated", serde_json::json!({ "id": canonical }));
     // FIX-DAEMON-106: emit cascade SSE events
     for (event_name, entity_id) in cascade_events {
-        app.emit(event_name, serde_json::json!({ "id": entity_id, "cascade": true }));
+        app.emit(
+            event_name,
+            serde_json::json!({ "id": entity_id, "cascade": true }),
+        );
     }
     let payload = updated
         .map(|t| serde_json::to_value(t).unwrap_or_else(|_| serde_json::json!({})))
@@ -504,10 +512,7 @@ async fn update(
                             let ctx = env_conditions::EvalContext::new(&conn, repo_path);
                             if let Err(v) = env_conditions::evaluate(preds, &ctx) {
                                 return Err(ApiError::conflict_with_details(
-                                    format!(
-                                        "{} violation: {}",
-                                        field, v.reason
-                                    ),
+                                    format!("{} violation: {}", field, v.reason),
                                     serde_json::json!({
                                         "field": field,
                                         "reason": v.reason,
@@ -526,8 +531,8 @@ async fn update(
     // require non-empty escalation_reason in the same patch.
     if let Some(obj) = body.as_object() {
         if let Some(new_tier_used) = obj.get("tier_used").and_then(Value::as_str) {
-            let current = tasks::get(&conn, &id)?
-                .ok_or_else(|| ApiError::not_found("Task not found"))?;
+            let current =
+                tasks::get(&conn, &id)?.ok_or_else(|| ApiError::not_found("Task not found"))?;
             let declared_tier = obj
                 .get("tier")
                 .and_then(Value::as_str)
@@ -576,10 +581,16 @@ async fn update(
 
     let with_env = task_with_envelope(&conn, task)?;
     drop(conn);
-    app.emit("task:updated", serde_json::json!({ "id": with_env.task.id }));
+    app.emit(
+        "task:updated",
+        serde_json::json!({ "id": with_env.task.id }),
+    );
     // FIX-DAEMON-106: emit SSE for cascade-completed plan/cycle
     for (event_name, entity_id) in cascade_events {
-        app.emit(event_name, serde_json::json!({ "id": entity_id, "cascade": true }));
+        app.emit(
+            event_name,
+            serde_json::json!({ "id": entity_id, "cascade": true }),
+        );
     }
     if title_or_body_touched {
         schedule_task_embed(app.clone(), &with_env.task);
@@ -604,7 +615,10 @@ async fn bulk_update(
         if let Some(t) = updated {
             // FIX-DAEMON-106: emit cascade SSE events per task
             for (event_name, entity_id) in cascade_events {
-                app.emit(event_name, serde_json::json!({ "id": entity_id, "cascade": true }));
+                app.emit(
+                    event_name,
+                    serde_json::json!({ "id": entity_id, "cascade": true }),
+                );
             }
             out.push(t);
         }
@@ -736,8 +750,8 @@ async fn similar(
     Query(q): Query<SimilarQuery>,
 ) -> ApiResult<Json<Vec<TaskHit>>> {
     let limit = q.limit.unwrap_or(10).clamp(1, 30);
-    let task = tasks::get(&app.conn(), &id)?
-        .ok_or_else(|| ApiError::not_found("Task not found"))?;
+    let task =
+        tasks::get(&app.conn(), &id)?.ok_or_else(|| ApiError::not_found("Task not found"))?;
     let source = format!("{}\n{}", task.title, task.body);
     let vec = match embeddings::embed(&source)
         .await
@@ -823,8 +837,7 @@ async fn get_envelope(
     // when `resolve=true` (RL-U3-11 / LM-64). The leaf override is still
     // applied below so historical-version requests get the right body.
     let chain = task_envelopes::resolve_chain(&conn, &task.id, RESOLVE_CHAIN_MAX_DEPTH)?;
-    let chain_root_to_self: Vec<String> =
-        chain.iter().map(|e| e.task_id.clone()).collect();
+    let chain_root_to_self: Vec<String> = chain.iter().map(|e| e.task_id.clone()).collect();
 
     let resolved_envelope = if q.resolve.unwrap_or(false) {
         let mut acc = Value::Object(Default::default());
@@ -888,7 +901,10 @@ async fn clear_envelope(
     if cleared {
         app.emit("task:updated", serde_json::json!({ "id": task.id }));
     }
-    Ok(Json(ClearEnvelopeResponse { task_id: task.id, cleared }))
+    Ok(Json(ClearEnvelopeResponse {
+        task_id: task.id,
+        cleared,
+    }))
 }
 
 async fn envelope_history(
@@ -905,8 +921,7 @@ async fn envelope_history(
     let out: Vec<HistoryEntry> = entries
         .into_iter()
         .map(|e| {
-            let envelope: Value = serde_json::from_str(&e.envelope.json)
-                .unwrap_or(Value::Null);
+            let envelope: Value = serde_json::from_str(&e.envelope.json).unwrap_or(Value::Null);
             HistoryEntry {
                 id: e.envelope.id,
                 version: e.envelope.version,
@@ -1030,14 +1045,8 @@ async fn decompose_route(
     let resolved = resolve_envelope(&conn, &task)?.unwrap_or(Value::Null);
     // Existing children count: same query the MCP tool used (BFS,
     // capped depth). The route only consults the count, not the list.
-    let existing_children_count = tasks::descendants(
-        &conn,
-        &task.id,
-        max_depth as usize,
-        true,
-        TREE_NODE_CAP,
-    )?
-    .len();
+    let existing_children_count =
+        tasks::descendants(&conn, &task.id, max_depth as usize, true, TREE_NODE_CAP)?.len();
 
     let parent = decompose_suggest::ParentSummary {
         id: task.id.clone(),
@@ -1092,7 +1101,8 @@ async fn create_subtask(
     let type_ = norm_opt(body.type_);
 
     let parent_env = task_envelopes::active_for_task(&conn, &parent.id)?;
-    let child_env = compute_inherited_envelope(parent_env.as_ref(), body.envelope_overrides.as_ref())?;
+    let child_env =
+        compute_inherited_envelope(parent_env.as_ref(), body.envelope_overrides.as_ref())?;
 
     let created = tasks::create(
         &mut conn,
@@ -1121,8 +1131,8 @@ async fn create_subtask(
             batch_id: None,
         },
     )?;
-    let mut task = created
-        .ok_or_else(|| ApiError::internal("failed to create subtask".to_string()))?;
+    let mut task =
+        created.ok_or_else(|| ApiError::internal("failed to create subtask".to_string()))?;
 
     if let Some(mut env) = child_env {
         autofill_planned_sha(&mut env, &conn);
@@ -1140,7 +1150,10 @@ async fn create_subtask(
 
     let with_env = task_with_envelope(&conn, task)?;
     drop(conn);
-    app.emit("task:created", serde_json::json!({ "id": with_env.task.id }));
+    app.emit(
+        "task:created",
+        serde_json::json!({ "id": with_env.task.id }),
+    );
     schedule_task_embed(app.clone(), &with_env.task);
     Ok(Json(with_env))
 }
@@ -1434,10 +1447,7 @@ async fn get_ancestors(
     let conn = app.conn();
     let _ = tasks::get(&conn, &id)?
         .ok_or_else(|| ApiError::not_found(format!("Task not found: {}", id)))?;
-    let depth = q
-        .depth
-        .map(|d| d.max(0) as usize)
-        .unwrap_or(TREE_NODE_CAP);
+    let depth = q.depth.map(|d| d.max(0) as usize).unwrap_or(TREE_NODE_CAP);
     let want_env = q.include_envelope.unwrap_or(true);
     let chain = tasks::ancestors(&conn, &id, depth)?;
     let mut out = Vec::with_capacity(chain.len());
@@ -1464,10 +1474,7 @@ async fn get_descendants(
     let conn = app.conn();
     let _ = tasks::get(&conn, &id)?
         .ok_or_else(|| ApiError::not_found(format!("Task not found: {}", id)))?;
-    let depth = q
-        .depth
-        .map(|d| d.max(1) as usize)
-        .unwrap_or(TREE_NODE_CAP);
+    let depth = q.depth.map(|d| d.max(1) as usize).unwrap_or(TREE_NODE_CAP);
     let bfs = matches!(q.order.as_deref(), Some("bfs"));
     let want_env = q.include_envelope.unwrap_or(true);
     let nodes = tasks::descendants(&conn, &id, depth, bfs, TREE_NODE_CAP)?;
@@ -1495,10 +1502,7 @@ async fn get_subtree(
     let conn = app.conn();
     let root = tasks::get(&conn, &id)?
         .ok_or_else(|| ApiError::not_found(format!("Task not found: {}", id)))?;
-    let depth = q
-        .depth
-        .map(|d| d.max(0) as usize)
-        .unwrap_or(TREE_NODE_CAP);
+    let depth = q.depth.map(|d| d.max(0) as usize).unwrap_or(TREE_NODE_CAP);
     let bfs = matches!(q.order.as_deref(), Some("bfs"));
     let want_env = q.include_envelope.unwrap_or(true);
 
@@ -1515,13 +1519,8 @@ async fn get_subtree(
     });
 
     if depth > 0 {
-        let descendants = tasks::descendants(
-            &conn,
-            &root.id,
-            depth,
-            bfs,
-            TREE_NODE_CAP.saturating_sub(1),
-        )?;
+        let descendants =
+            tasks::descendants(&conn, &root.id, depth, bfs, TREE_NODE_CAP.saturating_sub(1))?;
         for n in descendants {
             let resolved = if want_env {
                 resolve_envelope(&conn, &n.task)?
@@ -1651,16 +1650,22 @@ fn schedule_task_embed(app: AppState, task: &Task) {
 fn validate_scenario_id(s: &str) -> ApiResult<()> {
     // Fast hand-rolled check (no regex dep): US- prefix, uppercase domain, dash, 3-digit suffix.
     let rest = s.strip_prefix("US-").ok_or_else(|| {
-        ApiError::bad_request_coded("INVALID_SCENARIO_ID", "INVALID_SCENARIO_ID: scenario_id must match ^US-[A-Z][A-Z0-9-]*-\\d{3}$")
+        ApiError::bad_request_coded(
+            "INVALID_SCENARIO_ID",
+            "INVALID_SCENARIO_ID: scenario_id must match ^US-[A-Z][A-Z0-9-]*-\\d{3}$",
+        )
     })?;
     // rest = "[A-Z][A-Z0-9-]*-NNN"
     // Find last '-' separator before the 3-digit suffix.
     let last_dash = rest.rfind('-').ok_or_else(|| {
-        ApiError::bad_request_coded("INVALID_SCENARIO_ID", "INVALID_SCENARIO_ID: scenario_id must match ^US-[A-Z][A-Z0-9-]*-\\d{3}$")
+        ApiError::bad_request_coded(
+            "INVALID_SCENARIO_ID",
+            "INVALID_SCENARIO_ID: scenario_id must match ^US-[A-Z][A-Z0-9-]*-\\d{3}$",
+        )
     })?;
     let (domain, suffix) = rest.split_at(last_dash);
     let suffix = &suffix[1..]; // skip '-'
-    // suffix must be exactly 3 ASCII digits
+                               // suffix must be exactly 3 ASCII digits
     if suffix.len() != 3 || !suffix.bytes().all(|b| b.is_ascii_digit()) {
         return Err(ApiError::bad_request_coded(
             "INVALID_SCENARIO_ID",
@@ -1746,7 +1751,11 @@ fn parse_update(v: &Value) -> ApiResult<tasks::UpdateFields> {
     if let Some(v) = obj.get("cycle_id") {
         f.cycle_id = Some(value_to_opt_string(v));
     }
-    if let Some(s) = obj.get("unit_id").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+    if let Some(s) = obj
+        .get("unit_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
         f.unit_id = Some(s.into());
     }
     if let Some(v) = obj.get("reporter") {
@@ -2009,15 +2018,14 @@ mod envelope {
         )
         .await;
         let id = created["id"].as_str().unwrap().to_string();
-        let v1_id = created["active_envelope"]["id"].as_str().unwrap().to_string();
+        let v1_id = created["active_envelope"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let env_v2 = serde_json::json!({"version": 1, "intent": "second"});
-        let (status, updated) = patch_task(
-            &s.app,
-            &id,
-            serde_json::json!({"envelope": env_v2}),
-        )
-        .await;
+        let (status, updated) =
+            patch_task(&s.app, &id, serde_json::json!({"envelope": env_v2})).await;
         assert_eq!(status, StatusCode::OK);
         let active = &updated["active_envelope"];
         assert_eq!(active["version"].as_i64(), Some(2));
@@ -2040,17 +2048,19 @@ mod envelope {
         )
         .await;
         let id = created["id"].as_str().unwrap().to_string();
-        let v1_id = created["active_envelope"]["id"].as_str().unwrap().to_string();
+        let v1_id = created["active_envelope"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
-        let (status, updated) = patch_task(
-            &s.app,
-            &id,
-            serde_json::json!({"title": "renamed"}),
-        )
-        .await;
+        let (status, updated) =
+            patch_task(&s.app, &id, serde_json::json!({"title": "renamed"})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(updated["title"], "renamed");
-        assert_eq!(updated["active_envelope"]["id"].as_str(), Some(v1_id.as_str()));
+        assert_eq!(
+            updated["active_envelope"]["id"].as_str(),
+            Some(v1_id.as_str())
+        );
         assert_eq!(updated["active_envelope"]["version"].as_i64(), Some(1));
     }
 
@@ -2194,15 +2204,15 @@ mod get_envelope {
             )
             .await
             .unwrap();
-        assert!(resp.status().is_success(), "POST {uri} failed: {:?}", resp.status());
+        assert!(
+            resp.status().is_success(),
+            "POST {uri} failed: {:?}",
+            resp.status()
+        );
         body_json(resp).await
     }
 
-    async fn get_envelope_req(
-        app: &axum::Router,
-        id: &str,
-        query: &str,
-    ) -> (StatusCode, Value) {
+    async fn get_envelope_req(app: &axum::Router, id: &str, query: &str) -> (StatusCode, Value) {
         let uri = if query.is_empty() {
             format!("/tasks/{id}/envelope")
         } else {
@@ -2342,7 +2352,10 @@ mod get_envelope {
         let (status, body) = get_envelope_req(&s.app, id, "").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["raw_envelope"], env);
-        assert_eq!(body["resolved_envelope"], env, "default resolve=false: equal to raw");
+        assert_eq!(
+            body["resolved_envelope"], env,
+            "default resolve=false: equal to raw"
+        );
         assert_eq!(body["version"].as_i64(), Some(1));
         assert_eq!(body["superseded"].as_bool(), Some(false));
         assert_eq!(body["inheritance_chain"].as_array().unwrap().len(), 1);
@@ -2463,7 +2476,10 @@ mod get_envelope {
         let id = task["id"].as_str().unwrap();
         let (status, body) = get_envelope_req(&s.app, id, "version=99").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(body["error"].as_str().unwrap_or("").contains("envelope version"));
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("envelope version"));
     }
 
     #[tokio::test]
@@ -2648,7 +2664,11 @@ mod envelope_history {
             )
             .await
             .unwrap();
-        assert!(resp.status().is_success(), "PATCH failed: {:?}", resp.status());
+        assert!(
+            resp.status().is_success(),
+            "PATCH failed: {:?}",
+            resp.status()
+        );
     }
 
     async fn history(app: &axum::Router, id: &str, query: &str) -> (StatusCode, Value) {
@@ -3055,7 +3075,10 @@ mod subtasks {
         let resolved = get_envelope_resolved(&s.app, child_id).await;
         // Child stored already inherits parent — both raw and resolved equal.
         assert_eq!(resolved["resolved_envelope"]["intent"], "child");
-        assert_eq!(resolved["resolved_envelope"]["tags"], serde_json::json!(["root"]));
+        assert_eq!(
+            resolved["resolved_envelope"]["tags"],
+            serde_json::json!(["root"])
+        );
         let chain = resolved["inheritance_chain"].as_array().unwrap();
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].as_str(), Some(parent_id));
@@ -3263,7 +3286,11 @@ mod tree {
             )
             .await
             .unwrap();
-        assert!(resp.status().is_success(), "POST {uri} failed: {:?}", resp.status());
+        assert!(
+            resp.status().is_success(),
+            "POST {uri} failed: {:?}",
+            resp.status()
+        );
         body_json(resp).await
     }
 
@@ -3340,8 +3367,7 @@ mod tree {
     async fn ancestors_returns_parent_chain_root_last_with_resolved_envelope() {
         let s = setup();
         let (root, a, b, c) = build_chain(&s).await;
-        let (status, body) =
-            get_json(&s.app, &format!("/tasks/{c}/ancestors")).await;
+        let (status, body) = get_json(&s.app, &format!("/tasks/{c}/ancestors")).await;
         assert_eq!(status, StatusCode::OK);
         let arr = body.as_array().unwrap();
         assert_eq!(arr.len(), 3);
@@ -3423,19 +3449,41 @@ mod tree {
         .await;
         let b2_id = b2["id"].as_str().unwrap().to_string();
 
-        let (_, dfs) =
-            get_json(&s.app, &format!("/tasks/{root_id}/descendants?order=dfs")).await;
-        let dfs_ids: Vec<&str> =
-            dfs.as_array().unwrap().iter().map(|n| n["id"].as_str().unwrap()).collect();
+        let (_, dfs) = get_json(&s.app, &format!("/tasks/{root_id}/descendants?order=dfs")).await;
+        let dfs_ids: Vec<&str> = dfs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
         // DFS pre-order: a1, b1, a2, b2
-        assert_eq!(dfs_ids, vec![a1_id.as_str(), b1_id.as_str(), a2_id.as_str(), b2_id.as_str()]);
+        assert_eq!(
+            dfs_ids,
+            vec![
+                a1_id.as_str(),
+                b1_id.as_str(),
+                a2_id.as_str(),
+                b2_id.as_str()
+            ]
+        );
 
-        let (_, bfs) =
-            get_json(&s.app, &format!("/tasks/{root_id}/descendants?order=bfs")).await;
-        let bfs_ids: Vec<&str> =
-            bfs.as_array().unwrap().iter().map(|n| n["id"].as_str().unwrap()).collect();
+        let (_, bfs) = get_json(&s.app, &format!("/tasks/{root_id}/descendants?order=bfs")).await;
+        let bfs_ids: Vec<&str> = bfs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
         // BFS level-order: a1, a2, b1, b2
-        assert_eq!(bfs_ids, vec![a1_id.as_str(), a2_id.as_str(), b1_id.as_str(), b2_id.as_str()]);
+        assert_eq!(
+            bfs_ids,
+            vec![
+                a1_id.as_str(),
+                a2_id.as_str(),
+                b1_id.as_str(),
+                b2_id.as_str()
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3483,8 +3531,7 @@ mod tree {
     async fn unknown_task_returns_404_for_all_three_endpoints() {
         let s = setup();
         for path in &["ancestors", "descendants", "subtree"] {
-            let (status, _) =
-                get_json(&s.app, &format!("/tasks/TASK-NONEXISTENT/{path}")).await;
+            let (status, _) = get_json(&s.app, &format!("/tasks/TASK-NONEXISTENT/{path}")).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{path} should 404");
         }
     }
@@ -3535,8 +3582,7 @@ mod tree {
         // Root has envelope, A doesn't. Ancestors of C: [B (no env), A (no env), root (env)].
         let s = setup();
         let (root, _a, _b, c) = build_chain(&s).await;
-        let (status, body) =
-            get_json(&s.app, &format!("/tasks/{c}/ancestors")).await;
+        let (status, body) = get_json(&s.app, &format!("/tasks/{c}/ancestors")).await;
         assert_eq!(status, StatusCode::OK);
         let arr = body.as_array().unwrap();
         // B has no envelope → ancestors-of-C[0] (which is B) should still
@@ -3580,7 +3626,11 @@ mod planned_sha_autofill {
     }
 
     fn init_repo(path: &std::path::Path) -> String {
-        Cmd::new("git").args(["init", "-q", "-b", "main"]).arg(path).status().unwrap();
+        Cmd::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(path)
+            .status()
+            .unwrap();
         Cmd::new("git")
             .args(["-C"])
             .arg(path)
@@ -3594,7 +3644,12 @@ mod planned_sha_autofill {
             .status()
             .unwrap();
         std::fs::write(path.join("README"), "x").unwrap();
-        Cmd::new("git").args(["-C"]).arg(path).args(["add", "."]).status().unwrap();
+        Cmd::new("git")
+            .args(["-C"])
+            .arg(path)
+            .args(["add", "."])
+            .status()
+            .unwrap();
         Cmd::new("git")
             .args(["-C"])
             .arg(path)
@@ -3845,7 +3900,11 @@ mod drift {
     }
 
     fn git(args: &[&str], cwd: &std::path::Path) {
-        let status = Cmd::new("git").args(args).current_dir(cwd).status().unwrap();
+        let status = Cmd::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap();
         assert!(status.success(), "git {args:?} failed");
     }
 
@@ -3970,7 +4029,11 @@ mod drift {
             )
             .await
             .unwrap();
-        assert!(resp.status().is_success(), "POST /tasks: {:?}", resp.status());
+        assert!(
+            resp.status().is_success(),
+            "POST /tasks: {:?}",
+            resp.status()
+        );
         body_json(resp).await
     }
 
@@ -4105,10 +4168,7 @@ mod drift {
         let id = task["id"].as_str().unwrap();
         let (status, body) = drift_get(&s.app, id).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("planned_sha"));
+        assert!(body["error"].as_str().unwrap_or("").contains("planned_sha"));
     }
 
     #[tokio::test]
@@ -4148,10 +4208,7 @@ mod drift {
         let id = task["id"].as_str().unwrap();
         let (status, body) = drift_get(&s.app, id).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(body["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("target_repo"));
+        assert!(body["error"].as_str().unwrap_or("").contains("target_repo"));
     }
 
     #[tokio::test]
@@ -4337,8 +4394,12 @@ mod conditions_hook {
         )
         .await;
         let id = created["id"].as_str().unwrap();
-        let (status, body) =
-            patch_task(&s.app, id, serde_json::json!({"status": "done", "evidence": "test:done"})).await;
+        let (status, body) = patch_task(
+            &s.app,
+            id,
+            serde_json::json!({"status": "done", "evidence": "test:done"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["details"]["field"], "postconditions");
         assert_eq!(
@@ -4366,8 +4427,12 @@ mod conditions_hook {
         )
         .await;
         let id = created["id"].as_str().unwrap();
-        let (status, body) =
-            patch_task(&s.app, id, serde_json::json!({"status": "done", "evidence": "test:done"})).await;
+        let (status, body) = patch_task(
+            &s.app,
+            id,
+            serde_json::json!({"status": "done", "evidence": "test:done"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "done");
     }
@@ -4375,11 +4440,18 @@ mod conditions_hook {
     #[tokio::test]
     async fn done_transition_works_when_no_envelope_present() {
         let s = setup();
-        let created =
-            post_task(&s.app, serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T"})).await;
+        let created = post_task(
+            &s.app,
+            serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T"}),
+        )
+        .await;
         let id = created["id"].as_str().unwrap();
-        let (status, body) =
-            patch_task(&s.app, id, serde_json::json!({"status": "done", "evidence": "test:done"})).await;
+        let (status, body) = patch_task(
+            &s.app,
+            id,
+            serde_json::json!({"status": "done", "evidence": "test:done"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "done");
     }
@@ -4398,8 +4470,12 @@ mod conditions_hook {
         )
         .await;
         let id = created["id"].as_str().unwrap();
-        let (status, body) =
-            patch_task(&s.app, id, serde_json::json!({"status": "done", "evidence": "test:done"})).await;
+        let (status, body) = patch_task(
+            &s.app,
+            id,
+            serde_json::json!({"status": "done", "evidence": "test:done"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "done");
     }
@@ -4454,8 +4530,12 @@ mod conditions_hook {
         )
         .await;
         let id = created["id"].as_str().unwrap();
-        let (status, body) =
-            patch_task(&s.app, id, serde_json::json!({"status": "done", "evidence": "test:done"})).await;
+        let (status, body) = patch_task(
+            &s.app,
+            id,
+            serde_json::json!({"status": "done", "evidence": "test:done"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(
             body["details"]["violating_predicate"]["type"],
@@ -4684,10 +4764,7 @@ mod entropy_hook {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("secrets_ref"));
+        assert!(body["error"].as_str().unwrap_or("").contains("secrets_ref"));
     }
 
     #[tokio::test]
@@ -4929,9 +5006,7 @@ mod lease {
         // acquired_at preserved across same-session refresh
         assert_eq!(second["acquired_at"], first["acquired_at"]);
         // expires_at extends
-        assert!(
-            second["expires_at"].as_i64().unwrap() >= first["expires_at"].as_i64().unwrap()
-        );
+        assert!(second["expires_at"].as_i64().unwrap() >= first["expires_at"].as_i64().unwrap());
     }
 
     #[tokio::test]
@@ -4954,17 +5029,10 @@ mod lease {
     async fn acquire_400_on_missing_session_id() {
         let s = setup();
         let id = make_task(&s.app, &s.unit_id, &s.cycle_id).await;
-        let (status, body) = post(
-            &s.app,
-            &format!("/tasks/{id}/lease"),
-            serde_json::json!({}),
-        )
-        .await;
+        let (status, body) =
+            post(&s.app, &format!("/tasks/{id}/lease"), serde_json::json!({})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("session_id"));
+        assert!(body["error"].as_str().unwrap_or("").contains("session_id"));
     }
 
     #[tokio::test]
@@ -5080,12 +5148,8 @@ mod lease {
         )
         .await;
         assert_eq!(st, StatusCode::OK);
-        assert!(
-            body["expires_at"].as_i64().unwrap() > first["expires_at"].as_i64().unwrap()
-        );
-        assert!(
-            body["heartbeat_at"].as_i64().unwrap() >= first["heartbeat_at"].as_i64().unwrap()
-        );
+        assert!(body["expires_at"].as_i64().unwrap() > first["expires_at"].as_i64().unwrap());
+        assert!(body["heartbeat_at"].as_i64().unwrap() >= first["heartbeat_at"].as_i64().unwrap());
     }
 
     #[tokio::test]
@@ -5105,10 +5169,7 @@ mod lease {
         )
         .await;
         assert_eq!(st, StatusCode::CONFLICT);
-        assert!(body["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("session-B"));
+        assert!(body["error"].as_str().unwrap_or("").contains("session-B"));
     }
 
     #[tokio::test]
