@@ -588,4 +588,141 @@ mod tests {
             "expected residue count 1, got: {msg}"
         );
     }
+
+    #[test]
+    fn completed_cycle_cannot_be_restarted_to_planning() {
+        // Lifecycle invariant: status=completed is terminal. Patching back to
+        // 'planning' or 'active' must be rejected ("cannot be restarted"); the
+        // user has to create a new cycle. Guards `cycles.rs:135-140`.
+        let (_d, db, _plan_id, _unit_id, cycle_id) = setup_with_unit();
+        complete(&db.conn, &cycle_id).unwrap();
+
+        let err = update(
+            &db.conn,
+            &cycle_id,
+            UpdateFields {
+                status: Some("planning".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be restarted"),
+            "expected restart guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn completed_cycle_cannot_be_restarted_to_active() {
+        let (_d, db, _plan_id, _unit_id, cycle_id) = setup_with_unit();
+        complete(&db.conn, &cycle_id).unwrap();
+
+        let err = update(
+            &db.conn,
+            &cycle_id,
+            UpdateFields {
+                status: Some("active".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be restarted"),
+            "expected restart guard, got: {err}"
+        );
+    }
+
+    fn project_id_for_unit(conn: &Connection, unit_id: &str) -> String {
+        conn.query_row(
+            "SELECT p.project_id FROM units u
+             JOIN plans p ON p.id = u.plan_id
+             WHERE u.id = ?1",
+            params![unit_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn update_to_active_rejects_when_unit_already_has_active() {
+        // PDD A8 — same-unit cycle serialization. `update(status=active)` must
+        // refuse when another cycle in the same unit is already active. The
+        // public HTTP /cycles/:id/activate path auto-deactivates the prior
+        // cycle instead, but a direct PATCH that mutates `status` re-enters
+        // this guard (cycles.rs:144-159). The defense must remain even though
+        // the activate endpoint usually short-circuits it.
+        let (_d, db, _plan_id, unit_id, c1_id) = setup_with_unit();
+        let pid = project_id_for_unit(&db.conn, &unit_id);
+        // c1 is active. Create c2 in the same unit; it starts as 'planning'.
+        // Force c2 to 'active' via update() to verify the guard fires.
+        let c2 = create(
+            &db.conn,
+            CreateInput {
+                project_id: &pid,
+                unit_id: &unit_id,
+                title: "C2",
+                goal: None,
+                idx: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        let err = update(
+            &db.conn,
+            &c2.id,
+            UpdateFields {
+                status: Some("active".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("UNIT_HAS_ACTIVE_CYCLE"),
+            "expected UNIT_HAS_ACTIVE_CYCLE, got: {err}"
+        );
+        // C1 must remain active (the guard rejects the update; it does NOT
+        // silently swap which cycle is active).
+        let c1_after = get(&db.conn, &c1_id).unwrap().unwrap();
+        assert_eq!(c1_after.status, "active");
+    }
+
+    #[test]
+    fn create_with_out_of_order_idx_is_rejected() {
+        // API-CYCLE-005: cycles in the same unit must be planned in order.
+        // Creating a cycle with idx N when an existing planning cycle has
+        // idx > N is `INVALID_REQUEST` (cycles.rs:30-47).
+        let (_d, db, _plan_id, unit_id, _c1_id) = setup_with_unit();
+        let pid = project_id_for_unit(&db.conn, &unit_id);
+        // C1 is active (idx=0). Create C2 (idx=2, planning), then attempt
+        // C3 with idx=1 which is below the planning cycle at idx=2.
+        create(
+            &db.conn,
+            CreateInput {
+                project_id: &pid,
+                unit_id: &unit_id,
+                title: "C2",
+                goal: None,
+                idx: Some(2),
+            },
+        )
+        .unwrap();
+
+        let err = create(
+            &db.conn,
+            CreateInput {
+                project_id: &pid,
+                unit_id: &unit_id,
+                title: "C3",
+                goal: None,
+                idx: Some(1),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("INVALID_REQUEST")
+                && err.to_string().contains("planned in order"),
+            "expected idx ordering guard, got: {err}"
+        );
+    }
 }
