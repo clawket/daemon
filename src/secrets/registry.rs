@@ -69,12 +69,13 @@ impl Registry {
     }
 
     pub fn fetch(&self, kind: BackendKind, path: &str) -> SecretResult<Secret> {
-        let backend = self.backends.get(&kind).ok_or_else(|| {
-            SecretError::BackendUnavailable {
+        let backend = self
+            .backends
+            .get(&kind)
+            .ok_or_else(|| SecretError::BackendUnavailable {
                 backend: kind.as_str().into(),
                 reason: "backend not registered".into(),
-            }
-        })?;
+            })?;
         backend.fetch(path)
     }
 }

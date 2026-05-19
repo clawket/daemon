@@ -407,43 +407,86 @@ async fn envelope_validate_route_evaluates_draft_envelope() {
     let project: serde_json::Value = client
         .post(format!("{}/projects", d.base_url))
         .json(&serde_json::json!({"name": "envval", "key": "EV"}))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let pid = project["id"].as_str().unwrap().to_string();
 
     let plan: serde_json::Value = client
         .post(format!("{}/plans", d.base_url))
         .json(&serde_json::json!({"project_id": pid, "title": "p"}))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let plan_id = plan["id"].as_str().unwrap().to_string();
-    let _ = client.post(format!("{}/plans/{}/approve", d.base_url, plan_id)).send().await.unwrap();
+    let _ = client
+        .post(format!("{}/plans/{}/approve", d.base_url, plan_id))
+        .send()
+        .await
+        .unwrap();
 
     let unit: serde_json::Value = client
         .post(format!("{}/units", d.base_url))
         .json(&serde_json::json!({"plan_id": plan_id, "title": "u"}))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let unit_id = unit["id"].as_str().unwrap().to_string();
 
     // Active cycle is required for task creation (API-TASK-001 + PDD A4).
     let cycle: serde_json::Value = client
         .post(format!("{}/cycles", d.base_url))
         .json(&serde_json::json!({"project_id": pid, "unit_id": unit_id, "title": "c"}))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let cycle_id = cycle["id"].as_str().unwrap().to_string();
-    let _ = client.post(format!("{}/cycles/{}/activate", d.base_url, cycle_id)).send().await.unwrap();
+    let _ = client
+        .post(format!("{}/cycles/{}/activate", d.base_url, cycle_id))
+        .send()
+        .await
+        .unwrap();
 
     let task: serde_json::Value = client
         .post(format!("{}/tasks", d.base_url))
         .json(&serde_json::json!({"unit_id": unit_id, "cycle_id": cycle_id, "title": "t"}))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let task_id = task["id"].as_str().unwrap().to_string();
 
     // Empty draft → required-field errors.
     let empty_resp: serde_json::Value = client
-        .post(format!("{}/tasks/{}/envelope/validate", d.base_url, task_id))
+        .post(format!(
+            "{}/tasks/{}/envelope/validate",
+            d.base_url, task_id
+        ))
         .json(&serde_json::json!({"envelope": {}, "strict": false}))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(empty_resp["valid"], false);
-    let viols = empty_resp["violations"].as_array().expect("violations array");
+    let viols = empty_resp["violations"]
+        .as_array()
+        .expect("violations array");
     let fields: Vec<&str> = viols.iter().filter_map(|v| v["field"].as_str()).collect();
     assert!(fields.contains(&"intent"));
     assert!(fields.contains(&"prompt_template"));
@@ -452,7 +495,10 @@ async fn envelope_validate_route_evaluates_draft_envelope() {
 
     // Valid draft → no errors.
     let good_resp: serde_json::Value = client
-        .post(format!("{}/tasks/{}/envelope/validate", d.base_url, task_id))
+        .post(format!(
+            "{}/tasks/{}/envelope/validate",
+            d.base_url, task_id
+        ))
         .json(&serde_json::json!({
             "envelope": {
                 "intent": "x",
@@ -465,17 +511,29 @@ async fn envelope_validate_route_evaluates_draft_envelope() {
             },
             "strict": true
         }))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(good_resp["valid"], true);
     let warn_count = good_resp["violations"]
         .as_array()
         .map(|a| a.iter().filter(|v| v["severity"] == "warning").count())
         .unwrap_or(99);
-    assert_eq!(warn_count, 0, "no warnings expected on fully-populated envelope: {:?}", good_resp);
+    assert_eq!(
+        warn_count, 0,
+        "no warnings expected on fully-populated envelope: {:?}",
+        good_resp
+    );
 
     // Bad atomic_size_hint surfaces with that exact field name.
     let bad_size: serde_json::Value = client
-        .post(format!("{}/tasks/{}/envelope/validate", d.base_url, task_id))
+        .post(format!(
+            "{}/tasks/{}/envelope/validate",
+            d.base_url, task_id
+        ))
         .json(&serde_json::json!({
             "envelope": {
                 "intent": "x",
@@ -485,18 +543,31 @@ async fn envelope_validate_route_evaluates_draft_envelope() {
             },
             "strict": false
         }))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(bad_size["valid"], false);
     let bad_fields: Vec<&str> = bad_size["violations"]
-        .as_array().unwrap()
-        .iter().filter_map(|v| v["field"].as_str()).collect();
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v["field"].as_str())
+        .collect();
     assert!(bad_fields.contains(&"atomic_size_hint"));
 
     // No envelope body + no active envelope → 404.
     let missing = client
-        .post(format!("{}/tasks/{}/envelope/validate", d.base_url, task_id))
+        .post(format!(
+            "{}/tasks/{}/envelope/validate",
+            d.base_url, task_id
+        ))
         .json(&serde_json::json!({"strict": false}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
@@ -511,29 +582,57 @@ async fn decompose_route_returns_one_suggestion_per_success_criterion() {
     let project: serde_json::Value = client
         .post(format!("{}/projects", d.base_url))
         .json(&serde_json::json!({"name": "decomp", "key": "DC"}))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let pid = project["id"].as_str().unwrap().to_string();
 
     let plan: serde_json::Value = client
         .post(format!("{}/plans", d.base_url))
         .json(&serde_json::json!({"project_id": pid, "title": "p"}))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let plan_id = plan["id"].as_str().unwrap().to_string();
-    let _ = client.post(format!("{}/plans/{}/approve", d.base_url, plan_id)).send().await.unwrap();
+    let _ = client
+        .post(format!("{}/plans/{}/approve", d.base_url, plan_id))
+        .send()
+        .await
+        .unwrap();
 
     let unit: serde_json::Value = client
         .post(format!("{}/units", d.base_url))
         .json(&serde_json::json!({"plan_id": plan_id, "title": "u"}))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let unit_id = unit["id"].as_str().unwrap().to_string();
 
     // Active cycle is required for task creation (API-TASK-001 + PDD A4).
     let cycle: serde_json::Value = client
         .post(format!("{}/cycles", d.base_url))
         .json(&serde_json::json!({"project_id": pid, "unit_id": unit_id, "title": "c"}))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let cycle_id = cycle["id"].as_str().unwrap().to_string();
-    let _ = client.post(format!("{}/cycles/{}/activate", d.base_url, cycle_id)).send().await.unwrap();
+    let _ = client
+        .post(format!("{}/cycles/{}/activate", d.base_url, cycle_id))
+        .send()
+        .await
+        .unwrap();
 
     let task: serde_json::Value = client
         .post(format!("{}/tasks", d.base_url))
@@ -548,27 +647,47 @@ async fn decompose_route_returns_one_suggestion_per_success_criterion() {
                 "decomposition_policy": "auto",
             }
         }))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let task_id = task["id"].as_str().unwrap().to_string();
 
     let resp: serde_json::Value = client
         .post(format!("{}/tasks/{}/decompose", d.base_url, task_id))
         .json(&serde_json::json!({"strategy": "auto", "max_depth": 2}))
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
 
     assert_eq!(resp["parent"]["id"], task_id);
     assert_eq!(resp["strategy"], "auto");
     assert_eq!(resp["max_depth"], 2);
-    let suggestions = resp["suggested_subtasks"].as_array().expect("suggestions array");
+    let suggestions = resp["suggested_subtasks"]
+        .as_array()
+        .expect("suggestions array");
     assert_eq!(suggestions.len(), 3);
-    assert!(suggestions[0]["title"].as_str().unwrap().contains("Parent task"));
-    assert!(suggestions[0]["title"].as_str().unwrap().contains("criterion A"));
+    assert!(suggestions[0]["title"]
+        .as_str()
+        .unwrap()
+        .contains("Parent task"));
+    assert!(suggestions[0]["title"]
+        .as_str()
+        .unwrap()
+        .contains("criterion A"));
 
     // Unknown task → 404.
     let missing = client
         .post(format!("{}/tasks/TASK-NOPE/decompose", d.base_url))
         .json(&serde_json::json!({}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
@@ -746,7 +865,13 @@ async fn spa_bootstrap_paths_are_auth_exempt() {
     let d = DaemonHandle::spawn().await;
     let bare = reqwest::Client::new();
     // Each path must return a non-401 status without any token / cookie.
-    for path in &["/", "/web", "/favicon.svg", "/icons.svg", "/assets/anything.js"] {
+    for path in &[
+        "/",
+        "/web",
+        "/favicon.svg",
+        "/icons.svg",
+        "/assets/anything.js",
+    ] {
         let resp = bare
             .get(format!("{}{path}", d.base_url))
             .send()

@@ -117,7 +117,11 @@ pub fn current_size_bytes(conn: &Connection) -> Result<i64> {
 }
 
 /// Run the rollup once. Safe to call repeatedly; idempotent per UTC day.
-pub fn run_once(conn: &mut Connection, policy: &RetentionPolicy, now_ms: i64) -> Result<RollupReport> {
+pub fn run_once(
+    conn: &mut Connection,
+    policy: &RetentionPolicy,
+    now_ms: i64,
+) -> Result<RollupReport> {
     let hot_cutoff = now_ms - policy.hot_days * MS_PER_DAY;
 
     let mut report = RollupReport::default();
@@ -144,7 +148,8 @@ pub fn run_once(conn: &mut Connection, policy: &RetentionPolicy, now_ms: i64) ->
     let max_bytes = policy.max_mb.saturating_mul(1024 * 1024);
     let mut size = current_size_bytes(conn)?;
     while size > max_bytes && effective_total > MIN_TOTAL_DAYS_UNDER_PRESSURE {
-        effective_total = (effective_total - PRESSURE_SHRINK_STEP_DAYS).max(MIN_TOTAL_DAYS_UNDER_PRESSURE);
+        effective_total =
+            (effective_total - PRESSURE_SHRINK_STEP_DAYS).max(MIN_TOTAL_DAYS_UNDER_PRESSURE);
         let cold_cutoff = now_ms - effective_total * MS_PER_DAY;
         let pruned = cold_prune(conn, cold_cutoff)?;
         report.rows_cold_pruned += pruned;
@@ -199,7 +204,10 @@ fn next_unarchived_day(conn: &Connection, hot_cutoff_ms: i64) -> Result<Option<U
         .flatten();
     Ok(oldest.map(|ms| {
         let start = floor_to_utc_day(ms);
-        UtcDay { start_ms: start, end_ms: start + MS_PER_DAY }
+        UtcDay {
+            start_ms: start,
+            end_ms: start + MS_PER_DAY,
+        }
     }))
 }
 
@@ -425,7 +433,9 @@ mod tests {
         // Archive batch present.
         let blobs: i64 = db
             .conn
-            .query_row("SELECT COUNT(*) FROM activity_log_archive", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM activity_log_archive", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(blobs, 1);
     }
@@ -444,7 +454,9 @@ mod tests {
 
         let blobs: i64 = db
             .conn
-            .query_row("SELECT COUNT(*) FROM activity_log_archive", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM activity_log_archive", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(blobs, 1, "archive table must not gain duplicate periods");
     }
@@ -466,7 +478,9 @@ mod tests {
             .unwrap();
         let archive: i64 = db
             .conn
-            .query_row("SELECT COUNT(*) FROM activity_log_archive", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM activity_log_archive", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(inline, 0, "cold row removed from inline");
         assert_eq!(archive, 1, "archive blob retained");

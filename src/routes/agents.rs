@@ -11,7 +11,8 @@ pub fn router() -> Router<AppState> {
 
 async fn list(State(app): State<AppState>) -> ApiResult<Json<Vec<String>>> {
     let conn = app.conn();
-    let mut stmt = conn.prepare("SELECT DISTINCT agent FROM runs WHERE agent IS NOT NULL ORDER BY agent")?;
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT agent FROM runs WHERE agent IS NOT NULL ORDER BY agent")?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {

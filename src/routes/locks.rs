@@ -139,8 +139,8 @@ async fn heartbeat_lock(
     let ttl_s = validate_ttl(body.ttl_seconds)?;
     let conn = app.conn();
     let task = require_task(&conn, &id)?;
-    let lock = locks::heartbeat(&conn, &task.id, &body.session_id, ttl_s * 1000)?
-        .ok_or_else(|| {
+    let lock =
+        locks::heartbeat(&conn, &task.id, &body.session_id, ttl_s * 1000)?.ok_or_else(|| {
             ApiError::not_found(format!(
                 "No live lock owned by session_id={} on task {}",
                 body.session_id, task.id
@@ -377,7 +377,9 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(b2["lock"]["expires_at"].as_i64().unwrap() > b1["lock"]["expires_at"].as_i64().unwrap());
+        assert!(
+            b2["lock"]["expires_at"].as_i64().unwrap() > b1["lock"]["expires_at"].as_i64().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -470,7 +472,8 @@ mod tests {
     async fn get_lock_returns_204_when_unlocked() {
         let s = setup();
         let task_id = create_task(&s).await;
-        let (status, _, _) = send(&s.app, Method::GET, &format!("/tasks/{task_id}/lock"), None).await;
+        let (status, _, _) =
+            send(&s.app, Method::GET, &format!("/tasks/{task_id}/lock"), None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
 

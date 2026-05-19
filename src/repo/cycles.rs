@@ -48,7 +48,15 @@ pub fn create(conn: &Connection, input: CreateInput<'_>) -> Result<Option<Cycle>
     conn.execute(
         "INSERT INTO cycles (id, project_id, unit_id, title, goal, idx, created_at, status)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'planning')",
-        params![id, input.project_id, input.unit_id, input.title, input.goal, idx, ts],
+        params![
+            id,
+            input.project_id,
+            input.unit_id,
+            input.title,
+            input.goal,
+            idx,
+            ts
+        ],
     )
     .context("insert cycle")?;
     get(conn, &id)
@@ -575,6 +583,9 @@ mod tests {
         );
         // PDD-230: `blocked` is treated terminal (cycle Exit Gate may pass on
         // tracked external blockers). Only T3 (todo) remains as residue.
-        assert!(msg.contains("1 task(s)"), "expected residue count 1, got: {msg}");
+        assert!(
+            msg.contains("1 task(s)"),
+            "expected residue count 1, got: {msg}"
+        );
     }
 }

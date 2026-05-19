@@ -1,5 +1,5 @@
+use axum::extract::Path;
 use axum::extract::{Query, State};
-use axum::extract::{Path};
 use axum::routing::{get, patch};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -68,9 +68,13 @@ async fn create_collection(
         .task_id
         .ok_or_else(|| ApiError::bad_request("task_id is required"))?;
     let conn = app.conn();
-    let task = tasks::get(&conn, &task_id)?
-        .ok_or_else(|| ApiError::not_found("Task not found"))?;
-    json_or_404(comments::create(&conn, &task.id, &payload.author, &payload.body)?)
+    let task = tasks::get(&conn, &task_id)?.ok_or_else(|| ApiError::not_found("Task not found"))?;
+    json_or_404(comments::create(
+        &conn,
+        &task.id,
+        &payload.author,
+        &payload.body,
+    )?)
 }
 
 #[derive(Deserialize)]
@@ -86,8 +90,7 @@ async fn list_collection(
         .task_id
         .ok_or_else(|| ApiError::bad_request("task_id query param is required"))?;
     let conn = app.conn();
-    let task = tasks::get(&conn, &task_id)?
-        .ok_or_else(|| ApiError::not_found("Task not found"))?;
+    let task = tasks::get(&conn, &task_id)?.ok_or_else(|| ApiError::not_found("Task not found"))?;
     Ok(Json(comments::list(&conn, &task.id)?))
 }
 

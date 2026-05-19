@@ -17,10 +17,7 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/plans", get(list).post(create))
-        .route(
-            "/plans/{id}",
-            get(get_one).patch(update).delete(delete_one),
-        )
+        .route("/plans/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/plans/{id}/approve", post(approve))
         .route("/plans/{id}/counts", get(counts))
         // US-CLAWKET-PDD-113: QA round comparator (task delta vs N-1).
@@ -47,7 +44,10 @@ struct ListQuery {
     status: Option<String>,
 }
 
-async fn list(State(app): State<AppState>, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Plan>>> {
+async fn list(
+    State(app): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> ApiResult<Json<Vec<Plan>>> {
     Ok(Json(plans::list(
         &app.conn(),
         plans::ListFilter {
@@ -66,7 +66,10 @@ struct CreateBody {
     source_path: Option<String>,
 }
 
-async fn create(State(app): State<AppState>, Json(body): Json<CreateBody>) -> ApiResult<Json<Plan>> {
+async fn create(
+    State(app): State<AppState>,
+    Json(body): Json<CreateBody>,
+) -> ApiResult<Json<Plan>> {
     let description = norm_opt(body.description);
     let source = norm_opt(body.source);
     let source_path = norm_opt(body.source_path);
@@ -100,8 +103,7 @@ async fn approve(State(app): State<AppState>, Path(id): Path<String>) -> ApiResu
     //   { error: "single_active_plan", existing_plan_id: "<id>" }
     // so callers can disambiguate without parsing the human-readable text.
     let conn = app.conn();
-    let plan = plans::get(&conn, &id)?
-        .ok_or_else(|| ApiError::not_found("plan not found"))?;
+    let plan = plans::get(&conn, &id)?.ok_or_else(|| ApiError::not_found("plan not found"))?;
 
     let existing_active_id: Option<String> = conn
         .query_row(
@@ -190,13 +192,15 @@ async fn update(
                         rusqlite::params![id, now],
                     );
                     // PDD-231: defensive — after cascade, reject if any active cycle remains.
-                    let active_cycles: i64 = conn.query_row(
-                        "SELECT COUNT(*) FROM cycles c
+                    let active_cycles: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM cycles c
                          JOIN units u ON c.unit_id = u.id
                          WHERE u.plan_id = ?1 AND c.status = 'active'",
-                        rusqlite::params![id],
-                        |r| r.get(0),
-                    ).unwrap_or(0);
+                            rusqlite::params![id],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
                     if active_cycles > 0 {
                         return Err(ApiError::conflict_coded(
                             "PLAN_HAS_ACTIVE_CYCLES",
@@ -207,20 +211,24 @@ async fn update(
                         ));
                     }
                     // Existing residue gate: planning cycles + non-terminal tasks still block.
-                    let pending_cycles: i64 = conn.query_row(
-                        "SELECT COUNT(*) FROM cycles c
+                    let pending_cycles: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM cycles c
                          JOIN units u ON c.unit_id = u.id
                          WHERE u.plan_id = ?1 AND c.status != 'completed'",
-                        rusqlite::params![id],
-                        |r| r.get(0),
-                    ).unwrap_or(0);
-                    let pending_tasks: i64 = conn.query_row(
-                        "SELECT COUNT(*) FROM tasks t
+                            rusqlite::params![id],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    let pending_tasks: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM tasks t
                          JOIN units u ON t.unit_id = u.id
                          WHERE u.plan_id = ?1 AND t.status NOT IN ('done', 'cancelled')",
-                        rusqlite::params![id],
-                        |r| r.get(0),
-                    ).unwrap_or(0);
+                            rusqlite::params![id],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
                     if pending_cycles > 0 || pending_tasks > 0 {
                         return Err(ApiError::conflict(format!(
                             "Cannot complete plan: {} planning cycle(s) and {} non-terminal task(s) remain",
@@ -249,8 +257,7 @@ async fn counts(
     Path(id): Path<String>,
 ) -> ApiResult<Json<PlanCounts>> {
     let conn = app.conn();
-    let plan = plans::get(&conn, &id)?
-        .ok_or_else(|| ApiError::not_found("plan not found"))?;
+    let plan = plans::get(&conn, &id)?.ok_or_else(|| ApiError::not_found("plan not found"))?;
 
     // Single aggregate query: group tasks by unit
     let mut stmt = conn.prepare(
@@ -487,8 +494,7 @@ async fn round_diff(
         ));
     }
     let conn = app.conn();
-    let _plan = plans::get(&conn, &id)?
-        .ok_or_else(|| ApiError::not_found("plan not found"))?;
+    let _plan = plans::get(&conn, &id)?.ok_or_else(|| ApiError::not_found("plan not found"))?;
 
     let prior_cycle = cycle_for_round(&conn, &id, n - 1)?;
     let cur_cycle = cycle_for_round(&conn, &id, n)?;
@@ -530,8 +536,7 @@ async fn round_regression_intent(
         ));
     }
     let conn = app.conn();
-    let _plan = plans::get(&conn, &id)?
-        .ok_or_else(|| ApiError::not_found("plan not found"))?;
+    let _plan = plans::get(&conn, &id)?.ok_or_else(|| ApiError::not_found("plan not found"))?;
 
     let prior_cycle = cycle_for_round(&conn, &id, n - 1)?;
     let cur_cycle = cycle_for_round(&conn, &id, n)?;

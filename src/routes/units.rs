@@ -15,10 +15,7 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/units", get(list).post(create))
-        .route(
-            "/units/{id}",
-            get(get_one).patch(update).delete(delete_one),
-        )
+        .route("/units/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/units/{id}/counts", get(counts))
     // NOTE: /units/{id}/approve endpoint removed in v3.0 (FIX-DAEMON-004).
     // Units are pure grouping entities with no approval lifecycle.
@@ -29,7 +26,10 @@ struct ListQuery {
     plan_id: Option<String>,
 }
 
-async fn list(State(app): State<AppState>, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Unit>>> {
+async fn list(
+    State(app): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> ApiResult<Json<Vec<Unit>>> {
     Ok(Json(units::list(
         &app.conn(),
         units::ListFilter {
@@ -47,7 +47,10 @@ struct CreateBody {
     execution_mode: Option<String>,
 }
 
-async fn create(State(app): State<AppState>, Json(body): Json<CreateBody>) -> ApiResult<Json<Unit>> {
+async fn create(
+    State(app): State<AppState>,
+    Json(body): Json<CreateBody>,
+) -> ApiResult<Json<Unit>> {
     json_or_404(units::create(
         &app.conn(),
         units::CreateInput {
@@ -78,11 +81,11 @@ async fn counts(
     Path(id): Path<String>,
 ) -> ApiResult<Json<SingleUnitCounts>> {
     let conn = app.conn();
-    let unit = units::get(&conn, &id)?
-        .ok_or_else(|| ApiError::not_found("unit not found"))?;
+    let unit = units::get(&conn, &id)?.ok_or_else(|| ApiError::not_found("unit not found"))?;
 
-    let row: (i64, i64, i64, i64, i64, i64) = conn.query_row(
-        "SELECT
+    let row: (i64, i64, i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT
             SUM(CASE WHEN status = 'todo'        THEN 1 ELSE 0 END),
             SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END),
             SUM(CASE WHEN status = 'done'        THEN 1 ELSE 0 END),
@@ -90,9 +93,19 @@ async fn counts(
             SUM(CASE WHEN status = 'cancelled'   THEN 1 ELSE 0 END),
             COUNT(id)
          FROM tasks WHERE unit_id = ?1",
-        rusqlite::params![id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-    ).map_err(|e| ApiError::internal(e.to_string()))?;
+            rusqlite::params![id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
     Ok(Json(SingleUnitCounts {
         unit_id: unit.id,

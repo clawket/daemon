@@ -24,11 +24,7 @@ use axum::{
 use crate::routes::error::ApiError;
 use crate::state::AppState;
 
-pub async fn migration_gate(
-    State(app): State<AppState>,
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn migration_gate(State(app): State<AppState>, req: Request, next: Next) -> Response {
     let method = req.method();
     let mutating = matches!(
         method,

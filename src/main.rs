@@ -116,10 +116,7 @@ async fn run_daemon(args: StartArgs) -> Result<()> {
     // US-CKT-SCHEMA-038: pass the state dir so migration events are appended
     // to <state>/migration.log in addition to the tracing subscriber.
     let database = db::Db::open_with_state(&paths_cfg.db, Some(paths_cfg.state.clone()))?;
-    tracing::info!(
-        vec_enabled = database.vec_enabled,
-        "database initialized"
-    );
+    tracing::info!(vec_enabled = database.vec_enabled, "database initialized");
 
     // FIX-DAEMON-108: generate the TCP auth token early so AppState can hold a
     // copy. LM-10833: the SPA index handler reads it from AppState to issue the
@@ -178,12 +175,12 @@ async fn run_daemon(args: StartArgs) -> Result<()> {
         .with_state(app_state.clone());
 
     // FIX-DAEMON-108: TCP listener gets auth middleware; Unix socket is exempt (local = trusted)
-    let tcp_app = base_router.clone().route_layer(
-        axum::middleware::from_fn_with_state(
+    let tcp_app = base_router
+        .clone()
+        .route_layer(axum::middleware::from_fn_with_state(
             tcp_token,
             middleware::tcp_auth::tcp_auth_layer,
-        ),
-    );
+        ));
     // Unix socket uses the same routes without the auth layer
     let unix_app = base_router;
 
@@ -538,7 +535,11 @@ async fn backfill_missing_embeddings(state: AppState) {
             }
         };
         let mapped = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         });
         match mapped {
             Ok(iter) => iter.filter_map(|r| r.ok()).collect(),

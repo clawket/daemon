@@ -82,18 +82,11 @@ fn parse_string_ref(env_var: &str, raw: &str) -> SecretResult<SecretRef> {
 }
 
 fn parse_object_ref(env_var: &str, raw: &Map<String, Value>) -> SecretResult<SecretRef> {
-    let backend_str = raw
-        .get("backend")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            SecretError::InvalidReference(format!(
-                "secrets_ref[{env_var}] object missing 'backend'"
-            ))
-        })?;
+    let backend_str = raw.get("backend").and_then(Value::as_str).ok_or_else(|| {
+        SecretError::InvalidReference(format!("secrets_ref[{env_var}] object missing 'backend'"))
+    })?;
     let path = raw.get("path").and_then(Value::as_str).ok_or_else(|| {
-        SecretError::InvalidReference(format!(
-            "secrets_ref[{env_var}] object missing 'path'"
-        ))
+        SecretError::InvalidReference(format!("secrets_ref[{env_var}] object missing 'path'"))
     })?;
     if path.is_empty() {
         return Err(SecretError::InvalidReference(format!(
@@ -137,7 +130,10 @@ mod tests {
         store.set("clawket/anthropic", "kr-secret");
         let mut r = Registry::empty();
         r.set(BackendKind::Env, Arc::new(EnvBackend::new()));
-        r.set(BackendKind::Keyring, Arc::new(KeyringBackend::new(Box::new(store))));
+        r.set(
+            BackendKind::Keyring,
+            Arc::new(KeyringBackend::new(Box::new(store))),
+        );
         r
     }
 

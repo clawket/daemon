@@ -29,8 +29,9 @@ pub fn create(conn: &Connection, input: CreateInput<'_>) -> Result<Option<Knowle
         if parent_id == id.as_str() {
             bail!("SELF_PARENT: knowledge cannot be its own parent");
         }
-        let depth: i64 = conn.query_row(
-            "WITH RECURSIVE depth_walk(pid, d) AS (
+        let depth: i64 = conn
+            .query_row(
+                "WITH RECURSIVE depth_walk(pid, d) AS (
                SELECT ?1, 1
                UNION ALL
                SELECT k.parent_id, d + 1
@@ -39,9 +40,10 @@ pub fn create(conn: &Connection, input: CreateInput<'_>) -> Result<Option<Knowle
                WHERE k.parent_id IS NOT NULL AND d < 10
              )
              SELECT COALESCE(MAX(d), 0) FROM depth_walk",
-            rusqlite::params![parent_id],
-            |r| r.get(0),
-        ).unwrap_or(0);
+                rusqlite::params![parent_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
         if depth >= 8 {
             bail!("WIKI_DEPTH_EXCEEDED: max wiki tree depth is 8");
         }
@@ -65,15 +67,16 @@ pub fn soft_delete(conn: &Connection, id: &str) -> Result<()> {
         "UPDATE knowledge SET parent_id = NULL WHERE parent_id = ?1",
         params![id],
     )?;
-    conn.execute(
-        "DELETE FROM knowledge WHERE id = ?1",
-        params![id],
-    )?;
+    conn.execute("DELETE FROM knowledge WHERE id = ?1", params![id])?;
     Ok(())
 }
 
 /// Get wiki tree (children of a parent, recursive) up to depth 8.
-pub fn wiki_tree(conn: &Connection, root_id: Option<&str>, plan_id: Option<&str>) -> Result<Vec<Knowledge>> {
+pub fn wiki_tree(
+    conn: &Connection,
+    root_id: Option<&str>,
+    plan_id: Option<&str>,
+) -> Result<Vec<Knowledge>> {
     let sql = if let Some(rid) = root_id {
         format!(
             "WITH RECURSIVE tree(id, depth) AS (
@@ -197,19 +200,26 @@ pub fn update(conn: &Connection, id: &str, f: UpdateFields) -> Result<Option<Kno
             bail!("SELF_PARENT: knowledge cannot be its own parent");
         }
         // Walk up the new parent's chain to ensure 'id' doesn't appear (cycle detection).
-        let would_cycle: bool = conn.query_row(
-            "WITH RECURSIVE chain(pid) AS (
+        let would_cycle: bool = conn
+            .query_row(
+                "WITH RECURSIVE chain(pid) AS (
                SELECT ?1
                UNION ALL
                SELECT k.parent_id FROM knowledge k JOIN chain c ON k.id = c.pid
                WHERE k.parent_id IS NOT NULL
              )
              SELECT COUNT(*) FROM chain WHERE pid = ?2",
-            rusqlite::params![new_parent, id],
-            |r| r.get::<_, i64>(0),
-        ).unwrap_or(0) > 0;
+                rusqlite::params![new_parent, id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
         if would_cycle {
-            bail!("WIKI_CYCLE: setting parent_id='{}' on knowledge '{}' would create a cycle", new_parent, id);
+            bail!(
+                "WIKI_CYCLE: setting parent_id='{}' on knowledge '{}' would create a cycle",
+                new_parent,
+                id
+            );
         }
     }
 
@@ -262,11 +272,7 @@ pub fn delete(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn keyword_search(
-    conn: &Connection,
-    query: &str,
-    limit: i64,
-) -> Result<Vec<Knowledge>> {
+pub fn keyword_search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Knowledge>> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
@@ -440,7 +446,10 @@ fn map_knowledge_with_wiki(r: &rusqlite::Row<'_>) -> rusqlite::Result<Knowledge>
     let content: String = r.get(6)?;
     // For decision knowledge entries, parse `## Decision` and `## Outcome` body sections.
     let (decision_text, outcome) = if type_ == "decision" {
-        (parse_md_section(&content, "Decision"), parse_md_section(&content, "Outcome"))
+        (
+            parse_md_section(&content, "Decision"),
+            parse_md_section(&content, "Outcome"),
+        )
     } else {
         (None, None)
     };
@@ -475,7 +484,11 @@ fn parse_md_section(body: &str, heading: &str) -> Option<String> {
     };
     let end = rest.find("\n## ").unwrap_or(rest.len());
     let text = rest[..end].trim();
-    if text.is_empty() { None } else { Some(text.to_string()) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
 }
 
 #[cfg(test)]

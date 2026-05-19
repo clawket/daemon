@@ -351,8 +351,8 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     /// Mock clock: tests advance time without sleeping the runtime.
     struct MockClock {
@@ -404,14 +404,13 @@ mod tests {
         }
     }
 
-    fn limiter_with(
-        config: RateLimitConfig,
-        clock: Arc<MockClock>,
-    ) -> RateLimiter {
+    fn limiter_with(config: RateLimitConfig, clock: Arc<MockClock>) -> RateLimiter {
         RateLimiter::with_deps(config, Box::new(clock), Box::new(NoJitter))
     }
 
-    fn mock_sleeper(clock: Arc<MockClock>) -> impl FnMut(Duration) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn mock_sleeper(
+        clock: Arc<MockClock>,
+    ) -> impl FnMut(Duration) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
         move |d| {
             let c = clock.clone();
             Box::pin(async move {
@@ -512,9 +511,11 @@ mod tests {
             }
         }
         let clock = MockClock::new(Instant::now());
-        let limiter_low =
-            RateLimiter::with_deps(cfg_low, Box::new(clock), Box::new(LowerJitter));
-        assert_eq!(limiter_low.compute_backoff(0), Duration::from_secs_f64(0.80));
+        let limiter_low = RateLimiter::with_deps(cfg_low, Box::new(clock), Box::new(LowerJitter));
+        assert_eq!(
+            limiter_low.compute_backoff(0),
+            Duration::from_secs_f64(0.80)
+        );
     }
 
     #[tokio::test]

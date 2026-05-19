@@ -110,7 +110,11 @@ mod tests {
     use std::process::Command as Cmd;
 
     fn init_repo_and_commit(path: &std::path::Path) -> String {
-        Cmd::new("git").args(["init", "-q", "-b", "main"]).arg(path).status().unwrap();
+        Cmd::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(path)
+            .status()
+            .unwrap();
         Cmd::new("git")
             .args(["-C"])
             .arg(path)
@@ -124,7 +128,12 @@ mod tests {
             .status()
             .unwrap();
         std::fs::write(path.join("README"), "hello").unwrap();
-        Cmd::new("git").args(["-C"]).arg(path).args(["add", "."]).status().unwrap();
+        Cmd::new("git")
+            .args(["-C"])
+            .arg(path)
+            .args(["add", "."])
+            .status()
+            .unwrap();
         Cmd::new("git")
             .args(["-C"])
             .arg(path)

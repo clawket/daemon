@@ -145,7 +145,9 @@ fn resolve_web_dir() -> Option<PathBuf> {
         candidates.push(cwd.join("../../web/dist"));
     }
 
-    candidates.into_iter().find(|c| c.join("index.html").is_file())
+    candidates
+        .into_iter()
+        .find(|c| c.join("index.html").is_file())
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -154,11 +156,7 @@ fn home_dir() -> Result<PathBuf> {
         .context("HOME is not set; cannot resolve XDG paths")
 }
 
-fn resolve_dir(
-    override_env: &str,
-    xdg_var: &str,
-    home_fallback: &str,
-) -> Result<PathBuf> {
+fn resolve_dir(override_env: &str, xdg_var: &str, home_fallback: &str) -> Result<PathBuf> {
     if let Some(p) = env::var_os(override_env) {
         return Ok(PathBuf::from(p));
     }
@@ -301,9 +299,8 @@ pub fn remove_token_file(path: &Path) {
 /// so the caller (CLI restart logic) can surface the right error.
 pub fn prepare_socket_path(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("create socket parent dir: {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create socket parent dir: {}", parent.display()))?;
     }
     if path.exists() {
         // Attempt to detect if a live process owns this socket via the pid file.

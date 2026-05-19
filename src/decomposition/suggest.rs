@@ -89,7 +89,11 @@ pub fn generate(
         .map(|(i, line)| Suggestion {
             idx: i,
             title: format!("{} — {}", parent.title, truncate(line, TITLE_TRUNCATE)),
-            rationale: format!("success_criteria #{}: {}", i + 1, truncate(line, RATIONALE_TRUNCATE)),
+            rationale: format!(
+                "success_criteria #{}: {}",
+                i + 1,
+                truncate(line, RATIONALE_TRUNCATE)
+            ),
             scope_hint,
             inherited_envelope_keys: vec!["intent", "prompt_template", "decomposition_policy"],
         })
@@ -259,7 +263,9 @@ mod tests {
         let result = generate(parent(), &resolved, 0, 2, "auto");
         assert_eq!(result.suggested_subtasks.len(), 3);
         assert_eq!(result.suggested_subtasks[0].idx, 0);
-        assert!(result.suggested_subtasks[0].title.contains("Build the thing"));
+        assert!(result.suggested_subtasks[0]
+            .title
+            .contains("Build the thing"));
         assert!(result.suggested_subtasks[0].title.contains("criterion A"));
     }
 
@@ -310,11 +316,7 @@ mod tests {
         // Truncated to max_subtasks=3, so post-truncation count is 3.
         // min_subtasks=6 vs *initial* length=5 → fires warning before truncation.
         assert_eq!(result.suggested_subtasks.len(), 3);
-        let fields: Vec<&str> = result
-            .policy_violations
-            .iter()
-            .map(|v| v.field)
-            .collect();
+        let fields: Vec<&str> = result.policy_violations.iter().map(|v| v.field).collect();
         assert!(fields.contains(&"min_subtasks"));
         assert!(fields.contains(&"max_subtasks"));
     }

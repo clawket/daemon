@@ -51,10 +51,7 @@ fn extract_title(path: &Path, fallback: &str) -> String {
     let Ok(bytes) = std::fs::read(path) else {
         return fallback.to_string();
     };
-    let head: String = String::from_utf8_lossy(&bytes)
-        .chars()
-        .take(500)
-        .collect();
+    let head: String = String::from_utf8_lossy(&bytes).chars().take(500).collect();
     for line in head.lines() {
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix("# ") {
@@ -72,13 +69,7 @@ fn modified_ms(meta: &std::fs::Metadata) -> u128 {
         .unwrap_or(0)
 }
 
-fn scan_dir(
-    dir: &Path,
-    cwd: &Path,
-    wiki_root: &str,
-    depth: usize,
-    out: &mut Vec<WikiFile>,
-) {
+fn scan_dir(dir: &Path, cwd: &Path, wiki_root: &str, depth: usize, out: &mut Vec<WikiFile>) {
     if depth > MAX_DEPTH {
         return;
     }

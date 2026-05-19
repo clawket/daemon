@@ -384,7 +384,11 @@ async fn knowledge_export(
 
     let export_path: String = if let Some(pid) = body.project_id.as_deref() {
         match projects::get(&conn, pid)? {
-            Some(p) => p.wiki_paths.first().cloned().unwrap_or_else(|| "docs".into()),
+            Some(p) => p
+                .wiki_paths
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "docs".into()),
             None => "docs".into(),
         }
     } else {

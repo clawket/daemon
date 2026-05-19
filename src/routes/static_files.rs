@@ -50,10 +50,8 @@ fn serve_file(path: &Path) -> Option<Response<Body>> {
         .to_lowercase();
     let mime = mime_for(&ext);
     let mut resp = Response::new(Body::from(bytes));
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(mime),
-    );
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=31536000, immutable"),
@@ -98,10 +96,8 @@ async fn spa_index(State(app): State<AppState>) -> Response<Body> {
     );
     // LM-10833: don't cache the index, the bootstrap cookie below rotates
     // every daemon restart so a stale 304 would hand the browser a dead token.
-    resp.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     // LM-10833: bootstrap the SPA's auth channel. The browser receives an
     // HttpOnly + SameSite=Strict cookie carrying the same token the CLI reads
     // from the token file. SPA `fetch` calls with `credentials: 'include'`
@@ -112,9 +108,8 @@ async fn spa_index(State(app): State<AppState>) -> Response<Body> {
     // browsers that honor it.
     let token = app.tcp_token();
     if !token.is_empty() {
-        let cookie = format!(
-            "clawket_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
-        );
+        let cookie =
+            format!("clawket_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400");
         if let Ok(value) = HeaderValue::from_str(&cookie) {
             resp.headers_mut().append(header::SET_COOKIE, value);
         }
@@ -136,10 +131,7 @@ async fn icons(State(app): State<AppState>) -> Response<Body> {
     serve_file(&web_dir.join("icons.svg")).unwrap_or_else(not_found)
 }
 
-async fn asset(
-    State(app): State<AppState>,
-    AxumPath(path): AxumPath<String>,
-) -> Response<Body> {
+async fn asset(State(app): State<AppState>, AxumPath(path): AxumPath<String>) -> Response<Body> {
     let Some(web_dir) = app.paths().web_dir.clone() else {
         return not_found();
     };

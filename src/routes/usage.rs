@@ -18,7 +18,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::repo::{plans, tasks, task_envelopes, usage};
+use crate::repo::{plans, task_envelopes, tasks, usage};
 use crate::routes::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -190,10 +190,7 @@ struct PlanUsageResponse {
 
 /// Read the `token_budget` from the resolved envelope chain (parent →
 /// self deep-merged). Returns `None` if no level supplies one.
-fn resolved_token_budget(
-    conn: &rusqlite::Connection,
-    task_id: &str,
-) -> ApiResult<Option<Value>> {
+fn resolved_token_budget(conn: &rusqlite::Connection, task_id: &str) -> ApiResult<Option<Value>> {
     let chain = task_envelopes::resolve_chain(conn, task_id, RESOLVE_CHAIN_MAX_DEPTH)?;
     if chain.is_empty() {
         return Ok(None);
@@ -416,8 +413,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let (status, body) =
-            get_uri(&s.app, &format!("/tasks/{}/usage", task_id)).await;
+        let (status, body) = get_uri(&s.app, &format!("/tasks/{}/usage", task_id)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["runs"].as_array().unwrap().len(), 1);
         assert_eq!(body["totals"]["input_tokens"], 1000);
@@ -451,8 +447,7 @@ mod tests {
         )
         .await;
         assert_eq!(rec_status, StatusCode::OK);
-        let (status, body) =
-            get_uri(&s.app, &format!("/tasks/{}/usage/preflight", task_id)).await;
+        let (status, body) = get_uri(&s.app, &format!("/tasks/{}/usage/preflight", task_id)).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(body["error"], "token_budget exceeded");
         assert_eq!(body["details"]["over_input"], true);
@@ -484,8 +479,7 @@ mod tests {
             }),
         )
         .await;
-        let (status, body) =
-            get_uri(&s.app, &format!("/tasks/{}/usage/preflight", task_id)).await;
+        let (status, body) = get_uri(&s.app, &format!("/tasks/{}/usage/preflight", task_id)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["exceeded"], false);
     }
@@ -494,8 +488,7 @@ mod tests {
     async fn preflight_200_when_no_budget_set() {
         let s = setup();
         let task_id = create_task(&s, None).await;
-        let (status, body) =
-            get_uri(&s.app, &format!("/tasks/{}/usage/preflight", task_id)).await;
+        let (status, body) = get_uri(&s.app, &format!("/tasks/{}/usage/preflight", task_id)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["exceeded"], false);
     }
@@ -526,8 +519,7 @@ mod tests {
             serde_json::json!({"run_id": r2, "model": "haiku", "input_tokens": 50}),
         )
         .await;
-        let (status, body) =
-            get_uri(&s.app, &format!("/plans/{}/usage", s.plan_id)).await;
+        let (status, body) = get_uri(&s.app, &format!("/plans/{}/usage", s.plan_id)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["by_model"].as_array().unwrap().len(), 2);
         assert_eq!(body["totals"]["input_tokens"], 150);

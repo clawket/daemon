@@ -23,11 +23,7 @@
 //! Unix socket listener is already gated by filesystem permissions, so no
 //! additional auth layer is required here.
 
-use axum::{
-    extract::State,
-    routing::post,
-    Json, Router,
-};
+use axum::{extract::State, routing::post, Json, Router};
 use serde::Deserialize;
 use serde_json::Value;
 

@@ -29,10 +29,7 @@ impl OnePasswordBackend {
                 .map_err(|e| format!("failed to spawn op: {e}"))?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!(
-                    "op exited with {}: {}",
-                    output.status, stderr
-                ));
+                return Err(format!("op exited with {}: {}", output.status, stderr));
             }
             let stdout = String::from_utf8_lossy(&output.stdout)
                 .trim_end_matches('\n')

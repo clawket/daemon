@@ -140,7 +140,10 @@ mod tests {
     fn entropy_of_natural_english_is_below_threshold() {
         let s = "Build the Stripe integration end-to-end including webhook tests";
         let h = shannon_entropy(s);
-        assert!(h < ENTROPY_THRESHOLD, "english entropy {h} should be < {ENTROPY_THRESHOLD}");
+        assert!(
+            h < ENTROPY_THRESHOLD,
+            "english entropy {h} should be < {ENTROPY_THRESHOLD}"
+        );
     }
 
     #[test]
@@ -148,7 +151,10 @@ mod tests {
         // Real-shaped api key: 32 alnum chars, all distinct, distributed.
         let s = "EXAMPLE_4eC39HqLyjWDarjtT1zdp7dc";
         let h = shannon_entropy(s);
-        assert!(h > ENTROPY_THRESHOLD, "key entropy {h} should be > {ENTROPY_THRESHOLD}");
+        assert!(
+            h > ENTROPY_THRESHOLD,
+            "key entropy {h} should be > {ENTROPY_THRESHOLD}"
+        );
     }
 
     #[test]

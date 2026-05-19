@@ -141,8 +141,14 @@ impl AppState {
         let (entity_type, change_type) = parse_event_name(event);
         // Inject structured fields into data object
         if let Some(obj) = data.as_object_mut() {
-            obj.insert("entity_type".to_string(), Value::String(entity_type.to_string()));
-            obj.insert("change_type".to_string(), Value::String(change_type.to_string()));
+            obj.insert(
+                "entity_type".to_string(),
+                Value::String(entity_type.to_string()),
+            );
+            obj.insert(
+                "change_type".to_string(),
+                Value::String(change_type.to_string()),
+            );
             obj.insert("event_id".to_string(), Value::Number(id.into()));
             obj.insert("ts".to_string(), Value::Number(now_ms().into()));
         }
@@ -164,26 +170,26 @@ impl AppState {
 fn parse_event_name(event: &'static str) -> (&'static str, &'static str) {
     // We use a static lookup to keep borrowed lifetimes correct.
     match event {
-        "task:created"   => ("task",    "created"),
-        "task:updated"   => ("task",    "updated"),
-        "task:deleted"   => ("task",    "deleted"),
-        "task:started"   => ("task",    "started"),
-        "task:done"      => ("task",    "done"),
-        "task:cancelled" => ("task",    "cancelled"),
-        "cycle:created"  => ("cycle",   "created"),
-        "cycle:updated"  => ("cycle",   "updated"),
-        "cycle:deleted"  => ("cycle",   "deleted"),
-        "plan:created"   => ("plan",    "created"),
-        "plan:updated"   => ("plan",    "updated"),
-        "plan:deleted"   => ("plan",    "deleted"),
-        "unit:created"   => ("unit",    "created"),
-        "unit:updated"   => ("unit",    "updated"),
-        "unit:deleted"   => ("unit",    "deleted"),
+        "task:created" => ("task", "created"),
+        "task:updated" => ("task", "updated"),
+        "task:deleted" => ("task", "deleted"),
+        "task:started" => ("task", "started"),
+        "task:done" => ("task", "done"),
+        "task:cancelled" => ("task", "cancelled"),
+        "cycle:created" => ("cycle", "created"),
+        "cycle:updated" => ("cycle", "updated"),
+        "cycle:deleted" => ("cycle", "deleted"),
+        "plan:created" => ("plan", "created"),
+        "plan:updated" => ("plan", "updated"),
+        "plan:deleted" => ("plan", "deleted"),
+        "unit:created" => ("unit", "created"),
+        "unit:updated" => ("unit", "updated"),
+        "unit:deleted" => ("unit", "deleted"),
         "knowledge:created" => ("knowledge", "created"),
         "knowledge:updated" => ("knowledge", "updated"),
         "knowledge:deleted" => ("knowledge", "deleted"),
-        "comment:created"  => ("comment",  "created"),
-        "comment:deleted"  => ("comment",  "deleted"),
+        "comment:created" => ("comment", "created"),
+        "comment:deleted" => ("comment", "deleted"),
         _ => {
             // Fallback: split on ':'
             if let Some(pos) = event.find(':') {

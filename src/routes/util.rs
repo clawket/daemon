@@ -9,13 +9,7 @@
 use serde_json::Value;
 
 pub fn norm_opt(s: Option<String>) -> Option<String> {
-    s.and_then(|v| {
-        if v.trim().is_empty() {
-            None
-        } else {
-            Some(v)
-        }
-    })
+    s.and_then(|v| if v.trim().is_empty() { None } else { Some(v) })
 }
 
 pub fn value_to_opt_string(v: &Value) -> Option<String> {

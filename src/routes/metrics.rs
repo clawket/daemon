@@ -30,10 +30,7 @@ async fn metrics_handler(State(app): State<AppState>) -> impl IntoResponse {
     // --- clawket_schema_version ---
     lines.push("# HELP clawket_schema_version Current SQLite schema version".to_string());
     lines.push("# TYPE clawket_schema_version gauge".to_string());
-    lines.push(format!(
-        "clawket_schema_version {}",
-        app.schema_version()
-    ));
+    lines.push(format!("clawket_schema_version {}", app.schema_version()));
 
     // --- clawket_uptime_ms ---
     lines.push("# HELP clawket_uptime_ms Milliseconds since daemon started".to_string());
@@ -85,9 +82,8 @@ async fn metrics_handler(State(app): State<AppState>) -> impl IntoResponse {
 }
 
 fn task_counts_by_status(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<(String, i64)>> {
-    let mut stmt = conn.prepare(
-        "SELECT status, COUNT(*) FROM tasks GROUP BY status ORDER BY status",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT status, COUNT(*) FROM tasks GROUP BY status ORDER BY status")?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -95,9 +91,8 @@ fn task_counts_by_status(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<(S
 }
 
 fn plan_counts_by_status(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<(String, i64)>> {
-    let mut stmt = conn.prepare(
-        "SELECT status, COUNT(*) FROM plans GROUP BY status ORDER BY status",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT status, COUNT(*) FROM plans GROUP BY status ORDER BY status")?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;

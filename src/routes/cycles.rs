@@ -173,11 +173,11 @@ async fn counts(
     Path(id): Path<String>,
 ) -> ApiResult<Json<CycleCounts>> {
     let conn = app.conn();
-    let cycle = cycles::get(&conn, &id)?
-        .ok_or_else(|| ApiError::not_found("cycle not found"))?;
+    let cycle = cycles::get(&conn, &id)?.ok_or_else(|| ApiError::not_found("cycle not found"))?;
 
-    let row: (i64, i64, i64, i64, i64, i64) = conn.query_row(
-        "SELECT
+    let row: (i64, i64, i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT
             SUM(CASE WHEN status = 'todo'        THEN 1 ELSE 0 END),
             SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END),
             SUM(CASE WHEN status = 'done'        THEN 1 ELSE 0 END),
@@ -185,9 +185,19 @@ async fn counts(
             SUM(CASE WHEN status = 'cancelled'   THEN 1 ELSE 0 END),
             COUNT(id)
          FROM tasks WHERE cycle_id = ?1",
-        rusqlite::params![id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-    ).map_err(|e| ApiError::internal(e.to_string()))?;
+            rusqlite::params![id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
     Ok(Json(CycleCounts {
         cycle_id: cycle.id,
@@ -219,8 +229,7 @@ async fn cycle_diff(
     Query(q): Query<CycleDiffQuery>,
 ) -> ApiResult<Json<Value>> {
     let conn = app.conn();
-    let current = cycles::get(&conn, &id)?
-        .ok_or_else(|| ApiError::not_found("cycle not found"))?;
+    let current = cycles::get(&conn, &id)?.ok_or_else(|| ApiError::not_found("cycle not found"))?;
 
     let against_id: Option<String> = match q.against {
         Some(s) if !s.is_empty() => Some(s),

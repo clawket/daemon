@@ -113,8 +113,8 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<Project>> {
         return Ok(None);
     };
 
-    let wiki_paths: Vec<String> = serde_json::from_str(&wiki_paths_json)
-        .unwrap_or_else(|_| vec!["docs".to_string()]);
+    let wiki_paths: Vec<String> =
+        serde_json::from_str(&wiki_paths_json).unwrap_or_else(|_| vec!["docs".to_string()]);
     let cwds = list_cwds(conn, &id)?;
 
     Ok(Some(Project {
@@ -132,7 +132,11 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<Project>> {
 
 pub fn get_by_name(conn: &Connection, name: &str) -> Result<Option<Project>> {
     let id: Option<String> = conn
-        .query_row("SELECT id FROM projects WHERE name = ?1", params![name], |r| r.get(0))
+        .query_row(
+            "SELECT id FROM projects WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
         .optional()?;
     match id {
         Some(i) => get(conn, &i),
@@ -352,7 +356,9 @@ mod tests {
         let by_cwd = get_by_cwd(&db.conn, "/tmp/myapp", false).unwrap().unwrap();
         assert_eq!(by_cwd.id, p.id);
 
-        let by_subdir = get_by_cwd(&db.conn, "/tmp/myapp/sub", false).unwrap().unwrap();
+        let by_subdir = get_by_cwd(&db.conn, "/tmp/myapp/sub", false)
+            .unwrap()
+            .unwrap();
         assert_eq!(by_subdir.id, p.id);
 
         add_cwd(&db.conn, &p.id, "/tmp/other").unwrap();
@@ -391,4 +397,3 @@ mod tests {
         assert_eq!(generate_key_from_name("x_y-z"), "XYZ");
     }
 }
-

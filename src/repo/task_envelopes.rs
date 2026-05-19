@@ -26,7 +26,14 @@ pub fn create(conn: &Connection, input: CreateInput<'_>) -> Result<TaskEnvelope>
     conn.execute(
         "INSERT INTO task_envelopes (id, task_id, version, json, signed_at, signed_by)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, input.task_id, input.version, input.json, ts, input.signed_by],
+        params![
+            id,
+            input.task_id,
+            input.version,
+            input.json,
+            ts,
+            input.signed_by
+        ],
     )
     .context("insert task_envelope")?;
     get(conn, &id)?.ok_or_else(|| anyhow::anyhow!("envelope vanished after insert"))
@@ -156,7 +163,8 @@ pub fn clear_active_for_task(conn: &Connection, task_id: &str) -> Result<bool> {
         )
         .optional()?;
     // US-CLAWKET-I18N-040: localized via TASK_NOT_FOUND (error.task.not_found).
-    let prev = prev.ok_or_else(|| anyhow::anyhow!("TASK_NOT_FOUND: task not found: {}", task_id))?;
+    let prev =
+        prev.ok_or_else(|| anyhow::anyhow!("TASK_NOT_FOUND: task not found: {}", task_id))?;
     let was_active = prev.is_some();
     if was_active {
         conn.execute(
@@ -177,8 +185,7 @@ pub fn sign_for_task(
     json: &str,
     signed_by: &str,
 ) -> Result<TaskEnvelope> {
-    serde_json::from_str::<serde_json::Value>(json)
-        .context("envelope json must be valid JSON")?;
+    serde_json::from_str::<serde_json::Value>(json).context("envelope json must be valid JSON")?;
 
     let tx = conn.transaction()?;
 
@@ -266,11 +273,7 @@ pub struct ChainEntry {
 /// `repo::tasks` already rejects parent links that would form cycles, so
 /// in practice the chain length matches the tree depth. 1024 is the
 /// default used by the routes layer.
-pub fn resolve_chain(
-    conn: &Connection,
-    task_id: &str,
-    max_depth: i64,
-) -> Result<Vec<ChainEntry>> {
+pub fn resolve_chain(conn: &Connection, task_id: &str, max_depth: i64) -> Result<Vec<ChainEntry>> {
     let mut stmt = conn.prepare(
         "WITH RECURSIVE chain(id, parent_task_id, active_envelope_id, depth) AS (
             SELECT id, parent_task_id, active_envelope_id, 0
@@ -317,7 +320,11 @@ pub fn resolve_chain_active(chain: &[ChainEntry]) -> serde_json::Value {
             }
         }
     }
-    if any { acc } else { Value::Null }
+    if any {
+        acc
+    } else {
+        Value::Null
+    }
 }
 
 fn deep_merge(into: &mut serde_json::Value, patch: &serde_json::Value) {
@@ -584,8 +591,7 @@ mod tests {
     #[test]
     fn clear_active_unlinks_pointer_and_preserves_history() {
         let (_d, mut db, task_id) = setup();
-        let env =
-            sign_for_task(&mut db.conn, &task_id, r#"{"intent":"x"}"#, "a").unwrap();
+        let env = sign_for_task(&mut db.conn, &task_id, r#"{"intent":"x"}"#, "a").unwrap();
         let before: Option<String> = db
             .conn
             .query_row(

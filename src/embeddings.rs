@@ -26,15 +26,16 @@ struct Embedder {
 static EMBEDDER: OnceCell<Arc<Mutex<Option<Embedder>>>> = OnceCell::new();
 
 fn slot() -> Arc<Mutex<Option<Embedder>>> {
-    EMBEDDER
-        .get_or_init(|| Arc::new(Mutex::new(None)))
-        .clone()
+    EMBEDDER.get_or_init(|| Arc::new(Mutex::new(None))).clone()
 }
 
 async fn fetch_files() -> Result<(PathBuf, PathBuf, PathBuf)> {
     let api = Api::new().context("hf-hub api init")?;
     let repo = api.repo(Repo::new(MODEL_REPO.to_string(), RepoType::Model));
-    let config = repo.get("config.json").await.context("download config.json")?;
+    let config = repo
+        .get("config.json")
+        .await
+        .context("download config.json")?;
     let tokenizer = repo
         .get("tokenizer.json")
         .await

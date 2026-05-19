@@ -54,7 +54,10 @@ async fn get_one(State(app): State<AppState>, Path(id): Path<String>) -> ApiResu
     json_or_404(projects::get(&app.conn(), &id)?)
 }
 
-async fn delete_one(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
+async fn delete_one(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
     projects::delete(&app.conn(), &id)?;
     Ok(Json(serde_json::json!({ "ok": true, "deleted": id })))
 }
@@ -105,7 +108,11 @@ async fn update(
     }
     if let Some(v) = obj.get("enabled") {
         let n = if let Some(b) = v.as_bool() {
-            if b { 1 } else { 0 }
+            if b {
+                1
+            } else {
+                0
+            }
         } else if let Some(i) = v.as_i64() {
             i
         } else {
@@ -139,4 +146,3 @@ async fn by_cwd(
         q.enabled_only.unwrap_or(false),
     )?)
 }
-

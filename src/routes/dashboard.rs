@@ -110,7 +110,11 @@ async fn dashboard(
         .filter(|p| p.status == "active")
         .count();
     if active_plan_count > 1 {
-        let level = if active_plan_count > 2 { "ERROR" } else { "WARN" };
+        let level = if active_plan_count > 2 {
+            "ERROR"
+        } else {
+            "WARN"
+        };
         let line = format!(
             "[{level}] active plan {} (>1) — PDD recommends ≤ 1 (≤ 2 in transition). Consider closing or completing extra plans.",
             active_plan_count
@@ -145,13 +149,14 @@ async fn dashboard(
     .into_iter()
     .next();
     if let Some(cycle) = &active_cycle {
-        lines.push(format!(
-            "## Active Cycle: {} ({})",
-            cycle.title, cycle.id
-        ));
+        lines.push(format!("## Active Cycle: {} ({})", cycle.title, cycle.id));
         if let Some(goal) = cycle.goal.as_deref().filter(|s| !s.is_empty()) {
             let snippet: String = goal.chars().take(200).collect();
-            let suffix = if goal.chars().count() > 200 { "…" } else { "" };
+            let suffix = if goal.chars().count() > 200 {
+                "…"
+            } else {
+                ""
+            };
             lines.push(format!("  Goal: {snippet}{suffix}"));
         }
         lines.push(String::new());
@@ -195,10 +200,7 @@ async fn dashboard(
         };
 
         for unit in &visible_units {
-            lines.push(format!(
-                "## {} ({})",
-                unit.title, unit.id
-            ));
+            lines.push(format!("## {} ({})", unit.title, unit.id));
 
             let all_tasks = tasks::list(
                 &conn,
@@ -235,7 +237,10 @@ async fn dashboard(
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .unwrap_or(&task.id);
-                lines.push(format!("  {} {} ({}){}", icon, task.title, reference, assignee));
+                lines.push(format!(
+                    "  {} {} ({}){}",
+                    icon, task.title, reference, assignee
+                ));
             }
             lines.push(String::new());
         }
@@ -401,9 +406,7 @@ async fn dashboard(
                 }
                 let decision = if defect == 0 && scenario_error == 0 {
                     "converged"
-                } else if defect > 0
-                    && prev_defect.map(|prev| defect > prev).unwrap_or(false)
-                {
+                } else if defect > 0 && prev_defect.map(|prev| defect > prev).unwrap_or(false) {
                     "regression"
                 } else {
                     "continue"

@@ -1,8 +1,8 @@
 pub mod activity_log;
 pub mod audit_log;
 pub mod comments;
-pub mod knowledge;
 pub mod cycles;
+pub mod knowledge;
 pub mod locks;
 pub mod plans;
 pub mod projects;

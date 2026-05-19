@@ -16,8 +16,16 @@ pub type SqlitePooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 pub const SCHEMA_VERSION_MAX: i64 = 26;
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
-    (1, "001_initial.sql", include_str!("../migrations/001_initial.sql")),
-    (2, "002_envelope.sql", include_str!("../migrations/002_envelope.sql")),
+    (
+        1,
+        "001_initial.sql",
+        include_str!("../migrations/001_initial.sql"),
+    ),
+    (
+        2,
+        "002_envelope.sql",
+        include_str!("../migrations/002_envelope.sql"),
+    ),
     (
         3,
         "003_task_usage.sql",
@@ -162,8 +170,8 @@ impl Db {
 
         let vec_enabled = register_sqlite_vec();
 
-        let conn = Connection::open(path)
-            .with_context(|| format!("open sqlite: {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("open sqlite: {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // FIX-DAEMON-110: SQLite BUSY retry — wait up to 5 s before giving up.
@@ -240,7 +248,11 @@ impl Db {
             return 0;
         }
         self.conn
-            .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| r.get(0))
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |r| r.get(0),
+            )
             .unwrap_or(0)
     }
 
@@ -258,7 +270,11 @@ impl Db {
 
         let current: i64 = if has_table {
             self.conn
-                .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| r.get(0))
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                    [],
+                    |r| r.get(0),
+                )
                 .unwrap_or(0)
         } else {
             0
@@ -294,14 +310,7 @@ impl Db {
                     tx.commit()
                         .with_context(|| format!("commit migration {file}"))?;
                     tracing::info!(version, file, "migration applied");
-                    log_migration_event(
-                        &self.state_dir,
-                        now_ms(),
-                        *version,
-                        file,
-                        "success",
-                        None,
-                    );
+                    log_migration_event(&self.state_dir, now_ms(), *version, file, "success", None);
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -311,7 +320,11 @@ impl Db {
                             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?1, ?2)",
                             rusqlite::params![version, now_ms()],
                         )?;
-                        tracing::warn!(version, file, "migration already applied (duplicate column)");
+                        tracing::warn!(
+                            version,
+                            file,
+                            "migration already applied (duplicate column)"
+                        );
                         log_migration_event(
                             &self.state_dir,
                             now_ms(),
@@ -586,11 +599,9 @@ mod tests {
         assert_eq!(task_id, "TASK-X");
         let knowledge_id: String = db
             .conn
-            .query_row(
-                "SELECT id FROM knowledge WHERE id = 'ART-X'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT id FROM knowledge WHERE id = 'ART-X'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(knowledge_id, "ART-X");
 
@@ -603,7 +614,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(active.is_none(), "legacy task should have NULL active_envelope_id");
+        assert!(
+            active.is_none(),
+            "legacy task should have NULL active_envelope_id"
+        );
     }
 
     #[test]
@@ -748,7 +762,10 @@ mod tests {
                     |_| Ok(true),
                 )
                 .unwrap_or(false);
-            assert!(has_scenario, "v2 schema should already have scenario_id (migration 014)");
+            assert!(
+                has_scenario,
+                "v2 schema should already have scenario_id (migration 014)"
+            );
             let has_evidence: bool = conn
                 .query_row(
                     "SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'evidence'",
@@ -756,7 +773,10 @@ mod tests {
                     |_| Ok(true),
                 )
                 .unwrap_or(false);
-            assert!(!has_evidence, "v2 schema must NOT yet have evidence (added in 022)");
+            assert!(
+                !has_evidence,
+                "v2 schema must NOT yet have evidence (added in 022)"
+            );
             let has_batch: bool = conn
                 .query_row(
                     "SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'batch_id'",
@@ -764,7 +784,10 @@ mod tests {
                     |_| Ok(true),
                 )
                 .unwrap_or(false);
-            assert!(!has_batch, "v2 schema must NOT yet have batch_id (added in 022)");
+            assert!(
+                !has_batch,
+                "v2 schema must NOT yet have batch_id (added in 022)"
+            );
 
             // Insert v2-shaped legacy data. Note: tasks columns at v21 include
             // scenario_id (NULL) but no evidence/batch_id yet.
@@ -808,7 +831,10 @@ mod tests {
             .conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(max, SCHEMA_VERSION_MAX, "schema head must reach SCHEMA_VERSION_MAX after Db::open");
+        assert_eq!(
+            max, SCHEMA_VERSION_MAX,
+            "schema head must reach SCHEMA_VERSION_MAX after Db::open"
+        );
 
         // (a) The three v3 columns now exist on tasks.
         for col in &["scenario_id", "evidence", "batch_id"] {
@@ -832,7 +858,10 @@ mod tests {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        assert!(has_alias_idx, "migration 023 alias index idx_tasks_scenario_id missing");
+        assert!(
+            has_alias_idx,
+            "migration 023 alias index idx_tasks_scenario_id missing"
+        );
 
         // (b) Legacy rows must surface with NULL in all three v3 columns.
         for tid in &["TASK-V2-A", "TASK-V2-B"] {
@@ -844,34 +873,37 @@ mod tests {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .unwrap();
-            assert!(sid.is_none(), "{tid}.scenario_id should be NULL on legacy row");
+            assert!(
+                sid.is_none(),
+                "{tid}.scenario_id should be NULL on legacy row"
+            );
             assert!(evi.is_none(), "{tid}.evidence should be NULL on legacy row");
             assert!(bid.is_none(), "{tid}.batch_id should be NULL on legacy row");
         }
 
         // (c) Original v2 fields preserved verbatim.
-        let (id_a, title_a, body_a, status_a, created_a): (String, String, String, String, i64) = db
-            .conn
-            .query_row(
-                "SELECT id, title, body, status, created_at FROM tasks WHERE id = 'TASK-V2-A'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .unwrap();
+        let (id_a, title_a, body_a, status_a, created_a): (String, String, String, String, i64) =
+            db.conn
+                .query_row(
+                    "SELECT id, title, body, status, created_at FROM tasks WHERE id = 'TASK-V2-A'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
         assert_eq!(id_a, "TASK-V2-A");
         assert_eq!(title_a, "legacy A");
         assert_eq!(body_a, "body A");
         assert_eq!(status_a, "todo");
         assert_eq!(created_a, created_at);
 
-        let (id_b, title_b, body_b, status_b, created_b): (String, String, String, String, i64) = db
-            .conn
-            .query_row(
-                "SELECT id, title, body, status, created_at FROM tasks WHERE id = 'TASK-V2-B'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .unwrap();
+        let (id_b, title_b, body_b, status_b, created_b): (String, String, String, String, i64) =
+            db.conn
+                .query_row(
+                    "SELECT id, title, body, status, created_at FROM tasks WHERE id = 'TASK-V2-B'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
         assert_eq!(id_b, "TASK-V2-B");
         assert_eq!(title_b, "legacy B");
         assert_eq!(body_b, "body B");
@@ -914,6 +946,9 @@ mod tests {
                     [],
                 )
             });
-        assert!(err.is_err(), "atomic_size_hint='gigantic' should fail CHECK");
+        assert!(
+            err.is_err(),
+            "atomic_size_hint='gigantic' should fail CHECK"
+        );
     }
 }

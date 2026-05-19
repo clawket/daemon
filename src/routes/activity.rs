@@ -35,7 +35,9 @@ async fn stats(State(app): State<AppState>) -> ApiResult<Json<ActivityStats>> {
         .query_row("SELECT COUNT(*) FROM activity_log", [], |r| r.get(0))
         .unwrap_or(0);
     let archive_batches: i64 = conn
-        .query_row("SELECT COUNT(*) FROM activity_log_archive", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM activity_log_archive", [], |r| {
+            r.get(0)
+        })
         .unwrap_or(0);
     let archive_oldest_period_start: Option<i64> = conn
         .query_row(
