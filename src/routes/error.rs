@@ -276,6 +276,12 @@ impl From<anyhow::Error> for ApiError {
         if msg.starts_with("PLAN_HAS_ACTIVE_CYCLES:") {
             return ApiError::conflict_coded("PLAN_HAS_ACTIVE_CYCLES", msg);
         }
+        // LM-11031: task/unit create rejected because parent plan is completed.
+        // 409 (not 400) — the request itself is well-formed; the conflict is
+        // with the structural invariant that completed plans are frozen.
+        if msg.starts_with("PLAN_COMPLETED:") {
+            return ApiError::conflict_coded("PLAN_COMPLETED", msg);
+        }
         // API-CYCLE-005: cycles must be planned in order
         if msg.starts_with("INVALID_REQUEST:") {
             return ApiError::bad_request_coded("INVALID_REQUEST", msg);
