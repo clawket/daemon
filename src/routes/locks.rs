@@ -304,6 +304,11 @@ mod tests {
                 "unit_id": s.unit_id,
                 "cycle_id": s.cycle_id,
                 "title": "T",
+                "envelope": {
+                    "intent": "test",
+                    "prompt_template": "test prompt",
+                    "success_criteria": ["ok"],
+                },
             })),
         )
         .await;

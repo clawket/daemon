@@ -165,7 +165,16 @@ async fn bootstrap_task(d: &DaemonHandle) -> String {
 
     let task: serde_json::Value = c
         .post(format!("{}/tasks", d.base_url))
-        .json(&serde_json::json!({"unit_id": uid, "cycle_id": cid, "title": "t"}))
+        .json(&serde_json::json!({
+            "unit_id": uid,
+            "cycle_id": cid,
+            "title": "t",
+            "envelope": {
+                "intent": "evidence test",
+                "prompt_template": "evidence test prompt",
+                "success_criteria": ["evidence ok"],
+            },
+        }))
         .send()
         .await
         .unwrap()

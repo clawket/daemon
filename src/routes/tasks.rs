@@ -271,6 +271,56 @@ async fn create(
         ));
     }
 
+    // Enforce required envelope fields (intent / prompt_template /
+    // success_criteria) at task creation. The check resolves the
+    // inheritance chain (parent task's active envelope chain + this
+    // request's envelope) and runs the same structural validator used
+    // by POST /tasks/:id/envelope/validate, keeping create-time and
+    // edit-time contracts aligned with the web EnvelopeForm strict
+    // validator at web/src/components/EnvelopeForm.tsx:209. Without
+    // this gate, a freshly created task always opens with three
+    // required-field violations in the UI.
+    {
+        let mut sim_chain: Vec<task_envelopes::ChainEntry> =
+            if let Some(parent) = parent_task_id.as_deref() {
+                task_envelopes::resolve_chain(&conn, parent, 1024)?
+            } else {
+                Vec::new()
+            };
+        if let Some(env) = body.envelope.as_ref() {
+            let json = serde_json::to_string(env)
+                .map_err(|e| ApiError::bad_request(format!("envelope serialize: {e}")))?;
+            sim_chain.push(task_envelopes::ChainEntry {
+                task_id: "<draft>".to_string(),
+                depth: -1,
+                json: Some(json),
+            });
+        }
+        let resolved = task_envelopes::resolve_chain_active(&sim_chain);
+        let result = env_validate::validate_envelope(&resolved, false);
+        let missing: Vec<String> = result
+            .violations
+            .iter()
+            .filter(|v| {
+                matches!(v.severity, env_validate::Severity::Error)
+                    && matches!(
+                        v.field.as_str(),
+                        "intent" | "prompt_template" | "success_criteria"
+                    )
+            })
+            .map(|v| v.field.clone())
+            .collect();
+        if !missing.is_empty() {
+            return Err(ApiError::bad_request_coded(
+                "ENVELOPE_REQUIRED_FIELDS_MISSING",
+                format!(
+                    "ENVELOPE_REQUIRED_FIELDS_MISSING: required envelope fields missing on resolved chain: {}. Supply them in the `envelope` field (intent, prompt_template, success_criteria) or inherit from a parent task.",
+                    missing.join(", ")
+                ),
+            ));
+        }
+    }
+
     // LM-265 / L1.3.c — propagate atomic_size_hint and
     // decomposition_policy. Precedence: explicit body field > envelope
     // field > SQLite DEFAULT. Tracking the envelope as a fallback keeps
@@ -1966,16 +2016,22 @@ mod envelope {
     }
 
     #[tokio::test]
-    async fn post_without_envelope_works_and_returns_no_envelope_field() {
+    async fn post_without_envelope_is_rejected_with_envelope_required_fields_missing() {
+        // v3.0 invariant: task creation must supply the required envelope
+        // fields (intent / prompt_template / success_criteria) either
+        // directly or via an inherited parent envelope.
         let s = setup();
         let (status, body) = post_task(
             &s.app,
             serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T1"}),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body["id"].as_str().unwrap().starts_with("TASK-"));
-        assert!(body.get("active_envelope").is_none());
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["code"].as_str(),
+            Some("ENVELOPE_REQUIRED_FIELDS_MISSING"),
+            "body: {body}"
+        );
     }
 
     #[tokio::test]
@@ -1984,6 +2040,8 @@ mod envelope {
         let env = serde_json::json!({
             "version": 1,
             "intent": "add envelope round-trip test",
+            "prompt_template": "round trip prompt",
+            "success_criteria": ["ok"],
             "decomposition_policy": "atomic"
         });
         let (status, body) = post_task(
@@ -2007,7 +2065,12 @@ mod envelope {
     #[tokio::test]
     async fn patch_with_envelope_increments_version_and_supersedes_prior() {
         let s = setup();
-        let env_v1 = serde_json::json!({"version": 1, "intent": "first"});
+        let env_v1 = serde_json::json!({
+            "version": 1,
+            "intent": "first",
+            "prompt_template": "p",
+            "success_criteria": ["ok"],
+        });
         let (_, created) = post_task(
             &s.app,
             serde_json::json!({
@@ -2043,7 +2106,12 @@ mod envelope {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "T1",
-                "envelope": {"version": 1, "intent": "first"},
+                "envelope": {
+                    "version": 1,
+                    "intent": "first",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                },
             }),
         )
         .await;
@@ -2065,13 +2133,11 @@ mod envelope {
     }
 
     #[tokio::test]
-    async fn post_with_invalid_envelope_json_returns_400() {
+    async fn post_with_empty_envelope_is_rejected() {
+        // Empty `{}` envelope yields the same ENVELOPE_REQUIRED_FIELDS_MISSING
+        // gate as an omitted field — the resolved chain has no required
+        // fields populated.
         let s = setup();
-        // axum will reject non-JSON body; we test daemon's own validation by
-        // sending a string (which is JSON-valid but not an object/array — the
-        // repo accepts any valid JSON). For grammar errors the request itself
-        // wouldn't parse. So instead exercise the empty-object path which is
-        // valid JSON and should be accepted.
         let (status, body) = post_task(
             &s.app,
             serde_json::json!({
@@ -2081,8 +2147,61 @@ mod envelope {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["active_envelope"]["version"].as_i64(), Some(1));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["code"].as_str(),
+            Some("ENVELOPE_REQUIRED_FIELDS_MISSING"),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_with_partial_envelope_names_missing_fields_in_error() {
+        // Supplying only `intent` must surface the other two missing
+        // required fields (prompt_template, success_criteria) in the
+        // error message so the user can fix them in one round-trip.
+        let s = setup();
+        let (status, body) = post_task(
+            &s.app,
+            serde_json::json!({
+                "unit_id": s.unit_id, "cycle_id": s.cycle_id,
+                "title": "T1",
+                "envelope": {"intent": "only intent"},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["code"].as_str(),
+            Some("ENVELOPE_REQUIRED_FIELDS_MISSING"),
+            "body: {body}"
+        );
+        let err = body["error"].as_str().unwrap_or("");
+        // The error message has the shape:
+        //   "ENVELOPE_REQUIRED_FIELDS_MISSING: required envelope fields
+        //    missing on resolved chain: <field>, <field>. Supply them
+        //    in the `envelope` field (intent, prompt_template,
+        //    success_criteria) or inherit from a parent task."
+        // The hint after `Supply them` always lists all three field
+        // names, so the "intent must not be flagged" check has to be
+        // scoped to the actual missing-list segment.
+        let missing_segment = err
+            .split("missing on resolved chain:")
+            .nth(1)
+            .and_then(|s| s.split('.').next())
+            .unwrap_or("");
+        assert!(
+            missing_segment.contains("prompt_template"),
+            "missing list must name prompt_template: {err}"
+        );
+        assert!(
+            missing_segment.contains("success_criteria"),
+            "missing list must name success_criteria: {err}"
+        );
+        assert!(
+            !missing_segment.contains("intent"),
+            "intent was supplied — must not appear in missing list: {err}"
+        );
     }
 }
 
@@ -2258,7 +2377,13 @@ mod get_envelope {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "T1",
-                "envelope": {"version": 1, "intent": "x", "decomposition_policy": "atomic"},
+                "envelope": {
+                    "version": 1,
+                    "intent": "x",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                    "decomposition_policy": "atomic"
+                },
             }),
         )
         .await;
@@ -2298,10 +2423,22 @@ mod get_envelope {
         let task = post_json(
             &s.app,
             "/tasks",
-            serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T1"}),
+            serde_json::json!({
+                "unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T1",
+                "envelope": {
+                    "intent": "x",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                },
+            }),
         )
         .await;
         let id = task["id"].as_str().unwrap();
+        // First delete clears the envelope.
+        let (status, body) = delete_envelope_req(&s.app, id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["cleared"].as_bool(), Some(true));
+        // Second delete on the now-empty envelope is a no-op.
         let (status, body) = delete_envelope_req(&s.app, id).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["cleared"].as_bool(), Some(false));
@@ -2316,14 +2453,25 @@ mod get_envelope {
 
     #[tokio::test]
     async fn returns_404_when_no_envelope() {
+        // Tasks must be created with an envelope; this test verifies that
+        // GET /envelope returns 404 once the envelope is explicitly DELETEd.
         let s = setup();
         let task = post_json(
             &s.app,
             "/tasks",
-            serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T1"}),
+            serde_json::json!({
+                "unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T1",
+                "envelope": {
+                    "intent": "x",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                },
+            }),
         )
         .await;
         let id = task["id"].as_str().unwrap();
+        let (clear_status, _) = delete_envelope_req(&s.app, id).await;
+        assert_eq!(clear_status, StatusCode::OK);
         let (status, body) = get_envelope_req(&s.app, id, "").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body["error"].as_str().unwrap_or("").contains("no envelope"));
@@ -2335,6 +2483,8 @@ mod get_envelope {
         let env = serde_json::json!({
             "version": 1,
             "intent": "raw vs resolved",
+            "prompt_template": "p",
+            "success_criteria": ["ok"],
             "decomposition_policy": "atomic"
         });
         let task = post_json(
@@ -2373,6 +2523,8 @@ mod get_envelope {
                 "envelope": {
                     "version": 1,
                     "intent": "parent intent",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
                     "tags": ["p-tag"],
                     "decomposition_policy": "tree(max_depth=3)"
                 },
@@ -2422,7 +2574,12 @@ mod get_envelope {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "T1",
-                "envelope": {"version": 1, "intent": "v1"},
+                "envelope": {
+                    "version": 1,
+                    "intent": "v1",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                },
             }),
         )
         .await;
@@ -2469,7 +2626,12 @@ mod get_envelope {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "T1",
-                "envelope": {"version": 1, "intent": "only v1"},
+                "envelope": {
+                    "version": 1,
+                    "intent": "only v1",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                },
             }),
         )
         .await;
@@ -2492,6 +2654,9 @@ mod get_envelope {
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "P",
                 "envelope": {
+                    "intent": "parent",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
                     "retry_policy": {
                         "max_attempts": 3,
                         "backoff": "exponential",
@@ -2693,21 +2858,6 @@ mod envelope_history {
     }
 
     #[tokio::test]
-    async fn empty_history_for_envelope_less_task() {
-        let s = setup();
-        let task = post_json(
-            &s.app,
-            "/tasks",
-            serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T1"}),
-        )
-        .await;
-        let id = task["id"].as_str().unwrap();
-        let (status, body) = history(&s.app, id, "").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.as_array().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
     async fn replanning_three_times_returns_three_versions_desc() {
         let s = setup();
         let task = post_json(
@@ -2716,7 +2866,12 @@ mod envelope_history {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "T1",
-                "envelope": {"version": 1, "intent": "v1"},
+                "envelope": {
+                    "version": 1,
+                    "intent": "v1",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                },
             }),
         )
         .await;
@@ -2760,7 +2915,12 @@ mod envelope_history {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "T1",
-                "envelope": {"version": 1, "intent": "v1"},
+                "envelope": {
+                    "version": 1,
+                    "intent": "v1",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                },
             }),
         )
         .await;
@@ -2950,12 +3110,21 @@ mod subtasks {
     }
 
     #[tokio::test]
-    async fn parent_without_envelope_creates_child_with_overrides_only() {
+    async fn parent_with_envelope_creates_child_with_overrides_only() {
+        // v3.0: parent must have an envelope. Child supplies overrides only;
+        // resolved envelope is parent ∪ overrides (overrides win on collisions).
         let s = setup();
         let (_, parent) = post_json(
             &s.app,
             "/tasks",
-            serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "P"}),
+            serde_json::json!({
+                "unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "P",
+                "envelope": {
+                    "intent": "parent",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                },
+            }),
         )
         .await;
         let parent_id = parent["id"].as_str().unwrap();
@@ -2987,7 +3156,13 @@ mod subtasks {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "P",
-                "envelope": {"version": 1, "intent": "parent intent", "decomposition_policy": "atomic"},
+                "envelope": {
+                    "version": 1,
+                    "intent": "parent intent",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                    "decomposition_policy": "atomic",
+                },
             }),
         )
         .await;
@@ -3020,6 +3195,8 @@ mod subtasks {
                 "envelope": {
                     "version": 1,
                     "intent": "parent intent",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
                     "retry_policy": {"max_attempts": 3, "backoff": "exponential"}
                 },
             }),
@@ -3056,7 +3233,13 @@ mod subtasks {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "P",
-                "envelope": {"version": 1, "intent": "parent", "tags": ["root"]},
+                "envelope": {
+                    "version": 1,
+                    "intent": "parent",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                    "tags": ["root"],
+                },
             }),
         )
         .await;
@@ -3094,7 +3277,13 @@ mod subtasks {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "P",
-                "envelope": {"version": 1, "scope_boundary": ["src/a/", "src/b/", "src/c/"]},
+                "envelope": {
+                    "version": 1,
+                    "intent": "parent",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                    "scope_boundary": ["src/a/", "src/b/", "src/c/"],
+                },
             }),
         )
         .await;
@@ -3124,7 +3313,13 @@ mod subtasks {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "P",
-                "envelope": {"version": 1, "scope_boundary": ["src/a/"]},
+                "envelope": {
+                    "version": 1,
+                    "intent": "parent",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                    "scope_boundary": ["src/a/"],
+                },
             }),
         )
         .await;
@@ -3152,7 +3347,14 @@ mod subtasks {
         let (_, parent) = post_json(
             &s.app,
             "/tasks",
-            serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "P"}),
+            serde_json::json!({
+                "unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "P",
+                "envelope": {
+                    "intent": "parent",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                },
+            }),
         )
         .await;
         let parent_id = parent["id"].as_str().unwrap();
@@ -3334,7 +3536,12 @@ mod tree {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "R",
-                "envelope": {"version": 1, "intent": "root"}
+                "envelope": {
+                    "version": 1,
+                    "intent": "root",
+                    "prompt_template": "root prompt",
+                    "success_criteria": ["ok"],
+                }
             }),
         )
         .await;
@@ -3416,7 +3623,14 @@ mod tree {
         let root = post_json(
             &s.app,
             "/tasks",
-            serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "R"}),
+            serde_json::json!({
+                "unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "R",
+                "envelope": {
+                    "intent": "root",
+                    "prompt_template": "root prompt",
+                    "success_criteria": ["ok"],
+                }
+            }),
         )
         .await;
         let root_id = root["id"].as_str().unwrap().to_string();
@@ -3543,7 +3757,14 @@ mod tree {
         let root = post_json(
             &s.app,
             "/tasks",
-            serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "R"}),
+            serde_json::json!({
+                "unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "R",
+                "envelope": {
+                    "intent": "root",
+                    "prompt_template": "root prompt",
+                    "success_criteria": ["ok"],
+                }
+            }),
         )
         .await;
         let root_id = root["id"].as_str().unwrap().to_string();
@@ -3774,7 +3995,13 @@ mod planned_sha_autofill {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "T",
-                "envelope": {"version": 1, "target_repo": "daemon"}
+                "envelope": {
+                    "version": 1,
+                    "intent": "x",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                    "target_repo": "daemon",
+                }
             }),
         )
         .await;
@@ -3793,7 +4020,13 @@ mod planned_sha_autofill {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "T",
-                "envelope": {"version": 1, "target_repo": "daemon@HEAD"}
+                "envelope": {
+                    "version": 1,
+                    "intent": "x",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                    "target_repo": "daemon@HEAD",
+                }
             }),
         )
         .await;
@@ -3811,7 +4044,13 @@ mod planned_sha_autofill {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "T",
-                "envelope": {"version": 1, "target_repo": "nonexistent-repo-xyz"}
+                "envelope": {
+                    "version": 1,
+                    "intent": "x",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                    "target_repo": "nonexistent-repo-xyz",
+                }
             }),
         )
         .await;
@@ -3833,6 +4072,9 @@ mod planned_sha_autofill {
                 "title": "T",
                 "envelope": {
                     "version": 1,
+                    "intent": "x",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
                     "target_repo": "daemon",
                     "planned_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
                 }
@@ -3856,7 +4098,12 @@ mod planned_sha_autofill {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "T",
-                "envelope": {"version": 1, "intent": "no target"}
+                "envelope": {
+                    "version": 1,
+                    "intent": "no target",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                }
             }),
         )
         .await;
@@ -4063,6 +4310,9 @@ mod drift {
                 "title": "T",
                 "envelope": {
                     "version": 1,
+                    "intent": "drift",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
                     "target_repo": "daemon",
                     "scope_boundary": ["src/"]
                 }
@@ -4089,6 +4339,9 @@ mod drift {
                 "title": "T",
                 "envelope": {
                     "version": 1,
+                    "intent": "drift",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
                     "target_repo": "daemon",
                     "scope_boundary": ["src/in_scope/"]
                 }
@@ -4131,6 +4384,9 @@ mod drift {
                 "title": "T",
                 "envelope": {
                     "version": 1,
+                    "intent": "drift",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
                     "target_repo": "daemon",
                     "scope_boundary": ["src/in_scope/"]
                 }
@@ -4159,6 +4415,9 @@ mod drift {
                 "title": "T",
                 "envelope": {
                     "version": 1,
+                    "intent": "drift",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
                     "target_repo": "doesnotexist",
                     "scope_boundary": ["src/"]
                 }
@@ -4173,13 +4432,35 @@ mod drift {
 
     #[tokio::test]
     async fn drift_404_when_no_envelope() {
+        // v3.0 requires an envelope at create; this test verifies that
+        // drift returns 404 once the envelope has been explicitly DELETEd.
         let s = setup_with_repo("daemon");
         let task = post_task(
             &s.app,
-            serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T"}),
+            serde_json::json!({
+                "unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T",
+                "envelope": {
+                    "intent": "x",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                },
+            }),
         )
         .await;
         let id = task["id"].as_str().unwrap();
+        let clear = s
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/tasks/{id}/envelope"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(clear.status().is_success());
         let (status, body) = drift_get(&s.app, id).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body["error"].as_str().unwrap_or("").contains("no envelope"));
@@ -4199,6 +4480,9 @@ mod drift {
                 "title": "T",
                 "envelope": {
                     "version": 1,
+                    "intent": "drift",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
                     "target_repo": "unknown-repo-xyz",
                     "planned_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
                 }
@@ -4219,7 +4503,13 @@ mod drift {
             serde_json::json!({
                 "unit_id": s.unit_id, "cycle_id": s.cycle_id,
                 "title": "T",
-                "envelope": {"version": 1, "target_repo": "daemon"}
+                "envelope": {
+                    "version": 1,
+                    "intent": "drift",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                    "target_repo": "daemon",
+                }
             }),
         )
         .await;
@@ -4380,6 +4670,8 @@ mod conditions_hook {
         let env = serde_json::json!({
             "version": 1,
             "intent": "p",
+            "prompt_template": "p",
+            "success_criteria": ["ok"],
             "postconditions": [
                 {"type": "task_status", "task_id": "TASK-NOPE", "equals": "done"}
             ]
@@ -4415,6 +4707,8 @@ mod conditions_hook {
         let env = serde_json::json!({
             "version": 1,
             "intent": "p",
+            "prompt_template": "p",
+            "success_criteria": ["ok"],
             "postconditions": [{"type": "daemon_healthy"}]
         });
         let created = post_task(
@@ -4438,28 +4732,14 @@ mod conditions_hook {
     }
 
     #[tokio::test]
-    async fn done_transition_works_when_no_envelope_present() {
-        let s = setup();
-        let created = post_task(
-            &s.app,
-            serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T"}),
-        )
-        .await;
-        let id = created["id"].as_str().unwrap();
-        let (status, body) = patch_task(
-            &s.app,
-            id,
-            serde_json::json!({"status": "done", "evidence": "test:done"}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["status"], "done");
-    }
-
-    #[tokio::test]
     async fn done_transition_works_when_envelope_has_no_postconditions() {
         let s = setup();
-        let env = serde_json::json!({"version": 1, "intent": "p"});
+        let env = serde_json::json!({
+            "version": 1,
+            "intent": "p",
+            "prompt_template": "p",
+            "success_criteria": ["ok"]
+        });
         let created = post_task(
             &s.app,
             serde_json::json!({
@@ -4488,6 +4768,8 @@ mod conditions_hook {
         let env = serde_json::json!({
             "version": 1,
             "intent": "p",
+            "prompt_template": "p",
+            "success_criteria": ["ok"],
             "postconditions": [
                 {"type": "task_status", "task_id": "TASK-NOPE", "equals": "done"}
             ]
@@ -4518,6 +4800,8 @@ mod conditions_hook {
         let env = serde_json::json!({
             "version": 1,
             "intent": "p",
+            "prompt_template": "p",
+            "success_criteria": ["ok"],
             "postconditions": [pred]
         });
         let created = post_task(
@@ -4701,6 +4985,8 @@ mod entropy_hook {
         let envelope = serde_json::json!({
             "version": 1,
             "intent": "abcdefghijklmnopqrstuvwxyz0123456789ABCDE",
+            "prompt_template": "p",
+            "success_criteria": ["ok"],
         });
         let (status, body) = post_raw(
             &s.app,
@@ -4726,6 +5012,8 @@ mod entropy_hook {
         let envelope = serde_json::json!({
             "version": 1,
             "intent": "Wire the Anthropic client",
+            "prompt_template": "Wire the client per ADR-XX",
+            "success_criteria": ["client wired"],
             "secrets_ref": {"ANTHROPIC_API_KEY": "env:ANTHROPIC_API_KEY"}
         });
         let (status, _) = post_raw(
@@ -4747,7 +5035,15 @@ mod entropy_hook {
         let (status_create, created) = post_raw(
             &s.app,
             "/tasks",
-            serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T"}),
+            serde_json::json!({
+                "unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T",
+                "envelope": {
+                    "version": 1,
+                    "intent": "p",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                },
+            }),
         )
         .await;
         assert_eq!(status_create, StatusCode::OK);
@@ -4755,6 +5051,8 @@ mod entropy_hook {
         let bad_env = serde_json::json!({
             "version": 1,
             "intent": "p",
+            "prompt_template": "p",
+            "success_criteria": ["ok"],
             "context_refs": ["abcdefghijklmnopqrstuvwxyz0123456789ABCDE"]
         });
         let (status, body) = patch_raw(
@@ -4934,7 +5232,16 @@ mod lease {
         let (status, body) = post(
             app,
             "/tasks",
-            serde_json::json!({"unit_id": unit_id, "cycle_id": cycle_id, "title": "T"}),
+            serde_json::json!({
+                "unit_id": unit_id,
+                "cycle_id": cycle_id,
+                "title": "T",
+                "envelope": {
+                    "intent": "test",
+                    "prompt_template": "test prompt",
+                    "success_criteria": ["ok"],
+                },
+            }),
         )
         .await;
         assert!(status.is_success(), "create task failed: {status:?}");
@@ -4989,17 +5296,24 @@ mod lease {
     async fn acquire_same_session_refreshes_ttl() {
         let s = setup();
         let id = make_task(&s.app, &s.unit_id, &s.cycle_id).await;
+        // TTL must comfortably exceed the worst-case wall-clock gap
+        // between the two posts. Under heavy parallel test load each
+        // POST roundtrip can take tens of seconds, so a 30s ttl lets
+        // the first lease expire and the second call falls back to a
+        // fresh acquire — `acquired_at` differs and the same-session
+        // refresh contract is no longer the thing being asserted. Use
+        // the route's MAX cap (1h) for headroom.
         let (_, first) = post(
             &s.app,
             &format!("/tasks/{id}/lease"),
-            serde_json::json!({"session_id": "session-A", "ttl_ms": 30000}),
+            serde_json::json!({"session_id": "session-A", "ttl_ms": 3_600_000}),
         )
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let (st, second) = post(
             &s.app,
             &format!("/tasks/{id}/lease"),
-            serde_json::json!({"session_id": "session-A", "ttl_ms": 120000}),
+            serde_json::json!({"session_id": "session-A", "ttl_ms": 3_600_000}),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -5198,7 +5512,14 @@ mod lease {
         let (st, body) = post(
             &s.app,
             "/tasks",
-            serde_json::json!({"unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T"}),
+            serde_json::json!({
+                "unit_id": s.unit_id, "cycle_id": s.cycle_id, "title": "T",
+                "envelope": {
+                    "intent": "test",
+                    "prompt_template": "test prompt",
+                    "success_criteria": ["ok"],
+                },
+            }),
         )
         .await;
         assert!(st.is_success());

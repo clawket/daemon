@@ -264,7 +264,16 @@ async fn full_project_plan_task_flow() {
     // Create task (API-TASK-001: cycle_id is required)
     let task: serde_json::Value = client
         .post(format!("{}/tasks", d.base_url))
-        .json(&serde_json::json!({"unit_id": unit_id, "cycle_id": cycle_id, "title": "Hello task"}))
+        .json(&serde_json::json!({
+            "unit_id": unit_id,
+            "cycle_id": cycle_id,
+            "title": "Hello task",
+            "envelope": {
+                "intent": "hello",
+                "prompt_template": "hello prompt",
+                "success_criteria": ["hello ok"],
+            },
+        }))
         .send()
         .await
         .unwrap()
@@ -461,7 +470,16 @@ async fn envelope_validate_route_evaluates_draft_envelope() {
 
     let task: serde_json::Value = client
         .post(format!("{}/tasks", d.base_url))
-        .json(&serde_json::json!({"unit_id": unit_id, "cycle_id": cycle_id, "title": "t"}))
+        .json(&serde_json::json!({
+            "unit_id": unit_id,
+            "cycle_id": cycle_id,
+            "title": "t",
+            "envelope": {
+                "intent": "validate route test",
+                "prompt_template": "validate route test prompt",
+                "success_criteria": ["ok"],
+            },
+        }))
         .send()
         .await
         .unwrap()
@@ -558,7 +576,14 @@ async fn envelope_validate_route_evaluates_draft_envelope() {
         .collect();
     assert!(bad_fields.contains(&"atomic_size_hint"));
 
-    // No envelope body + no active envelope → 404.
+    // No envelope body + no active envelope → 404. Since v3.0 task
+    // creation requires an envelope, drop the active one first to
+    // reach the no-envelope state the route must handle.
+    let _ = client
+        .delete(format!("{}/tasks/{}/envelope", d.base_url, task_id))
+        .send()
+        .await
+        .unwrap();
     let missing = client
         .post(format!(
             "{}/tasks/{}/envelope/validate",

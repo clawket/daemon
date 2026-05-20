@@ -379,6 +379,11 @@ mod tests {
             "unit_id": s.unit_id,
             "cycle_id": s.cycle_id,
             "title": "T",
+            "envelope": {
+                "intent": "test",
+                "prompt_template": "test prompt",
+                "success_criteria": ["ok"],
+            },
         });
         if let Some(env) = envelope {
             body["envelope"] = env;
@@ -429,6 +434,8 @@ mod tests {
             Some(serde_json::json!({
                 "version": 1,
                 "intent": "p",
+                "prompt_template": "preflight test",
+                "success_criteria": ["ok"],
                 "token_budget": {"input_tokens": 100, "output_tokens": 100, "cost_usd": 0.5},
             })),
         )
@@ -462,6 +469,8 @@ mod tests {
             Some(serde_json::json!({
                 "version": 1,
                 "intent": "p",
+                "prompt_template": "preflight test",
+                "success_criteria": ["ok"],
                 "token_budget": {"input_tokens": 1000, "cost_usd": 10},
             })),
         )

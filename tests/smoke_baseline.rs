@@ -176,7 +176,16 @@ async fn smoke_crud_plan_unit_task_approve() {
 
     let task: serde_json::Value = c
         .post(format!("{}/tasks", d.base))
-        .json(&serde_json::json!({"unit_id": uid, "cycle_id": cid, "title": "t"}))
+        .json(&serde_json::json!({
+            "unit_id": uid,
+            "cycle_id": cid,
+            "title": "t",
+            "envelope": {
+                "intent": "smoke",
+                "prompt_template": "smoke prompt",
+                "success_criteria": ["smoke ok"],
+            },
+        }))
         .send()
         .await
         .unwrap()
@@ -273,7 +282,16 @@ async fn smoke_cycle_lifecycle_and_task_mapping() {
     // API-TASK-001: cycle_id is required at task creation; no auto-infer.
     let task: serde_json::Value = c
         .post(format!("{}/tasks", d.base))
-        .json(&serde_json::json!({"unit_id": uid, "cycle_id": c1_id, "title": "t"}))
+        .json(&serde_json::json!({
+            "unit_id": uid,
+            "cycle_id": c1_id,
+            "title": "t",
+            "envelope": {
+                "intent": "smoke",
+                "prompt_template": "smoke prompt",
+                "success_criteria": ["smoke ok"],
+            },
+        }))
         .send()
         .await
         .unwrap()
