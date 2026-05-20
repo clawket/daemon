@@ -3,8 +3,9 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use std::path::Path;
 
+use crate::envelope::sign as env_sign;
 use crate::models::{Plan, Project, Task, Unit};
-use crate::repo::{plans, projects, task_envelopes, tasks, units};
+use crate::repo::{plans, projects, tasks, units};
 use rusqlite::Connection;
 
 #[derive(Debug, Clone)]
@@ -1115,8 +1116,13 @@ pub fn import_plan_file(
 /// Strict-only side effects:
 ///   * `pt.depends_on` ticket strings are resolved against tasks created
 ///     in the same call and inserted into `task_depends_on`.
-///   * `pt.envelope` is signed via `task_envelopes::sign_for_task`, which
-///     also stamps `tasks.active_envelope_id`.
+///   * `pt.envelope` is signed via `envelope::sign::sign_envelope_from_json`,
+///     which validates the required tier (`Severity::Error`) before
+///     delegating to `task_envelopes::sign_for_task`; that call also
+///     stamps `tasks.active_envelope_id`. The `_from_json` variant
+///     preserves the source file's bullet order — re-serializing from
+///     `Value` would alphabetize because the default `serde_json::Map`
+///     is `BTreeMap` without the `preserve_order` feature.
 ///
 /// Loose-mode `ParsedTask` carries no envelope and no depends_on, so the
 /// shared path is a no-op for those side effects.
@@ -1334,10 +1340,28 @@ pub fn import_parsed_plan(
             };
             let task_id = created_units[pu_idx].tasks[pt_idx].id.clone();
             let json = parsed_envelope_to_json(env);
+            // Build a Value mirror for the validator while persisting
+                // the original key-ordered JSON. parsed_envelope_to_json
+                // emits well-formed JSON by construction, so the parse
+                // round-trip is infallible; the `?` covers only a
+                // genuine ParsedEnvelope::Value corruption bug.
+            let value: serde_json::Value = serde_json::from_str(&json)
+                .map_err(|e| anyhow::anyhow!("parsed envelope json round-trip failed: {e}"))?;
             // signed_by = opts.source so strict-import-originated
             // envelopes are distinguishable from interactive signs in
             // the audit trail.
-            task_envelopes::sign_for_task(conn, &task_id, &json, opts.source)?;
+            env_sign::sign_envelope_from_json(conn, &task_id, &value, &json, opts.source)
+                .map_err(|e| match e {
+                    env_sign::EnvelopeSignError::Validation(violations) => {
+                        let summary = violations
+                            .iter()
+                            .map(|v| format!("{}: {}", v.field, v.message))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        anyhow::anyhow!("ENVELOPE_INVALID for {}: {}", task_id, summary)
+                    }
+                    env_sign::EnvelopeSignError::Storage(err) => err,
+                })?;
         }
     }
 

@@ -67,14 +67,20 @@ pub fn validate_envelope(envelope: &Value, strict: bool) -> ValidateResult {
     if let Some(policy) = envelope.get("decomposition_policy") {
         match policy {
             Value::String(s) => {
-                if !matches!(s.as_str(), "auto" | "manual" | "atomic") {
+                // ADR-0001 defines `decomposition_policy` as a DSL string
+                // ({atomic, tree(max_depth=N), linear(max_steps=N),
+                // custom(...)}). The daemon stores it as a free-form
+                // String (`models::Task::decomposition_policy`) and
+                // `import_plan` only checks "must be a JSON string" —
+                // there is no runtime enum enforcement. The validator
+                // therefore accepts any non-empty string; an empty
+                // string is a meaningful violation (the field exists
+                // but carries no policy).
+                if s.trim().is_empty() {
                     v.push(Violation {
                         field: "decomposition_policy".into(),
                         severity: Severity::Error,
-                        message: format!(
-                            "decomposition_policy must be one of auto/manual/atomic, got `{}`",
-                            s
-                        ),
+                        message: "decomposition_policy must be a non-empty string".into(),
                     });
                 }
             }
@@ -140,20 +146,106 @@ pub fn validate_envelope(envelope: &Value, strict: bool) -> ValidateResult {
         if let Some(arr) = envelope.get(cond_field) {
             if let Some(items) = arr.as_array() {
                 for (i, c) in items.iter().enumerate() {
-                    match c {
-                        Value::String(s) if !s.trim().is_empty() => {
-                            if !is_balanced_parens(s) {
+                    // ADR-0005 / envelope::conditions accepts predicates
+                    // as JSON objects discriminated by a `type` field
+                    // (task_status / file_exists / knowledge_exists /
+                    // daemon_healthy / custom_cmd). The validator MUST
+                    // mirror that shape — the previous "must be a
+                    // non-empty expression string" rule never matched
+                    // anything the runtime evaluated, leaving the web
+                    // form rejecting envelopes the daemon happily
+                    // executed (lying UI in the opposite direction
+                    // from LM-11028). See `envelope::conditions::eval_one`.
+                    let field = format!("{}[{}]", cond_field, i);
+                    let Some(obj) = c.as_object() else {
+                        v.push(Violation {
+                            field,
+                            severity: Severity::Error,
+                            message:
+                                "condition must be a JSON object with a `type` discriminator"
+                                    .into(),
+                        });
+                        continue;
+                    };
+                    let Some(kind) = obj.get("type").and_then(Value::as_str) else {
+                        v.push(Violation {
+                            field,
+                            severity: Severity::Error,
+                            message: "condition missing required `type` discriminator".into(),
+                        });
+                        continue;
+                    };
+                    match kind {
+                        "task_status" => {
+                            if obj
+                                .get("task_id")
+                                .and_then(Value::as_str)
+                                .is_none_or(str::is_empty)
+                            {
                                 v.push(Violation {
-                                    field: format!("{}[{}]", cond_field, i),
+                                    field: format!("{field}.task_id"),
                                     severity: Severity::Error,
-                                    message: "unbalanced parentheses in expression".into(),
+                                    message: "task_status: `task_id` (string) required".into(),
+                                });
+                            }
+                            if obj
+                                .get("equals")
+                                .and_then(Value::as_str)
+                                .is_none_or(str::is_empty)
+                            {
+                                v.push(Violation {
+                                    field: format!("{field}.equals"),
+                                    severity: Severity::Error,
+                                    message: "task_status: `equals` (string) required".into(),
                                 });
                             }
                         }
-                        _ => v.push(Violation {
-                            field: format!("{}[{}]", cond_field, i),
+                        "file_exists" => {
+                            if obj
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .is_none_or(str::is_empty)
+                            {
+                                v.push(Violation {
+                                    field: format!("{field}.path"),
+                                    severity: Severity::Error,
+                                    message: "file_exists: `path` (string) required".into(),
+                                });
+                            }
+                        }
+                        "knowledge_exists" => {
+                            let has_filter = ["knowledge_type", "title_contains", "task_id"]
+                                .iter()
+                                .any(|k| obj.contains_key(*k));
+                            if !has_filter {
+                                v.push(Violation {
+                                    field,
+                                    severity: Severity::Error,
+                                    message: "knowledge_exists: at least one of `knowledge_type`, `title_contains`, `task_id` required".into(),
+                                });
+                            }
+                        }
+                        "daemon_healthy" => {}
+                        "custom_cmd" => {
+                            if obj
+                                .get("cmd")
+                                .and_then(Value::as_str)
+                                .is_none_or(str::is_empty)
+                            {
+                                v.push(Violation {
+                                    field: format!("{field}.cmd"),
+                                    severity: Severity::Error,
+                                    message: "custom_cmd: `cmd` (string) required".into(),
+                                });
+                            }
+                        }
+                        other => v.push(Violation {
+                            field: format!("{field}.type"),
                             severity: Severity::Error,
-                            message: "condition must be a non-empty expression string".into(),
+                            message: format!(
+                                "unknown predicate type `{}` (expected: task_status, file_exists, knowledge_exists, daemon_healthy, custom_cmd)",
+                                other
+                            ),
                         }),
                     }
                 }
@@ -161,7 +253,7 @@ pub fn validate_envelope(envelope: &Value, strict: bool) -> ValidateResult {
                 v.push(Violation {
                     field: cond_field.into(),
                     severity: Severity::Error,
-                    message: format!("{} must be an array of expression strings", cond_field),
+                    message: format!("{cond_field} must be an array of predicate objects"),
                 });
             }
         }
@@ -197,23 +289,6 @@ pub fn validate_envelope(envelope: &Value, strict: bool) -> ValidateResult {
         strict,
         violations: v,
     }
-}
-
-fn is_balanced_parens(s: &str) -> bool {
-    let mut depth: i32 = 0;
-    for ch in s.chars() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth < 0 {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    depth == 0
 }
 
 #[cfg(test)]
@@ -303,12 +378,16 @@ mod tests {
     }
 
     #[test]
-    fn unbalanced_precondition_emits_error() {
+    fn precondition_string_form_rejected() {
+        // ADR-0005 predicates are JSON objects, not strings — the
+        // validator must mirror what `envelope::conditions::eval_one`
+        // accepts. A bare string used to be silently accepted by the
+        // advisory check; lockstep enforcement now rejects it.
         let env = json!({
             "intent": "x",
             "prompt_template": "y",
             "success_criteria": ["z"],
-            "preconditions": ["status_eq(in_progress"],
+            "preconditions": ["status_eq(in_progress)"],
         });
         let result = validate_envelope(&env, false);
         assert!(!result.valid);
@@ -316,6 +395,54 @@ mod tests {
             .violations
             .iter()
             .any(|v| v.field == "preconditions[0]"));
+    }
+
+    #[test]
+    fn precondition_object_form_accepted() {
+        let env = json!({
+            "intent": "x",
+            "prompt_template": "y",
+            "success_criteria": ["z"],
+            "preconditions": [
+                {"type": "task_status", "task_id": "TASK-1", "equals": "done"},
+                {"type": "file_exists", "path": "src/foo.rs"},
+                {"type": "daemon_healthy"},
+            ],
+        });
+        let result = validate_envelope(&env, false);
+        assert!(result.valid, "{:?}", result.violations);
+    }
+
+    #[test]
+    fn precondition_missing_type_field_rejected() {
+        let env = json!({
+            "intent": "x",
+            "prompt_template": "y",
+            "success_criteria": ["z"],
+            "preconditions": [{"task_id": "TASK-1"}],
+        });
+        let result = validate_envelope(&env, false);
+        assert!(!result.valid);
+        assert!(result
+            .violations
+            .iter()
+            .any(|v| v.field == "preconditions[0]"));
+    }
+
+    #[test]
+    fn precondition_unknown_type_rejected() {
+        let env = json!({
+            "intent": "x",
+            "prompt_template": "y",
+            "success_criteria": ["z"],
+            "preconditions": [{"type": "magic_oracle"}],
+        });
+        let result = validate_envelope(&env, false);
+        assert!(!result.valid);
+        assert!(result
+            .violations
+            .iter()
+            .any(|v| v.field == "preconditions[0].type"));
     }
 
     #[test]

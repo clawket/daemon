@@ -141,6 +141,30 @@ impl ApiError {
     }
 }
 
+impl From<crate::envelope::sign::EnvelopeSignError> for ApiError {
+    fn from(err: crate::envelope::sign::EnvelopeSignError) -> Self {
+        use crate::envelope::sign::EnvelopeSignError;
+        match err {
+            EnvelopeSignError::Validation(violations) => {
+                let summary = violations
+                    .iter()
+                    .map(|v| format!("{}: {}", v.field, v.message))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let details = serde_json::json!({ "violations": violations });
+                ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: format!("ENVELOPE_INVALID: {summary}"),
+                    code: Some("ENVELOPE_INVALID".to_string()),
+                    details: Some(details),
+                    flat_details: false,
+                }
+            }
+            EnvelopeSignError::Storage(e) => ApiError::from(e),
+        }
+    }
+}
+
 impl From<rusqlite::Error> for ApiError {
     fn from(err: rusqlite::Error) -> Self {
         // SQLite BUSY → 503
