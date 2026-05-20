@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::decomposition::suggest as decompose_suggest;
 use crate::embeddings;
 use crate::envelope::conditions as env_conditions;
+use crate::envelope::sign as env_sign;
 use crate::envelope::validate as env_validate;
 use crate::git;
 use crate::models::{Task, TaskEnvelope};
@@ -404,13 +405,11 @@ async fn create(
     if let Some(mut env) = body.envelope {
         reject_high_entropy_in_value(&env).map_err(ApiError::bad_request)?;
         autofill_planned_sha(&mut env, &conn);
-        let json = serde_json::to_string(&env)
-            .map_err(|e| ApiError::bad_request(format!("envelope serialize: {e}")))?;
         let signer = assignee
             .as_deref()
             .or(reporter.as_deref())
             .unwrap_or("main");
-        task_envelopes::sign_for_task(&mut conn, &task.id, &json, signer)?;
+        env_sign::sign_envelope(&mut conn, &task.id, &env, signer)?;
         // Re-read so active_envelope_id is reflected.
         if let Some(refreshed) = tasks::get(&conn, &task.id)? {
             task = refreshed;
@@ -621,9 +620,7 @@ async fn update(
     if let Some(mut env) = envelope_value {
         reject_high_entropy_in_value(&env).map_err(ApiError::bad_request)?;
         autofill_planned_sha(&mut env, &conn);
-        let json = serde_json::to_string(&env)
-            .map_err(|e| ApiError::bad_request(format!("envelope serialize: {e}")))?;
-        task_envelopes::sign_for_task(&mut conn, &task.id, &json, &sidecar_author)?;
+        env_sign::sign_envelope(&mut conn, &task.id, &env, &sidecar_author)?;
         if let Some(refreshed) = tasks::get(&conn, &task.id)? {
             task = refreshed;
         }
@@ -1186,13 +1183,11 @@ async fn create_subtask(
 
     if let Some(mut env) = child_env {
         autofill_planned_sha(&mut env, &conn);
-        let json = serde_json::to_string(&env)
-            .map_err(|e| ApiError::bad_request(format!("envelope serialize: {e}")))?;
         let signer = assignee
             .as_deref()
             .or(reporter.as_deref())
             .unwrap_or("main");
-        task_envelopes::sign_for_task(&mut conn, &task.id, &json, signer)?;
+        env_sign::sign_envelope(&mut conn, &task.id, &env, signer)?;
         if let Some(refreshed) = tasks::get(&conn, &task.id)? {
             task = refreshed;
         }
@@ -2086,7 +2081,15 @@ mod envelope {
             .unwrap()
             .to_string();
 
-        let env_v2 = serde_json::json!({"version": 1, "intent": "second"});
+        // Each envelope version is a complete contract snapshot — top-level
+        // tasks (no parent_task_id) have no inheritance chain to fill in
+        // gaps, so PATCH payloads must carry the full required tier.
+        let env_v2 = serde_json::json!({
+            "version": 1,
+            "intent": "second",
+            "prompt_template": "p",
+            "success_criteria": ["ok"],
+        });
         let (status, updated) =
             patch_task(&s.app, &id, serde_json::json!({"envelope": env_v2})).await;
         assert_eq!(status, StatusCode::OK);
@@ -2585,7 +2588,7 @@ mod get_envelope {
         .await;
         let id = task["id"].as_str().unwrap().to_string();
 
-        // PATCH a v2.
+        // PATCH a v2. Top-level task → must carry full required tier.
         s.app
             .clone()
             .oneshot(
@@ -2595,7 +2598,12 @@ mod get_envelope {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
-                            "envelope": {"version": 1, "intent": "v2"}
+                            "envelope": {
+                                "version": 1,
+                                "intent": "v2",
+                                "prompt_template": "p",
+                                "success_criteria": ["ok"],
+                            }
                         }))
                         .unwrap(),
                     ))
@@ -2876,16 +2884,27 @@ mod envelope_history {
         )
         .await;
         let id = task["id"].as_str().unwrap().to_string();
+        // Each version is a complete snapshot on top-level tasks.
         patch_json(
             &s.app,
             &format!("/tasks/{id}"),
-            serde_json::json!({"envelope": {"version": 1, "intent": "v2"}}),
+            serde_json::json!({"envelope": {
+                "version": 1,
+                "intent": "v2",
+                "prompt_template": "p",
+                "success_criteria": ["ok"],
+            }}),
         )
         .await;
         patch_json(
             &s.app,
             &format!("/tasks/{id}"),
-            serde_json::json!({"envelope": {"version": 1, "intent": "v3"}}),
+            serde_json::json!({"envelope": {
+                "version": 1,
+                "intent": "v3",
+                "prompt_template": "p",
+                "success_criteria": ["ok"],
+            }}),
         )
         .await;
 
@@ -2929,7 +2948,12 @@ mod envelope_history {
             patch_json(
                 &s.app,
                 &format!("/tasks/{id}"),
-                serde_json::json!({"envelope": {"version": 1, "intent": format!("v{i}")}}),
+                serde_json::json!({"envelope": {
+                    "version": 1,
+                    "intent": format!("v{i}"),
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                }}),
             )
             .await;
         }

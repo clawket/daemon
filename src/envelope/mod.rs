@@ -3,4 +3,5 @@
 //! (RL-U3-10 / LM-63). Routes consume these from `envelope::conditions`.
 
 pub mod conditions;
+pub mod sign;
 pub mod validate;
