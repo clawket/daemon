@@ -1,7 +1,8 @@
 // FIX-DAEMON-004: Units are pure grouping entities — no status/approval lifecycle.
 use crate::id::{new_id, now_ms};
 use crate::models::Unit;
-use anyhow::{Context, Result};
+use crate::repo::plans;
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
 pub struct CreateInput<'a> {
@@ -13,6 +14,21 @@ pub struct CreateInput<'a> {
 }
 
 pub fn create(conn: &Connection, input: CreateInput<'_>) -> Result<Option<Unit>> {
+    // LM-11031: completed plans are structurally frozen — block new unit
+    // creation. Pairs with the symmetric gate in tasks::create and the
+    // residue gate at PATCH /plans/:id, so the only way to add work under a
+    // completed plan is to re-open it (PATCH status → active) or create a
+    // follow-up plan. Without this gate a delayed `unit create` after the
+    // cascade-complete transition would silently produce orphan TODO units
+    // under a Complete plan (LM-11031 root cause).
+    if let Some(plan) = plans::get(conn, input.plan_id)? {
+        if plan.status == "completed" {
+            bail!(
+                "PLAN_COMPLETED: cannot create unit under completed plan '{}'. Re-open the plan (PATCH status → active) or create a follow-up plan.",
+                plan.id
+            );
+        }
+    }
     let id = new_id("UNIT");
     let ts = now_ms();
     let idx = match input.idx {

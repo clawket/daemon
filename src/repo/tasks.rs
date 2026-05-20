@@ -84,6 +84,28 @@ pub fn create(conn: &mut Connection, input: CreateInput<'_>) -> Result<Option<Ta
 
     let unit = units::get(conn, input.unit_id)?;
 
+    // LM-11031: completed plans are structurally frozen — block new task
+    // creation under any unit whose parent plan is completed. Pairs with the
+    // symmetric gate in units::create and the residue gate at
+    // PATCH /plans/:id, so the only way to add work under a completed plan
+    // is to re-open it (PATCH status → active) or create a follow-up plan.
+    // Without this gate a delayed `task create` after cascade-complete would
+    // silently produce orphan TODO tasks under a Complete plan (LM-11031
+    // root cause: the cascade-up logic at line ~1049 commits the plan to
+    // 'completed' once all unit tasks are terminal, but nothing prevented a
+    // subsequent create from re-introducing non-terminal work).
+    if let Some(ref u) = unit {
+        if let Some(plan) = plans::get(conn, &u.plan_id)? {
+            if plan.status == "completed" {
+                bail!(
+                    "PLAN_COMPLETED: cannot create task under completed plan '{}' (via unit '{}'). Re-open the plan (PATCH status → active) or create a follow-up plan.",
+                    plan.id,
+                    u.id
+                );
+            }
+        }
+    }
+
     let mut cycle_id = input.cycle_id.map(String::from);
     if cycle_id.is_none() {
         if let Some(ref u) = unit {
@@ -2010,6 +2032,160 @@ mod tests {
         assert_eq!(plan.status, "completed");
         let cycle = cycles::get(&s.db.conn, &s.cycle_id).unwrap().unwrap();
         assert_eq!(cycle.status, "completed");
+    }
+
+    // LM-11031: once cascade_complete promotes the plan to `completed`,
+    // subsequent task creation under any of its units must fail with
+    // PLAN_COMPLETED. Without this gate, a delayed `task create` after the
+    // cascade would silently produce orphan TODO tasks under a Complete plan
+    // — the lying-state bug observed in the web dashboard.
+    #[test]
+    fn blocks_task_create_under_completed_plan() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let t = create(
+            &mut s.db.conn,
+            CreateInput {
+                unit_id: &s.unit_id,
+                title: "first",
+                body: None,
+                assignee: None,
+                idx: None,
+                depends_on: vec![],
+                parent_task_id: None,
+                priority: None,
+                complexity: None,
+                estimated_edits: None,
+                cycle_id: Some(&s.cycle_id),
+                reporter: None,
+                type_: None,
+                atomic_size_hint: None,
+                decomposition_policy: None,
+                tier: None,
+                qa_status: None,
+                scenario_id: None,
+                defect_task: None,
+                scenario_amendment: None,
+                evidence: None,
+                batch_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        update(
+            &mut s.db.conn,
+            &t.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:gate".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Plan is now completed via cascade. Creating a follow-up task must fail.
+        let err = create(
+            &mut s.db.conn,
+            CreateInput {
+                unit_id: &s.unit_id,
+                title: "post-cascade",
+                body: None,
+                assignee: None,
+                idx: None,
+                depends_on: vec![],
+                parent_task_id: None,
+                priority: None,
+                complexity: None,
+                estimated_edits: None,
+                cycle_id: None,
+                reporter: None,
+                type_: None,
+                atomic_size_hint: None,
+                decomposition_policy: None,
+                tier: None,
+                qa_status: None,
+                scenario_id: None,
+                defect_task: None,
+                scenario_amendment: None,
+                evidence: None,
+                batch_id: None,
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("PLAN_COMPLETED:"),
+            "expected PLAN_COMPLETED gate, got: {msg}"
+        );
+    }
+
+    // LM-11031: symmetric gate for `units::create` — once a plan is
+    // completed, no new units may be attached. Tested here (rather than in
+    // units.rs) to reuse the cascade-completing Scene from `setup(true)`.
+    #[test]
+    fn blocks_unit_create_under_completed_plan() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let t = create(
+            &mut s.db.conn,
+            CreateInput {
+                unit_id: &s.unit_id,
+                title: "first",
+                body: None,
+                assignee: None,
+                idx: None,
+                depends_on: vec![],
+                parent_task_id: None,
+                priority: None,
+                complexity: None,
+                estimated_edits: None,
+                cycle_id: Some(&s.cycle_id),
+                reporter: None,
+                type_: None,
+                atomic_size_hint: None,
+                decomposition_policy: None,
+                tier: None,
+                qa_status: None,
+                scenario_id: None,
+                defect_task: None,
+                scenario_amendment: None,
+                evidence: None,
+                batch_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        update(
+            &mut s.db.conn,
+            &t.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:gate".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = units::create(
+            &s.db.conn,
+            units::CreateInput {
+                plan_id: &s.plan_id,
+                title: "post-cascade-unit",
+                goal: None,
+                idx: None,
+                execution_mode: None,
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("PLAN_COMPLETED:"),
+            "expected PLAN_COMPLETED gate, got: {msg}"
+        );
     }
 
     #[test]
