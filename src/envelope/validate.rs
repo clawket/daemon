@@ -161,9 +161,8 @@ pub fn validate_envelope(envelope: &Value, strict: bool) -> ValidateResult {
                         v.push(Violation {
                             field,
                             severity: Severity::Error,
-                            message:
-                                "condition must be a JSON object with a `type` discriminator"
-                                    .into(),
+                            message: "condition must be a JSON object with a `type` discriminator"
+                                .into(),
                         });
                         continue;
                     };

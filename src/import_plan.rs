@@ -1341,17 +1341,17 @@ pub fn import_parsed_plan(
             let task_id = created_units[pu_idx].tasks[pt_idx].id.clone();
             let json = parsed_envelope_to_json(env);
             // Build a Value mirror for the validator while persisting
-                // the original key-ordered JSON. parsed_envelope_to_json
-                // emits well-formed JSON by construction, so the parse
-                // round-trip is infallible; the `?` covers only a
-                // genuine ParsedEnvelope::Value corruption bug.
+            // the original key-ordered JSON. parsed_envelope_to_json
+            // emits well-formed JSON by construction, so the parse
+            // round-trip is infallible; the `?` covers only a
+            // genuine ParsedEnvelope::Value corruption bug.
             let value: serde_json::Value = serde_json::from_str(&json)
                 .map_err(|e| anyhow::anyhow!("parsed envelope json round-trip failed: {e}"))?;
             // signed_by = opts.source so strict-import-originated
             // envelopes are distinguishable from interactive signs in
             // the audit trail.
-            env_sign::sign_envelope_from_json(conn, &task_id, &value, &json, opts.source)
-                .map_err(|e| match e {
+            env_sign::sign_envelope_from_json(conn, &task_id, &value, &json, opts.source).map_err(
+                |e| match e {
                     env_sign::EnvelopeSignError::Validation(violations) => {
                         let summary = violations
                             .iter()
@@ -1361,7 +1361,8 @@ pub fn import_parsed_plan(
                         anyhow::anyhow!("ENVELOPE_INVALID for {}: {}", task_id, summary)
                     }
                     env_sign::EnvelopeSignError::Storage(err) => err,
-                })?;
+                },
+            )?;
         }
     }
 
