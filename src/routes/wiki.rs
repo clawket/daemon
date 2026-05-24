@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::repo::projects;
 use crate::routes::error::ApiResult;
+use crate::routes::util::resolve_project_ref_opt;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -126,14 +127,16 @@ async fn list_files(
 
     let mut results: Vec<WikiFile> = Vec::new();
 
-    let wiki_paths: Vec<String> = if let Some(pid) = q.project_id.as_deref() {
+    let wiki_paths: Vec<String> = {
         let conn = app.conn();
-        match projects::get(&conn, pid)? {
-            Some(p) if !p.wiki_paths.is_empty() => p.wiki_paths,
-            _ => vec!["docs".to_string()],
+        let resolved = resolve_project_ref_opt(&conn, q.project_id.as_deref())?;
+        match resolved {
+            Some(pid) => match projects::get(&conn, &pid)? {
+                Some(p) if !p.wiki_paths.is_empty() => p.wiki_paths,
+                _ => vec!["docs".to_string()],
+            },
+            None => vec!["docs".to_string()],
         }
-    } else {
-        vec!["docs".to_string()]
     };
 
     for wp in &wiki_paths {
@@ -202,14 +205,15 @@ async fn get_file(
     let cwd_path = PathBuf::from(&cwd);
     let full = cwd_path.join(&rel_path);
 
-    let wiki_paths: Vec<String> = if let Some(pid) = q.project_id.as_deref() {
+    let wiki_paths: Vec<String> = {
         let conn = app.conn();
-        match projects::get(&conn, pid) {
-            Ok(Some(p)) if !p.wiki_paths.is_empty() => p.wiki_paths,
+        match resolve_project_ref_opt(&conn, q.project_id.as_deref()) {
+            Ok(Some(pid)) => match projects::get(&conn, &pid) {
+                Ok(Some(p)) if !p.wiki_paths.is_empty() => p.wiki_paths,
+                _ => vec!["docs".to_string()],
+            },
             _ => vec!["docs".to_string()],
         }
-    } else {
-        vec!["docs".to_string()]
     };
 
     let mut allowed_roots: Vec<PathBuf> = vec![cwd_path.clone()];

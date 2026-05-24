@@ -7,7 +7,9 @@ use serde_json::Value;
 use crate::models::{Cycle, CycleCounts, Task};
 use crate::repo::{cycles, tasks};
 use crate::routes::error::{json_or_404, ApiError, ApiResult};
-use crate::routes::util::{norm_opt, value_to_opt_string};
+use crate::routes::util::{
+    norm_opt, resolve_project_ref, resolve_project_ref_opt, value_to_opt_string,
+};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -36,10 +38,12 @@ async fn list(
     State(app): State<AppState>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<Cycle>>> {
+    let conn = app.conn();
+    let project_id = resolve_project_ref_opt(&conn, q.project_id.as_deref())?;
     Ok(Json(cycles::list(
-        &app.conn(),
+        &conn,
         cycles::ListFilter {
-            project_id: q.project_id.as_deref(),
+            project_id: project_id.as_deref(),
             unit_id: q.unit_id.as_deref(),
             status: q.status.as_deref(),
         },
@@ -67,11 +71,13 @@ async fn create(
             "MISSING_UNIT_ID: unit_id is required for cycle creation (PDD A4: Cycle ⊂ Unit). Use: clawket cycle create --unit <UNIT-ID>",
         ));
     }
+    let conn = app.conn();
+    let project_id = resolve_project_ref(&conn, &body.project_id)?;
     // Validate unit exists (UNIT_NOT_FOUND)
     {
         use crate::repo::units;
-        let unit = units::get(&app.conn(), &body.unit_id)
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let unit =
+            units::get(&conn, &body.unit_id).map_err(|e| ApiError::internal(e.to_string()))?;
         if unit.is_none() {
             return Err(ApiError::not_found_coded(
                 "UNIT_NOT_FOUND",
@@ -80,9 +86,9 @@ async fn create(
         }
     }
     json_or_404(cycles::create(
-        &app.conn(),
+        &conn,
         cycles::CreateInput {
-            project_id: &body.project_id,
+            project_id: &project_id,
             unit_id: &body.unit_id,
             title: &body.title,
             goal: goal.as_deref(),

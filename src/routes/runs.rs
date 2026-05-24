@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::models::Run;
 use crate::repo::{runs, task_envelopes, tasks};
 use crate::routes::error::{json_or_404, ApiError, ApiResult};
+use crate::routes::util::resolve_project_ref_opt;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -124,12 +125,14 @@ async fn list(
     State(app): State<AppState>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<Run>>> {
+    let conn = app.conn();
+    let project_id = resolve_project_ref_opt(&conn, q.project_id.as_deref())?;
     Ok(Json(runs::list(
-        &app.conn(),
+        &conn,
         runs::ListFilter {
             task_id: q.task_id.as_deref(),
             session_id: q.session_id.as_deref(),
-            project_id: q.project_id.as_deref(),
+            project_id: project_id.as_deref(),
         },
     )?))
 }

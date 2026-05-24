@@ -11,6 +11,7 @@ use crate::import_plan::{
 };
 use crate::repo::{knowledge, projects};
 use crate::routes::error::{ApiError, ApiResult};
+use crate::routes::util::resolve_project_ref_opt;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -311,13 +312,13 @@ async fn knowledge_import(
     let mut imported: Vec<KnowledgeImportItem> = Vec::new();
     let mut skipped: Vec<SkippedItem> = Vec::new();
 
-    let wiki_paths: Vec<String> = if let Some(pid) = body.project_id.as_deref() {
-        match projects::get(&conn, pid)? {
+    let wiki_paths: Vec<String> = match resolve_project_ref_opt(&conn, body.project_id.as_deref())?
+    {
+        Some(pid) => match projects::get(&conn, &pid)? {
             Some(p) if !p.wiki_paths.is_empty() => p.wiki_paths,
             _ => vec!["docs".into()],
-        }
-    } else {
-        vec!["docs".into()]
+        },
+        None => vec!["docs".into()],
     };
 
     for wp in &wiki_paths {
@@ -382,17 +383,16 @@ async fn knowledge_export(
     let cwd = PathBuf::from(&body.cwd);
     let conn = app.conn();
 
-    let export_path: String = if let Some(pid) = body.project_id.as_deref() {
-        match projects::get(&conn, pid)? {
+    let export_path: String = match resolve_project_ref_opt(&conn, body.project_id.as_deref())? {
+        Some(pid) => match projects::get(&conn, &pid)? {
             Some(p) => p
                 .wiki_paths
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "docs".into()),
             None => "docs".into(),
-        }
-    } else {
-        "docs".into()
+        },
+        None => "docs".into(),
     };
     let docs_dir = if Path::new(&export_path).is_absolute() {
         PathBuf::from(&export_path)
