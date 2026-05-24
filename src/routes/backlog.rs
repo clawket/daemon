@@ -7,6 +7,7 @@ use serde::Deserialize;
 use crate::models::Task;
 use crate::repo::tasks;
 use crate::routes::error::{ApiError, ApiResult};
+use crate::routes::util::resolve_project_ref;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -23,6 +24,7 @@ async fn list(
     Query(q): Query<BacklogQuery>,
 ) -> ApiResult<Json<Vec<Task>>> {
     let conn = app.conn();
+    let project_id = resolve_project_ref(&conn, &q.project_id)?;
     let mut stmt = conn.prepare(
         "SELECT s.id FROM tasks s
          JOIN units u ON u.id = s.unit_id
@@ -31,7 +33,7 @@ async fn list(
          ORDER BY s.created_at",
     )?;
     let ids: Vec<String> = stmt
-        .query_map(params![q.project_id], |r| r.get::<_, String>(0))
+        .query_map(params![project_id], |r| r.get::<_, String>(0))
         .map_err(|e| ApiError::internal(e.to_string()))?
         .filter_map(|r| r.ok())
         .collect();

@@ -8,7 +8,7 @@ use crate::embeddings;
 use crate::models::{Knowledge, KnowledgeVersion};
 use crate::repo::knowledge;
 use crate::routes::error::{json_or_404, ApiError, ApiResult};
-use crate::routes::util::norm_opt;
+use crate::routes::util::{norm_opt, resolve_project_ref_opt};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -42,6 +42,11 @@ async fn list(
     State(app): State<AppState>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<Knowledge>>> {
+    let conn = app.conn();
+    let project_filter = q.project.as_deref().or(q.project_id.as_deref());
+    let project_id = resolve_project_ref_opt(&conn, project_filter)?;
+    drop(conn);
+
     let mut results = knowledge::list(
         &app.conn(),
         knowledge::ListFilter {
@@ -52,8 +57,7 @@ async fn list(
         },
     )?;
 
-    let project_filter = q.project.as_deref().or(q.project_id.as_deref());
-    if let Some(pid) = project_filter {
+    if let Some(pid) = project_id.as_deref() {
         results.retain(|a| project_id_matches(a, Some(pid), &app));
     }
 

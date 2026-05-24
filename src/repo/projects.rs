@@ -144,6 +144,40 @@ pub fn get_by_name(conn: &Connection, name: &str) -> Result<Option<Project>> {
     }
 }
 
+/// Look up a project by its short ticket key (e.g. `SDI`). Keys are stored
+/// uppercase; the input is upper-cased before comparison so callers can pass
+/// `--project sdi` interchangeably with `--project SDI`.
+pub fn get_by_key(conn: &Connection, key: &str) -> Result<Option<Project>> {
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM projects WHERE key = ?1",
+            params![key.to_uppercase()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match id {
+        Some(i) => get(conn, &i),
+        None => Ok(None),
+    }
+}
+
+/// Resolve a project reference that may be either the canonical id
+/// (`PROJ-<slug>`) or the short ticket key (`SDI`). Returns the matching
+/// project or `None` if neither lookup succeeds. Callers that need the
+/// canonical id should use the returned project's `.id` field.
+///
+/// Centralising this in the repo layer lets every route accept either form
+/// without each handler having to know about both. Routes that previously
+/// passed `project_id` straight into an INSERT now go through
+/// `routes::util::resolve_project_ref`, which calls into this function and
+/// converts a missing project into a structured `PROJECT_NOT_FOUND` error.
+pub fn get_by_ref(conn: &Connection, value: &str) -> Result<Option<Project>> {
+    if let Some(p) = get(conn, value)? {
+        return Ok(Some(p));
+    }
+    get_by_key(conn, value)
+}
+
 pub fn get_by_cwd(conn: &Connection, cwd: &str, enabled_only: bool) -> Result<Option<Project>> {
     let exact_sql = if enabled_only {
         "SELECT p.id FROM projects p JOIN project_cwds c ON c.project_id = p.id
@@ -395,5 +429,38 @@ mod tests {
         assert_eq!(generate_key_from_name("my app"), "MA");
         assert_eq!(generate_key_from_name("one two three four five"), "OTTF");
         assert_eq!(generate_key_from_name("x_y-z"), "XYZ");
+    }
+
+    #[test]
+    fn get_by_ref_accepts_id_and_key() {
+        let (_d, mut db) = tmp_db();
+        let p = create(
+            &mut db.conn,
+            CreateInput {
+                name: "My App",
+                description: None,
+                cwd: None,
+                key: Some("MAP"),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.id, "PROJ-my-app");
+        assert_eq!(p.key.as_deref(), Some("MAP"));
+
+        // Canonical id resolves
+        let by_id = get_by_ref(&db.conn, "PROJ-my-app").unwrap().unwrap();
+        assert_eq!(by_id.id, p.id);
+
+        // Uppercase key resolves
+        let by_key_upper = get_by_ref(&db.conn, "MAP").unwrap().unwrap();
+        assert_eq!(by_key_upper.id, p.id);
+
+        // Lowercase key resolves (keys are normalised uppercase)
+        let by_key_lower = get_by_ref(&db.conn, "map").unwrap().unwrap();
+        assert_eq!(by_key_lower.id, p.id);
+
+        // Unknown ref returns None (caller surfaces as PROJECT_NOT_FOUND)
+        assert!(get_by_ref(&db.conn, "DOES-NOT-EXIST").unwrap().is_none());
     }
 }

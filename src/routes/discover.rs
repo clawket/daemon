@@ -38,7 +38,7 @@ use crate::id::ulid;
 use crate::models::{Cycle, Plan, Unit};
 use crate::repo::{cycles, knowledge, plans, tasks, units};
 use crate::routes::error::{ApiError, ApiResult};
-use crate::routes::util::norm_opt;
+use crate::routes::util::{norm_opt, resolve_project_ref};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -110,6 +110,7 @@ async fn start(
     }
 
     let conn = app.conn();
+    let project_id = resolve_project_ref(&conn, &body.project_id)?;
     let plan_title = format!("{} Round {}", body.domain, body.round);
     // R2 DOGFOOD-006 fix: auto-populate plan description with PDD C6
     // convergence condition when caller didn't supply one. R3 sub-agents
@@ -134,14 +135,14 @@ async fn start(
     if let Ok(existing_active) = plans::list(
         &conn,
         plans::ListFilter {
-            project_id: Some(&body.project_id),
+            project_id: Some(&project_id),
             status: Some("active"),
         },
     ) {
         let count = existing_active.len();
         if count >= 1 {
             tracing::warn!(
-                project_id = %body.project_id,
+                project_id = %project_id,
                 active_plan_count = count,
                 next_round = body.round,
                 "discover-loop:start — {} active plan(s) exist; PDD recommends ≤ 1 (≤ 2 in transition).",
@@ -150,7 +151,7 @@ async fn start(
             app.emit(
                 "discover-loop:active-plan-warning",
                 serde_json::json!({
-                    "project_id": body.project_id,
+                    "project_id": project_id,
                     "active_plan_count_before": count,
                     "active_plan_count_after": count + 1,
                     "recommended_max": 1,
@@ -164,7 +165,7 @@ async fn start(
     let plan = plans::create(
         &conn,
         plans::CreateInput {
-            project_id: &body.project_id,
+            project_id: &project_id,
             title: &plan_title,
             description: description.as_deref(),
             source: Some("discover-loop"),
@@ -202,7 +203,7 @@ async fn start(
     let cycle = cycles::create(
         &conn,
         cycles::CreateInput {
-            project_id: &body.project_id,
+            project_id: &project_id,
             unit_id: first_unit_id,
             title: &cycle_title,
             goal: Some(&format!(
@@ -1447,6 +1448,7 @@ async fn list_round_plans(
     Path(project_id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let conn = app.conn();
+    let project_id = resolve_project_ref(&conn, &project_id)?;
     let all_plans = plans::list(
         &conn,
         plans::ListFilter {
@@ -1495,11 +1497,12 @@ fn resolve_plan(
 ) -> ApiResult<Plan> {
     if let Some(pid) = plan_id {
         plans::get(conn, pid)?.ok_or_else(|| ApiError::not_found("plan not found"))
-    } else if let Some(proj_id) = project_id {
+    } else if let Some(proj_ref) = project_id {
+        let proj_id = resolve_project_ref(conn, proj_ref)?;
         let active = plans::list(
             conn,
             plans::ListFilter {
-                project_id: Some(proj_id),
+                project_id: Some(&proj_id),
                 status: Some("active"),
             },
         )?;

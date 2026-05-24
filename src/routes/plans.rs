@@ -11,7 +11,9 @@ use serde_json::Value;
 use crate::models::{Plan, PlanCounts, UnitCounts};
 use crate::repo::{plans, units};
 use crate::routes::error::{json_or_404, ApiError, ApiResult};
-use crate::routes::util::{norm_opt, value_to_opt_string};
+use crate::routes::util::{
+    norm_opt, resolve_project_ref, resolve_project_ref_opt, value_to_opt_string,
+};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -48,10 +50,12 @@ async fn list(
     State(app): State<AppState>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<Plan>>> {
+    let conn = app.conn();
+    let project_id = resolve_project_ref_opt(&conn, q.project_id.as_deref())?;
     Ok(Json(plans::list(
-        &app.conn(),
+        &conn,
         plans::ListFilter {
-            project_id: q.project_id.as_deref(),
+            project_id: project_id.as_deref(),
             status: q.status.as_deref(),
         },
     )?))
@@ -73,10 +77,12 @@ async fn create(
     let description = norm_opt(body.description);
     let source = norm_opt(body.source);
     let source_path = norm_opt(body.source_path);
+    let conn = app.conn();
+    let project_id = resolve_project_ref(&conn, &body.project_id)?;
     json_or_404(plans::create(
-        &app.conn(),
+        &conn,
         plans::CreateInput {
-            project_id: &body.project_id,
+            project_id: &project_id,
             title: &body.title,
             description: description.as_deref(),
             source: source.as_deref(),

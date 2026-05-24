@@ -284,8 +284,14 @@ mod tests {
             Err(EnvelopeSignError::Validation(violations)) => {
                 let fields: Vec<_> = violations.iter().map(|v| v.field.as_str()).collect();
                 assert!(fields.contains(&"intent"), "violations: {fields:?}");
-                assert!(fields.contains(&"prompt_template"), "violations: {fields:?}");
-                assert!(fields.contains(&"success_criteria"), "violations: {fields:?}");
+                assert!(
+                    fields.contains(&"prompt_template"),
+                    "violations: {fields:?}"
+                );
+                assert!(
+                    fields.contains(&"success_criteria"),
+                    "violations: {fields:?}"
+                );
             }
             other => panic!("expected Validation error, got {other:?}"),
         }

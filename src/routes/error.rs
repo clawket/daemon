@@ -207,6 +207,12 @@ impl From<anyhow::Error> for ApiError {
         if msg.starts_with("TASK_NOT_FOUND:") {
             return ApiError::not_found_coded("TASK_NOT_FOUND", msg);
         }
+        if msg.starts_with("PROJECT_NOT_FOUND:") {
+            return ApiError::not_found_coded("PROJECT_NOT_FOUND", msg);
+        }
+        if msg.starts_with("MISSING_PROJECT:") {
+            return ApiError::bad_request_coded("MISSING_PROJECT", msg);
+        }
         if msg.starts_with("MISSING_UNIT_ID:") {
             return ApiError::bad_request_coded("MISSING_UNIT_ID", msg);
         }
