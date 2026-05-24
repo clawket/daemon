@@ -1,6 +1,6 @@
 [package]
 name = "clawketd"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Structured task contracts for LLM coding agents — Axum HTTP daemon backed by SQLite + sqlite-vec for local RAG"
 license = "MIT"
