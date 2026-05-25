@@ -1069,6 +1069,20 @@ pub fn remove_label(conn: &Connection, id: &str, label: &str) -> Result<Option<T
 }
 
 /// FIX-DAEMON-106: cascade_complete returns list of (event_name, entity_id) for SSE emit
+///
+/// LM-11057 (US-CLAWKETD-CASCADE-001): plan/cycle completion is derived directly from
+/// the set of tasks that belong to the plan/cycle — not from intermediate per-unit
+/// derivations. The previous implementation required `all units have ≥1 task && all
+/// tasks terminal`, which a single empty unit could block forever. Units are pure
+/// grouping (FIX-DAEMON-004), so they have no completion state to derive — the only
+/// meaningful question is "are all of THIS plan's tasks terminal?".
+///
+/// Definition: a plan (or cycle) auto-completes iff
+///   (a) it owns ≥ 1 task, AND
+///   (b) every task it owns is in a terminal status (done | cancelled).
+///
+/// An empty plan / cycle (no tasks) is a cascade no-op — auto-completing a container
+/// that has no work declared yet would erase user intent.
 pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<CascadeEvent>> {
     let mut cascaded: Vec<CascadeEvent> = Vec::new();
     let task = match get(conn, task_id)? {
@@ -1076,49 +1090,27 @@ pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<Casc
         None => return Ok(cascaded),
     };
 
-    // FIX-DAEMON-004: Units no longer have status. Cascade to Plan based on
-    // whether ALL tasks across ALL units of the plan are terminal.
-    let unit = match units::get(conn, &task.unit_id)? {
-        Some(u) => u,
-        None => return Ok(cascaded),
-    };
+    // The trigger task itself must be terminal for any cascade to be possible.
+    if !TERMINAL.contains(&task.status.as_str()) {
+        return Ok(cascaded);
+    }
 
-    // Check if all tasks in this unit are terminal → try plan completion
-    let unit_tasks = list(
-        conn,
-        ListFilter {
-            unit_id: Some(&task.unit_id),
-            ..Default::default()
-        },
-    )?;
-    let all_unit_done = !unit_tasks.is_empty()
-        && unit_tasks
-            .iter()
-            .all(|t| TERMINAL.contains(&t.status.as_str()));
-
-    if all_unit_done {
-        // Check if ALL units in the plan are "done" (all their tasks terminal)
-        let plan_units = units::list(
+    // Plan-task-direct cascade. `ListFilter::plan_id` JOINs through units, so the
+    // result set is exactly the tasks owned by this plan — empty units contribute
+    // zero rows and therefore cannot block completion.
+    if let Some(unit) = units::get(conn, &task.unit_id)? {
+        let plan_tasks = list(
             conn,
-            units::ListFilter {
+            ListFilter {
                 plan_id: Some(&unit.plan_id),
+                ..Default::default()
             },
         )?;
-        let all_plan_done = !plan_units.is_empty()
-            && plan_units.iter().all(|u| {
-                list(
-                    conn,
-                    ListFilter {
-                        unit_id: Some(&u.id),
-                        ..Default::default()
-                    },
-                )
-                .map(|tasks| {
-                    !tasks.is_empty() && tasks.iter().all(|t| TERMINAL.contains(&t.status.as_str()))
-                })
-                .unwrap_or(false)
-            });
-        if all_plan_done {
+        let plan_done = !plan_tasks.is_empty()
+            && plan_tasks
+                .iter()
+                .all(|t| TERMINAL.contains(&t.status.as_str()));
+        if plan_done {
             if let Some(plan) = plans::get(conn, &unit.plan_id)? {
                 if plan.status == "active" {
                     plans::update(
@@ -1129,14 +1121,14 @@ pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<Casc
                             ..Default::default()
                         },
                     )?;
-                    // FIX-DAEMON-106: record cascade event for SSE emit
                     cascaded.push(("plan:updated", plan.id.clone()));
                 }
             }
         }
     }
 
-    // Cascade cycle completion
+    // Cycle-task-direct cascade. Symmetric definition: all tasks attached to this
+    // cycle must be terminal, and the cycle must own at least one task.
     if let Some(cid) = task.cycle_id.as_deref() {
         let cycle_tasks = list(
             conn,
@@ -1145,11 +1137,11 @@ pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<Casc
                 ..Default::default()
             },
         )?;
-        let all_cycle_done = !cycle_tasks.is_empty()
+        let cycle_done = !cycle_tasks.is_empty()
             && cycle_tasks
                 .iter()
                 .all(|t| TERMINAL.contains(&t.status.as_str()));
-        if all_cycle_done {
+        if cycle_done {
             if let Some(cycle) = cycles::get(conn, cid)? {
                 if cycle.status == "active" {
                     cycles::update(
@@ -1160,7 +1152,6 @@ pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<Casc
                             ..Default::default()
                         },
                     )?;
-                    // FIX-DAEMON-106: record cascade event for SSE emit
                     cascaded.push(("cycle:updated", cycle.id.clone()));
                 }
             }
@@ -2028,6 +2019,171 @@ mod tests {
 
         // FIX-DAEMON-004: Units have no status; only plan/cycle cascade.
         let _unit = units::get(&s.db.conn, &s.unit_id).unwrap().unwrap();
+        let plan = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
+        assert_eq!(plan.status, "completed");
+        let cycle = cycles::get(&s.db.conn, &s.cycle_id).unwrap().unwrap();
+        assert_eq!(cycle.status, "completed");
+    }
+
+    // LM-11057 (US-CLAWKETD-CASCADE-001): a plan with multiple units where ONE
+    // unit owns zero tasks must still cascade-complete once every existing
+    // task is terminal. Pre-fix, the empty unit kept `all_plan_done`
+    // permanently false because plan completion was derived from per-unit
+    // all-terminal checks gated on `!unit_tasks.is_empty()`. v20 plan
+    // (PLAN-01KS53TRCHW71NEKB6V6KV23DW) reproduced exactly this case in
+    // production.
+    #[test]
+    fn cascade_completes_plan_when_a_unit_is_empty() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        // s.unit_id is the "filled" unit; add a sibling unit that owns zero tasks.
+        let empty_unit = units::create(
+            &s.db.conn,
+            units::CreateInput {
+                plan_id: &s.plan_id,
+                title: "U-empty",
+                goal: None,
+                idx: None,
+                execution_mode: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        let t = create(
+            &mut s.db.conn,
+            CreateInput {
+                unit_id: &s.unit_id,
+                title: "only",
+                body: None,
+                assignee: None,
+                idx: None,
+                depends_on: vec![],
+                parent_task_id: None,
+                priority: None,
+                complexity: None,
+                estimated_edits: None,
+                cycle_id: Some(&s.cycle_id),
+                reporter: None,
+                type_: None,
+                atomic_size_hint: None,
+                decomposition_policy: None,
+                tier: None,
+                qa_status: None,
+                scenario_id: None,
+                defect_task: None,
+                scenario_amendment: None,
+                evidence: None,
+                batch_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        update(
+            &mut s.db.conn,
+            &t.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:empty-unit-cascade".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let plan = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
+        assert_eq!(
+            plan.status, "completed",
+            "plan must complete via cascade even when a sibling unit owns no tasks; empty_unit={}",
+            empty_unit.id
+        );
+        let cycle = cycles::get(&s.db.conn, &s.cycle_id).unwrap().unwrap();
+        assert_eq!(cycle.status, "completed");
+    }
+
+    // LM-11057 (US-CLAWKETD-CASCADE-001): cascade must treat `cancelled` as a
+    // terminal status alongside `done`, and must NOT fire until EVERY task in
+    // the plan reaches a terminal state. v20 plan in the field carried
+    // 16 done + 10 cancelled — the cascade definition has to admit that mix.
+    #[test]
+    fn cascade_completes_plan_with_mixed_done_and_cancelled() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let mk = |conn: &mut Connection, unit_id: &str, cycle_id: &str, title: &str| -> Task {
+            create(
+                conn,
+                CreateInput {
+                    unit_id,
+                    title,
+                    body: None,
+                    assignee: None,
+                    idx: None,
+                    depends_on: vec![],
+                    parent_task_id: None,
+                    priority: None,
+                    complexity: None,
+                    estimated_edits: None,
+                    cycle_id: Some(cycle_id),
+                    reporter: None,
+                    type_: None,
+                    atomic_size_hint: None,
+                    decomposition_policy: None,
+                    tier: None,
+                    qa_status: None,
+                    scenario_id: None,
+                    defect_task: None,
+                    scenario_amendment: None,
+                    evidence: None,
+                    batch_id: None,
+                },
+            )
+            .unwrap()
+            .unwrap()
+        };
+
+        let t1 = mk(&mut s.db.conn, &s.unit_id, &s.cycle_id, "done-1");
+        let t2 = mk(&mut s.db.conn, &s.unit_id, &s.cycle_id, "cancel-1");
+        let t3 = mk(&mut s.db.conn, &s.unit_id, &s.cycle_id, "done-2");
+
+        update(
+            &mut s.db.conn,
+            &t1.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:done-1".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update(
+            &mut s.db.conn,
+            &t2.id,
+            UpdateFields {
+                status: Some("cancelled".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let plan_mid = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
+        assert_eq!(
+            plan_mid.status, "active",
+            "plan must remain active while a non-terminal task survives"
+        );
+
+        update(
+            &mut s.db.conn,
+            &t3.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:done-2".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
         let plan = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
         assert_eq!(plan.status, "completed");
         let cycle = cycles::get(&s.db.conn, &s.cycle_id).unwrap().unwrap();
