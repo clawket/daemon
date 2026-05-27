@@ -1,0 +1,14 @@
+#!/bin/sh
+#
+# clawketd pre-commit hook — installed by cargo-husky (user-hooks feature) on
+# the first `cargo test`/build. Mirrors the CI `lint` job so formatting/lint
+# failures are caught locally before a commit instead of in CI.
+#
+# Bypass once with `git commit --no-verify` if you must commit WIP.
+set -e
+
+echo "[pre-commit] cargo fmt --check"
+cargo fmt --all -- --check
+
+echo "[pre-commit] cargo clippy -D warnings"
+cargo clippy --all-targets --locked -- -D warnings
