@@ -2,7 +2,7 @@ use crate::id::{new_id, now_ms};
 use crate::models::Task;
 use crate::repo::{cycles, knowledge, plans, units};
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 const TERMINAL: &[&str] = &["done", "cancelled"];
 
@@ -38,6 +38,17 @@ pub struct CreateInput<'a> {
 }
 
 pub fn create(conn: &mut Connection, input: CreateInput<'_>) -> Result<Option<Task>> {
+    let tx = conn.transaction()?;
+    let id = create_in_tx(&tx, input)?;
+    tx.commit()?;
+    get(conn, &id)
+}
+
+/// Tx-aware variant of [`create`]: runs all validation + the INSERT inside the
+/// caller-owned transaction and returns the new task id WITHOUT committing.
+/// Lets a route handler wrap `create_in_tx` + `sign_envelope_in_tx` in one
+/// transaction so a rejected envelope leaves no orphan task (D2 atomicity).
+pub fn create_in_tx(conn: &Transaction, input: CreateInput<'_>) -> Result<String> {
     if input.unit_id.is_empty() {
         bail!("unit_id is required");
     }
@@ -175,8 +186,7 @@ pub fn create(conn: &mut Connection, input: CreateInput<'_>) -> Result<Option<Ta
         _ => "med",
     };
 
-    let tx = conn.transaction()?;
-    tx.execute(
+    conn.execute(
         "INSERT INTO tasks (id, unit_id, idx, title, body, created_at, status, assignee,
          ticket_number, parent_task_id, priority, complexity, estimated_edits, cycle_id, reporter, type,
          atomic_size_hint, decomposition_policy, tier, qa_status, scenario_id, defect_task, scenario_amendment,
@@ -212,7 +222,7 @@ pub fn create(conn: &mut Connection, input: CreateInput<'_>) -> Result<Option<Ta
     .context("insert task")?;
 
     for dep in &input.depends_on {
-        tx.execute(
+        conn.execute(
             "INSERT INTO task_depends_on (task_id, depends_on_task_id) VALUES (?1, ?2)",
             params![id, dep],
         )?;
@@ -229,7 +239,7 @@ pub fn create(conn: &mut Connection, input: CreateInput<'_>) -> Result<Option<Ta
             // Find round number = position of `cid` in the unit's cycle list
             // ordered by created_at ASC (1-indexed). The unit_id comes from
             // the task being inserted (input.unit_id).
-            let prior_cycle_id: Option<String> = tx
+            let prior_cycle_id: Option<String> = conn
                 .query_row(
                     "SELECT prev.id
                  FROM cycles cur
@@ -244,7 +254,7 @@ pub fn create(conn: &mut Connection, input: CreateInput<'_>) -> Result<Option<Ta
                 )
                 .optional()?;
             if let Some(prev_cid) = prior_cycle_id {
-                let prior_defect_exists: bool = tx
+                let prior_defect_exists: bool = conn
                     .query_row(
                         "SELECT 1 FROM tasks
                          WHERE cycle_id = ?1 AND scenario_id = ?2 AND qa_status = 'defect'
@@ -255,7 +265,7 @@ pub fn create(conn: &mut Connection, input: CreateInput<'_>) -> Result<Option<Ta
                     .optional()?
                     .is_some();
                 if prior_defect_exists {
-                    tx.execute(
+                    conn.execute(
                         "UPDATE tasks SET escalation_reason = 'prior-round-defect' WHERE id = ?1",
                         params![id],
                     )?;
@@ -264,9 +274,7 @@ pub fn create(conn: &mut Connection, input: CreateInput<'_>) -> Result<Option<Ta
         }
     }
 
-    tx.commit()?;
-
-    get(conn, &id)
+    Ok(id)
 }
 
 pub fn get(conn: &Connection, id: &str) -> Result<Option<Task>> {

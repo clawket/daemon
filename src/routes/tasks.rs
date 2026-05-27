@@ -322,6 +322,16 @@ async fn create(
         }
     }
 
+    // LM-11058: the entropy/secret guard is a pure validation with no DB
+    // side-effect, so it must run BEFORE the task INSERT. When it ran after
+    // `tasks::create` committed (below), a rejected envelope left an orphan
+    // task row (body="", active_envelope_id=NULL) that accumulated on every
+    // retry. Co-locating it with the required-field gate above keeps all
+    // envelope validation strictly pre-mutation (validate-before-mutate).
+    if let Some(env) = body.envelope.as_ref() {
+        reject_high_entropy_in_value(env).map_err(ApiError::bad_request)?;
+    }
+
     // LM-265 / L1.3.c — propagate atomic_size_hint and
     // decomposition_policy. Precedence: explicit body field > envelope
     // field > SQLite DEFAULT. Tracking the envelope as a fallback keeps
@@ -369,8 +379,15 @@ async fn create(
         validate_batch_id(bid)?;
     }
 
-    let created = tasks::create(
-        &mut conn,
+    // D2 atomicity: the task INSERT and the envelope sign share ONE
+    // transaction. Pre-fix they committed in two separate transactions, so a
+    // crash or DB error between them (or a sign-time failure) left a task with
+    // no required envelope — an orphan. Wrapping both in a single tx means any
+    // mid-sequence failure rolls the task back too, so nothing half-written
+    // can ever land on disk (LM-11058 / D2).
+    let tx = conn.transaction()?;
+    let task_id = tasks::create_in_tx(
+        &tx,
         tasks::CreateInput {
             unit_id: &unit_id,
             title: &body.title,
@@ -397,24 +414,19 @@ async fn create(
         },
     )?;
 
-    let mut task = match created {
-        Some(t) => t,
-        None => return Err(ApiError::not_found("not found")),
-    };
-
     if let Some(mut env) = body.envelope {
-        reject_high_entropy_in_value(&env).map_err(ApiError::bad_request)?;
-        autofill_planned_sha(&mut env, &conn);
+        // Entropy/secret validation already ran pre-INSERT (LM-11058 gate above).
+        autofill_planned_sha(&mut env, &tx);
         let signer = assignee
             .as_deref()
             .or(reporter.as_deref())
             .unwrap_or("main");
-        env_sign::sign_envelope(&mut conn, &task.id, &env, signer)?;
-        // Re-read so active_envelope_id is reflected.
-        if let Some(refreshed) = tasks::get(&conn, &task.id)? {
-            task = refreshed;
-        }
+        env_sign::sign_envelope_in_tx(&tx, &task_id, &env, signer)?;
     }
+
+    tx.commit()?;
+
+    let task = tasks::get(&conn, &task_id)?.ok_or_else(|| ApiError::not_found("not found"))?;
 
     let with_env = task_with_envelope(&conn, task)?;
     drop(conn);
@@ -538,6 +550,14 @@ async fn update(
         .to_owned();
     let envelope_value = body.get("envelope").cloned();
 
+    // LM-11058: validate the incoming envelope (entropy/secret guard) before
+    // any mutation, mirroring the create path. Running it after `tasks::update`
+    // committed would land the update while rejecting the envelope, leaving the
+    // task and its intended envelope out of sync.
+    if let Some(env) = envelope_value.as_ref() {
+        reject_high_entropy_in_value(env).map_err(ApiError::bad_request)?;
+    }
+
     // Status-transition guard (RL-U3-10 / LM-63): when the PATCH advances
     // the task into `in_progress` or `done`, evaluate the resolved
     // envelope's preconditions / postconditions against the live state.
@@ -618,7 +638,7 @@ async fn update(
     };
 
     if let Some(mut env) = envelope_value {
-        reject_high_entropy_in_value(&env).map_err(ApiError::bad_request)?;
+        // Entropy/secret validation already ran pre-update (LM-11058 gate above).
         autofill_planned_sha(&mut env, &conn);
         env_sign::sign_envelope(&mut conn, &task.id, &env, &sidecar_author)?;
         if let Some(refreshed) = tasks::get(&conn, &task.id)? {
@@ -1151,8 +1171,11 @@ async fn create_subtask(
     let child_env =
         compute_inherited_envelope(parent_env.as_ref(), body.envelope_overrides.as_ref())?;
 
-    let created = tasks::create(
-        &mut conn,
+    // D2 atomicity: subtask INSERT + inherited-envelope sign share ONE
+    // transaction, so a failed sign rolls the subtask back too (no orphan).
+    let tx = conn.transaction()?;
+    let task_id = tasks::create_in_tx(
+        &tx,
         tasks::CreateInput {
             unit_id: &unit_id,
             title: &body.title,
@@ -1178,20 +1201,20 @@ async fn create_subtask(
             batch_id: None,
         },
     )?;
-    let mut task =
-        created.ok_or_else(|| ApiError::internal("failed to create subtask".to_string()))?;
 
     if let Some(mut env) = child_env {
-        autofill_planned_sha(&mut env, &conn);
+        autofill_planned_sha(&mut env, &tx);
         let signer = assignee
             .as_deref()
             .or(reporter.as_deref())
             .unwrap_or("main");
-        env_sign::sign_envelope(&mut conn, &task.id, &env, signer)?;
-        if let Some(refreshed) = tasks::get(&conn, &task.id)? {
-            task = refreshed;
-        }
+        env_sign::sign_envelope_in_tx(&tx, &task_id, &env, signer)?;
     }
+
+    tx.commit()?;
+
+    let task = tasks::get(&conn, &task_id)?
+        .ok_or_else(|| ApiError::internal("failed to create subtask".to_string()))?;
 
     let with_env = task_with_envelope(&conn, task)?;
     drop(conn);

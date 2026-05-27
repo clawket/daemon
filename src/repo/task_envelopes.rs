@@ -5,7 +5,7 @@
 use crate::id::{new_id, now_ms};
 use crate::models::TaskEnvelope;
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 pub struct CreateInput<'a> {
     pub task_id: &'a str,
@@ -185,11 +185,24 @@ pub fn sign_for_task(
     json: &str,
     signed_by: &str,
 ) -> Result<TaskEnvelope> {
+    let tx = conn.transaction()?;
+    let env = sign_for_task_in_tx(&tx, task_id, json, signed_by)?;
+    tx.commit().context("commit envelope sign")?;
+    Ok(env)
+}
+
+/// Tx-aware variant of [`sign_for_task`]: runs all four steps inside the
+/// caller-owned transaction WITHOUT committing, so a route handler can wrap
+/// `create_in_tx` + `sign_for_task_in_tx` in one transaction (D2 atomicity).
+pub fn sign_for_task_in_tx(
+    conn: &Transaction,
+    task_id: &str,
+    json: &str,
+    signed_by: &str,
+) -> Result<TaskEnvelope> {
     serde_json::from_str::<serde_json::Value>(json).context("envelope json must be valid JSON")?;
 
-    let tx = conn.transaction()?;
-
-    let prev_max: Option<i64> = tx
+    let prev_max: Option<i64> = conn
         .query_row(
             "SELECT MAX(version) FROM task_envelopes WHERE task_id = ?1",
             params![task_id],
@@ -199,7 +212,7 @@ pub fn sign_for_task(
         .flatten();
     let next_version = prev_max.unwrap_or(0) + 1;
 
-    let prev_active_id: Option<String> = tx
+    let prev_active_id: Option<String> = conn
         .query_row(
             "SELECT id FROM task_envelopes
              WHERE task_id = ?1 AND superseded_by IS NULL
@@ -211,7 +224,7 @@ pub fn sign_for_task(
 
     let id = new_id("ENV");
     let ts = now_ms();
-    tx.execute(
+    conn.execute(
         "INSERT INTO task_envelopes (id, task_id, version, json, signed_at, signed_by)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![id, task_id, next_version, json, ts, signed_by],
@@ -219,7 +232,7 @@ pub fn sign_for_task(
     .context("insert task_envelope")?;
 
     if let Some(old_id) = prev_active_id {
-        let updated = tx.execute(
+        let updated = conn.execute(
             "UPDATE task_envelopes SET superseded_by = ?1 WHERE id = ?2 AND superseded_by IS NULL",
             params![id, old_id],
         )?;
@@ -228,7 +241,7 @@ pub fn sign_for_task(
         }
     }
 
-    let task_updated = tx.execute(
+    let task_updated = conn.execute(
         "UPDATE tasks SET active_envelope_id = ?1 WHERE id = ?2",
         params![id, task_id],
     )?;
@@ -237,9 +250,7 @@ pub fn sign_for_task(
         bail!("TASK_NOT_FOUND: task not found: {}", task_id);
     }
 
-    tx.commit().context("commit envelope sign")?;
-
-    get(conn, &id)?.ok_or_else(|| anyhow::anyhow!("envelope vanished after commit"))
+    get(conn, &id)?.ok_or_else(|| anyhow::anyhow!("envelope vanished after sign"))
 }
 
 fn map_envelope(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEnvelope> {

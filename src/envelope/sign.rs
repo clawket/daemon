@@ -18,7 +18,7 @@
 //! sign-time would break the documented advisory semantics. Only
 //! `Severity::Error` aborts the sign.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 use serde_json::Value;
 
 use crate::envelope::validate::{validate_envelope, Severity, Violation};
@@ -89,8 +89,24 @@ pub fn sign_envelope(
     value: &Value,
     signed_by: &str,
 ) -> Result<TaskEnvelope, EnvelopeSignError> {
+    let tx = conn.transaction()?;
+    let env = sign_envelope_in_tx(&tx, task_id, value, signed_by)?;
+    tx.commit()?;
+    Ok(env)
+}
+
+/// Tx-aware variant of [`sign_envelope`]: validates + persists the new
+/// envelope inside the caller-owned transaction WITHOUT committing, so a
+/// route handler can wrap `tasks::create_in_tx` + `sign_envelope_in_tx` in
+/// one transaction (D2 atomicity: a rejected envelope leaves no orphan task).
+pub fn sign_envelope_in_tx(
+    conn: &Transaction,
+    task_id: &str,
+    value: &Value,
+    signed_by: &str,
+) -> Result<TaskEnvelope, EnvelopeSignError> {
     let json = serde_json::to_string(value)?;
-    sign_envelope_from_json(conn, task_id, value, &json, signed_by)
+    sign_envelope_from_json_in_tx(conn, task_id, value, &json, signed_by)
 }
 
 /// Variant for callers that have an already-serialized JSON string with
@@ -105,6 +121,21 @@ pub fn sign_envelope(
 /// invariant by validating one shape and persisting another.
 pub fn sign_envelope_from_json(
     conn: &mut Connection,
+    task_id: &str,
+    value: &Value,
+    json: &str,
+    signed_by: &str,
+) -> Result<TaskEnvelope, EnvelopeSignError> {
+    let tx = conn.transaction()?;
+    let env = sign_envelope_from_json_in_tx(&tx, task_id, value, json, signed_by)?;
+    tx.commit()?;
+    Ok(env)
+}
+
+/// Tx-aware variant of [`sign_envelope_from_json`]: validates + persists
+/// inside the caller-owned transaction WITHOUT committing (D2 atomicity).
+pub fn sign_envelope_from_json_in_tx(
+    conn: &Transaction,
     task_id: &str,
     value: &Value,
     json: &str,
@@ -128,7 +159,8 @@ pub fn sign_envelope_from_json(
             .collect();
         return Err(EnvelopeSignError::Validation(errors));
     }
-    task_envelopes::sign_for_task(conn, task_id, json, signed_by).map_err(EnvelopeSignError::from)
+    task_envelopes::sign_for_task_in_tx(conn, task_id, json, signed_by)
+        .map_err(EnvelopeSignError::from)
 }
 
 /// Compose the resolved envelope that *would* exist after persisting
