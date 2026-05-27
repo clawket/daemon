@@ -15,7 +15,7 @@ Clawket 의 **상태 계층 데몬**. Axum HTTP + Unix socket 으로 CLI / 웹 �
 | `tokenizers` | 0.21 (onig) | `Cargo.toml:38` |
 | `tower-http` | 0.6 (trace, cors) | `Cargo.toml:24` |
 | `clap` | 4 (derive) | `Cargo.toml:28` |
-| Crate / binary name | `clawketd` (version `0.2.4`) | `Cargo.toml:2-3,12-14` |
+| Crate / binary name | `clawketd` (version `0.3.3`) | `Cargo.toml:2-3,12-14` |
 
 Embedding model: `paraphrase-multilingual-MiniLM-L12-v2` (384d).
 
@@ -46,7 +46,7 @@ Request flow: **`routes/*` (HTTP) → `repo/*` (SQL) → `db.rs` (pool)**. SSE �
 | Invariant | Mechanism | Evidence |
 |---|---|---|
 | `EVIDENCE_REQUIRED` — `task.status=done` 전환 시 비어있지 않은 `evidence` 필수 | `repo::tasks::update` 가 `bail!("EVIDENCE_REQUIRED: …")`, `routes::error` 가 HTTP 400 + code 로 변환 | `src/repo/tasks.rs:654-658`, `src/routes/error.rs:204-206` |
-| `SCHEMA_VERSION_MAX` 는 **하나의 상수**가 단일 진실 | `pub const SCHEMA_VERSION_MAX: i64 = 25;` — migrate 함수가 동일 상수만 참조 | `src/db.rs:16` (헤드 비교 `:265,:424`) |
+| `SCHEMA_VERSION_MAX` 는 **하나의 상수**가 단일 진실 | `pub const SCHEMA_VERSION_MAX: i64 = 26;` — migrate 함수가 동일 상수만 참조 | `src/db.rs:16` (헤드 비교 `:286,:442`) |
 | Path separation (LM-8): data / cache / config / state / db 가 `~/.claude/plugins/` 하위로 잡히면 데몬 기동 거부 | `Paths::resolve()` 가 다섯 경로 모두에 `ensure_no_plugin_overlap` 실행. `CLAWKET_ALLOW_PLUGIN_OVERLAP=1` 로만 우회 가능 (데이터 손실 인지 의미) | `src/paths.rs:57-62`, 검사 함수 `:367` |
 | `/knowledge/*` 라우트가 정본 표면 — SSE 이벤트 `knowledge:{created,updated,deleted}` 발행 | 라우트 파일은 `routes/artifacts.rs` 에 위치 (`/knowledge` mount, `app.emit("knowledge:created/updated/deleted", …)`). 정적 mapping 은 `state.rs` | `src/routes/artifacts.rs:16-23,117,134,189`, `src/state.rs:182-184` |
 | TCP 리스너는 **반드시** `X-Clawket-Token` 헤더 또는 `clawket_session` HttpOnly 쿠키 + mutating 요청에 Origin/Referer 가드. Unix socket 은 인증 면제 (local = trusted). `CLAWKET_TCP_AUTH=0` 로만 무력화 가능 | `middleware::tcp_auth::tcp_auth_layer`, 토큰은 `~/.cache/clawket/clawketd.token` 에 기동 시 재생성 | `src/middleware/tcp_auth.rs:25,34-99` |
@@ -108,6 +108,6 @@ cargo run -- restart --port 19400
 - 편집 전 후보 파일을 다시 읽는다. 편집 후 `cargo check` (또는 `cargo build`) 로 컴파일 확인. 보고 전 `cargo test` + `cargo clippy --all-targets`.
 - `EVIDENCE_REQUIRED`, LM-8 path invariant, TCP auth, `PUBLIC_BIND_NOT_ALLOWED` 가드는 **사용자가 명시적으로 변경 지시하지 않는 한 우회·약화 금지**. 우회용 env (`CLAWKET_ALLOW_PLUGIN_OVERLAP`, `CLAWKET_TCP_AUTH=0`) 를 새 코드에서 디폴트로 깔지 않는다.
 - `/knowledge/*` 라우트를 변경하면 **같은 커밋에서** `src/state.rs` 의 `knowledge:*` SSE 이벤트 mapping (`:182-184`) 을 함께 갱신한다. 이벤트명은 CLI / 웹이 의존하는 wire contract.
-- `SCHEMA_VERSION_MAX` 를 올릴 때는 반드시 `migrations/` 에 새 SQL 파일을 추가하고, `db.rs:16` 의 상수와 head 비교 (`:265,:424`) 가 새 번호로 일치하는지 확인.
+- `SCHEMA_VERSION_MAX` 를 올릴 때는 반드시 `migrations/` 에 새 SQL 파일을 추가하고, `db.rs:16` 의 상수와 head 비교 (`:286,:442`) 가 새 번호로 일치하는지 확인.
 - 새 라우트는 `routes/mod.rs::router()` 에 merge 하지 않으면 노출되지 않는다.
 - Unix socket 핸들러는 인증 면제 경로다 — 그쪽에 추가로 권한 분기를 박지 않는다 (local = trusted 가정 유지).

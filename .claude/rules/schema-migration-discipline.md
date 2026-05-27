@@ -11,9 +11,9 @@ SQLite 스키마 진화는 `db.rs` 의 `SCHEMA_VERSION_MAX` 상수와 `MIGRATION
 
 ## Evidence
 - `src/db.rs:14-16` — `pub const SCHEMA_VERSION_MAX: i64 = 26;` 가 단일 진실.
-- `src/db.rs:18-131` — `MIGRATIONS: &[(i64, &str, &str)]` 가 `(version, filename, include_str!)` 튜플로 SQL 본문을 바이너리에 임베드. 버전 번호는 단조 증가지만 일부 번호(9, 10)는 비어 있는 gap.
-- `src/db.rs:267-277` — `if current > SCHEMA_VERSION_MAX { bail!("SCHEMA_DOWNGRADE_REFUSED: ...") }` — 상위 버전 DB 에 대해서만 기동을 거부.
-- `src/db.rs:279-` — `MIGRATIONS` 를 순회하며 `version <= current` 는 skip, 그 이상은 트랜잭션 안에서 적용.
+- `src/db.rs:18-139` — `MIGRATIONS: &[(i64, &str, &str)]` 가 `(version, filename, include_str!)` 튜플로 SQL 본문을 바이너리에 임베드. 버전 번호는 단조 증가지만 일부 번호(9, 10)는 비어 있는 gap.
+- `src/db.rs:286-291` — `if current > SCHEMA_VERSION_MAX { bail!("SCHEMA_DOWNGRADE_REFUSED: ...") }` — 상위 버전 DB 에 대해서만 기동을 거부.
+- `src/db.rs:295-` — `MIGRATIONS` 를 순회하며 `version <= current` 는 skip, 그 이상은 트랜잭션 안에서 적용.
 
 ## Why not global
 글로벌 룰은 단일 진실 원칙은 다루지만, "상수 + 배열 + 파일 시스템 디렉터리 세 자원이 동기되어야 한다" 는 daemon 의 특정 구현 패턴은 이 repo 의 코드를 본 사람만 안다. 다른 sub-repo 는 SQLite 마이그레이션 책임이 없다.
@@ -36,4 +36,4 @@ SQLite 스키마 진화는 `db.rs` 의 `SCHEMA_VERSION_MAX` 상수와 `MIGRATION
 - 기존 `migrations/*.sql` 본문을 사후 편집하지 않는다(개행/주석 수정 포함). 이미 그 버전을 통과한 사용자 DB 와 신규 DB 사이의 정합성이 깨진다.
 - `MIGRATIONS` 배열에서 항목을 제거하거나 순서를 바꾸지 않는다.
 - `SCHEMA_VERSION_MAX` 만 bump 하고 배열을 갱신하지 않는다(반대도 금지).
-- 다운그레이드 가드(`db.rs:267-277`) 를 우회하거나 약화하지 않는다.
+- 다운그레이드 가드(`db.rs:286-291`) 를 우회하거나 약화하지 않는다.
