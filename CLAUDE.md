@@ -15,7 +15,7 @@ Clawket 의 **상태 계층 데몬**. Axum HTTP + Unix socket 으로 CLI / 웹 �
 | `tokenizers` | 0.21 (onig) | `Cargo.toml:38` |
 | `tower-http` | 0.6 (trace, cors) | `Cargo.toml:24` |
 | `clap` | 4 (derive) | `Cargo.toml:28` |
-| Crate / binary name | `clawketd` (version `0.3.3`) | `Cargo.toml:2-3,12-14` |
+| Crate / binary name | `clawketd` (버전은 `Cargo.toml` 정본) | `Cargo.toml:2-3,12-14` |
 
 Embedding model: `paraphrase-multilingual-MiniLM-L12-v2` (384d).
 
@@ -29,14 +29,14 @@ src/main.rs              # CLI entry (clap) → start / stop / status / restart
   ├── middleware/        # tcp_auth.rs (X-Clawket-Token / cookie + Origin guard)
   ├── routes/            # axum Router (HTTP surface; see routes/mod.rs)
   ├── repo/              # SQL-facing domain modules (tasks, plans, cycles, units,
-  │                      #   artifacts, comments, runs, …)
+  │                      #   knowledge, comments, runs, …)
   ├── db.rs              # rusqlite open + embedded migration runner
   ├── embeddings.rs      # candle-based embedder + sqlite-vec wiring
   ├── envelope/          # task envelope contract (ADR-0001)
   ├── decomposition/     # plan → unit → task decomposition helpers
   ├── jobs/              # background workers (embedding backfill, cascade)
   └── locale.rs / secrets/ / id.rs / git.rs / import_plan.rs / models.rs
-migrations/              # 001…025 SQL, embedded in binary
+migrations/              # 001…026 SQL, embedded in binary
 ```
 
 Request flow: **`routes/*` (HTTP) → `repo/*` (SQL) → `db.rs` (pool)**. SSE 이벤트는 `repo` 가 변경을 끝낸 직후 `routes` 에서 `app.emit("<entity>:<change>", json)` 호출, `state.rs` 가 정적 mapping 으로 broadcast 한다. 두 리스너 (TCP / Unix socket) 가 동일한 `Router` 를 공유하며 TCP 만 `middleware::tcp_auth_layer` 가 추가로 감싼다.
@@ -48,7 +48,7 @@ Request flow: **`routes/*` (HTTP) → `repo/*` (SQL) → `db.rs` (pool)**. SSE �
 | `EVIDENCE_REQUIRED` — `task.status=done` 전환 시 비어있지 않은 `evidence` 필수 | `repo::tasks::update` 가 `bail!("EVIDENCE_REQUIRED: …")`, `routes::error` 가 HTTP 400 + code 로 변환 | `src/repo/tasks.rs:654-658`, `src/routes/error.rs:204-206` |
 | `SCHEMA_VERSION_MAX` 는 **하나의 상수**가 단일 진실 | `pub const SCHEMA_VERSION_MAX: i64 = 26;` — migrate 함수가 동일 상수만 참조 | `src/db.rs:16` (헤드 비교 `:286,:442`) |
 | Path separation (LM-8): data / cache / config / state / db 가 `~/.claude/plugins/` 하위로 잡히면 데몬 기동 거부 | `Paths::resolve()` 가 다섯 경로 모두에 `ensure_no_plugin_overlap` 실행. `CLAWKET_ALLOW_PLUGIN_OVERLAP=1` 로만 우회 가능 (데이터 손실 인지 의미) | `src/paths.rs:57-62`, 검사 함수 `:367` |
-| `/knowledge/*` 라우트가 정본 표면 — SSE 이벤트 `knowledge:{created,updated,deleted}` 발행 | 라우트 파일은 `routes/artifacts.rs` 에 위치 (`/knowledge` mount, `app.emit("knowledge:created/updated/deleted", …)`). 정적 mapping 은 `state.rs` | `src/routes/artifacts.rs:16-23,117,134,189`, `src/state.rs:182-184` |
+| `/knowledge/*` 라우트가 정본 표면 — SSE 이벤트 `knowledge:{created,updated,deleted}` 발행 | 라우트 파일은 `routes/knowledge.rs` 에 위치 (`/knowledge` mount, `app.emit("knowledge:created/deleted/updated", …)`). 정적 mapping 은 `state.rs` | `src/routes/knowledge.rs:16-26,121,141,200`, `src/state.rs:188-190` |
 | TCP 리스너는 **반드시** `X-Clawket-Token` 헤더 또는 `clawket_session` HttpOnly 쿠키 + mutating 요청에 Origin/Referer 가드. Unix socket 은 인증 면제 (local = trusted). `CLAWKET_TCP_AUTH=0` 로만 무력화 가능 | `middleware::tcp_auth::tcp_auth_layer`, 토큰은 `~/.cache/clawket/clawketd.token` 에 기동 시 재생성 | `src/middleware/tcp_auth.rs:25,34-99` |
 | 공개 바인드 금지 (`PUBLIC_BIND_NOT_ALLOWED`) — 기본 host `127.0.0.1` | `main.rs` 의 host 가드, `routes/error.rs` 가 코드 매핑 | `src/main.rs:131-138`, `src/routes/error.rs:207-208`, 기본값 `src/config.rs:34-35` |
 | 기본 포트 `19400`, 점유 시 +1 (최대 20), `0` = OS 할당 | clap `default_value_t = 19400` | `src/config.rs:28-31` |
@@ -98,7 +98,7 @@ cargo run -- restart --port 19400
 - `clawket/docs/RELEASING.md` — 릴리스 순서·체크리스트
 - `clawket/docs/COMPATIBILITY.md` — daemon ↔ CLI ↔ web ↔ plugin 버전 범위
 - `clawket/docs/HOOK_ENFORCEMENT.md` — MCP 기반 훅 enforcement 설계
-- `clawket/components.json` — daemon 의 핀 버전 (v3 baseline)
+- `clawket/components.json` — daemon 의 핀 버전 (정본)
 
 위 내용은 이 파일에서 중복하지 않는다.
 

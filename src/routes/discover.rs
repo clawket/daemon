@@ -1269,7 +1269,7 @@ async fn convergence_status(
         .unwrap_or(false);
 
     // R3 DOGFOOD-035 fix: append a per-round decision line to a domain-scoped
-    // audit artifact ("convergence audit log — <도메인>"). The artifact
+    // audit knowledge entry ("convergence audit log — <도메인>"). The entry
     // accumulates: "R<n>: defect=X, scenario_error=Y, decision=...". Decision
     // is one of: converged | regression | continue.
     let domain = parse_round_plan_title(&plan.title)

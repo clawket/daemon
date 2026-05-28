@@ -3,7 +3,7 @@
 The Clawket state daemon — axum HTTP over a Unix socket, rusqlite + sqlite-vec
 for the work-management store, no remote services. The daemon is the single
 source of truth for projects, plans, units, cycles, tasks, runs, comments,
-artifacts, and envelope contracts (ADR-0001).
+knowledge, and envelope contracts (ADR-0001).
 
 ## Cross-repo workflow
 
