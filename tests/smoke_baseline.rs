@@ -441,73 +441,9 @@ async fn smoke_dashboard_picks_up_project_by_cwd() {
     );
 }
 
-// U7-T5: MCP RAG tools surface (5 tools listed).
-// Starts the MCP Rust binary from the sibling crate via a hand-rolled Command.
-// Skipped when the MCP binary isn't available in the release workspace.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn smoke_mcp_rag_tools_list() {
-    // The MCP binary lives in ../mcp/rust — built separately. Best effort here.
-    let candidates = [
-        "../mcp/rust/target/release/clawket-mcp-rs",
-        "../mcp/rust/target/debug/clawket-mcp-rs",
-    ];
-    let bin = candidates
-        .iter()
-        .find(|p| std::path::Path::new(p).is_file());
-    let bin = match bin {
-        Some(p) => *p,
-        None => {
-            eprintln!("[smoke] skip mcp: no built clawket-mcp-rs binary");
-            return;
-        }
-    };
-
-    use std::io::Write;
-    let mut child = Command::new(bin)
-        .env("CLAWKET_DAEMON_URL", "http://127.0.0.1:0")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn mcp");
-    {
-        let stdin = child.stdin.as_mut().expect("stdin");
-        writeln!(
-            stdin,
-            "{}",
-            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-        )
-        .unwrap();
-        writeln!(
-            stdin,
-            "{}",
-            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
-        )
-        .unwrap();
-    }
-    let out = child.wait_with_output().expect("wait mcp");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
-    let tools_resp: serde_json::Value = serde_json::from_str(lines[1]).expect("tools/list");
-    let names: Vec<&str> = tools_resp["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
-    for expected in [
-        "clawket_search_artifacts",
-        "clawket_search_tasks",
-        "clawket_find_similar_tasks",
-        "clawket_get_task_context",
-        "clawket_get_recent_decisions",
-    ] {
-        assert!(
-            names.contains(&expected),
-            "MCP should expose {expected}; got {names:?}"
-        );
-    }
-}
+// MCP tools/list surface is covered by the cli crate's tests/mcp_compat.rs
+// (spawns `clawket mcp` over stdio and asserts the v3 read-only tool set).
+// The daemon does not expose MCP, so no MCP smoke test lives here.
 
 // Legacy lattice→clawket migration was removed. Clawket now treats every install
 // as a fresh start and only emits a stderr warning when legacy data is detected.
