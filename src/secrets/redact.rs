@@ -5,6 +5,15 @@
 //! never appear in legitimate prose. The envelope create / update routes
 //! reject any such leaf — users must move the value into a vault and
 //! reference it through `secrets_ref`.
+//!
+//! Per-character Shannon entropy alone over-fires on natural language whose
+//! alphabet is large — most notably CJK (Korean / Chinese / Japanese), where
+//! nearly every character in a sentence is distinct, pushing per-char entropy
+//! well past 4.5 even though the text is plain prose. A pasted key/token has a
+//! distinct *structural* shape that prose never has: it is a single ASCII token
+//! with no whitespace. We therefore only flag a high-entropy leaf when it also
+//! looks like a key (see `looks_like_secret`), which exempts prose in any
+//! script.
 
 use serde_json::Value;
 
@@ -40,6 +49,19 @@ pub fn shannon_entropy(s: &str) -> f64 {
     h
 }
 
+/// Structural gate that distinguishes a pasted key/token from natural-language
+/// prose, applied before the entropy threshold so prose never trips it.
+///
+/// A real base64/hex/API key is a single ASCII token: it has no whitespace and
+/// no characters outside the ASCII range. Natural language always violates one
+/// of those — English/Latin prose carries spaces, and CJK (whose dense
+/// per-character entropy is the actual source of the false positive) carries
+/// non-ASCII letters. Requiring *both* "no whitespace" and "pure ASCII" keeps
+/// the detector firing on actual keys while exempting prose in any script.
+fn looks_like_secret(s: &str) -> bool {
+    s.is_ascii() && !s.chars().any(|c| c.is_whitespace())
+}
+
 /// Walk every string leaf of `value` and return the first leaf whose
 /// length AND entropy both exceed the thresholds. Returns `None` for
 /// "envelope looks clean".
@@ -59,7 +81,7 @@ fn walk(value: &Value, pointer: String, hit: &mut Option<EntropyHit>) {
     }
     match value {
         Value::String(s) => {
-            if s.len() > MIN_LENGTH {
+            if s.len() > MIN_LENGTH && looks_like_secret(s) {
                 let h = shannon_entropy(s);
                 if h > ENTROPY_THRESHOLD {
                     *hit = Some(EntropyHit {
@@ -214,5 +236,61 @@ mod tests {
         let err = reject_high_entropy_in_value(&v).unwrap_err();
         assert!(err.contains("/k"));
         assert!(err.contains("secrets_ref"));
+    }
+
+    #[test]
+    fn korean_prose_envelope_passes_despite_high_per_char_entropy() {
+        // Regression for #50: plain Korean envelope text has per-char Shannon
+        // entropy well above 4.5 (nearly every syllable is distinct) but is not
+        // a secret. It must pass.
+        let intent =
+            "데몬 라우트 핸들러에서 시나리오 식별자 검증 로직을 재구성하고 회귀 테스트를 추가한다";
+        assert!(
+            shannon_entropy(intent) > ENTROPY_THRESHOLD,
+            "precondition: korean prose entropy should exceed the threshold"
+        );
+        let v = json!({
+            "intent": intent,
+            "prompt_template": "주어진 시나리오를 만족하도록 데몬 라우트를 구현하세요.",
+            "success_criteria": "한국어 envelope 로 태스크가 secret 오탐 없이 생성된다"
+        });
+        assert!(
+            find_high_entropy(&v).is_none(),
+            "korean prose must not be flagged as a secret"
+        );
+    }
+
+    #[test]
+    fn high_entropy_english_with_whitespace_passes() {
+        // A long, information-dense English sentence with spaces is prose, not
+        // a key — whitespace alone exempts it even if entropy is borderline.
+        let v = json!({
+            "intent": "Migrate the linear gate graph into a reentrant cycle graph abstraction"
+        });
+        assert!(find_high_entropy(&v).is_none());
+    }
+
+    #[test]
+    fn cjk_without_whitespace_still_passes() {
+        // Even a Korean sentence with no spaces is prose (non-ASCII), so the
+        // whitespace heuristic is not the only thing exempting CJK.
+        let v = json!({"intent": "작업실행계획을수립하고검증가능한단위로분해한다"});
+        assert!(find_high_entropy(&v).is_none());
+    }
+
+    #[test]
+    fn ascii_key_without_whitespace_is_still_flagged() {
+        // The structural gate must NOT weaken detection of real pasted keys.
+        // (Synthetic high-entropy token with no provider prefix.)
+        let v = json!({"token": "Xk7Qm2Zv9Wb4Rt6Yn1Lp3Hs8Dg5Fj0Ca"});
+        let hit = find_high_entropy(&v).expect("real key must still be flagged");
+        assert_eq!(hit.pointer, "/token");
+    }
+
+    #[test]
+    fn looks_like_secret_gate() {
+        assert!(looks_like_secret("abcDEF0123456789ghijkl"));
+        assert!(!looks_like_secret("has a space in it somewhere here"));
+        assert!(!looks_like_secret("한글이라서ASCII아님"));
     }
 }
