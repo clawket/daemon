@@ -1114,10 +1114,16 @@ pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<Casc
                 ..Default::default()
             },
         )?;
+        // Auto-complete only when every task is terminal AND at least one was
+        // actually `done`. A plan whose tasks are *all* cancelled was not
+        // completed — it was emptied/corrected (e.g. mis-created tasks cancelled
+        // to re-author them). Cascading "completed" there closes the plan and
+        // makes the active cycle unrestartable (#51). `cancelled`-only stays open.
         let plan_done = !plan_tasks.is_empty()
             && plan_tasks
                 .iter()
-                .all(|t| TERMINAL.contains(&t.status.as_str()));
+                .all(|t| TERMINAL.contains(&t.status.as_str()))
+            && plan_tasks.iter().any(|t| t.status == "done");
         if plan_done {
             if let Some(plan) = plans::get(conn, &unit.plan_id)? {
                 if plan.status == "active" {
@@ -1145,10 +1151,15 @@ pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<Casc
                 ..Default::default()
             },
         )?;
+        // Same guard as the plan cascade (#51): a cycle whose tasks are all
+        // cancelled was emptied, not completed. Require at least one `done` so
+        // cancelling every task to correct it does not auto-complete (and thus
+        // freeze) the cycle.
         let cycle_done = !cycle_tasks.is_empty()
             && cycle_tasks
                 .iter()
-                .all(|t| TERMINAL.contains(&t.status.as_str()));
+                .all(|t| TERMINAL.contains(&t.status.as_str()))
+            && cycle_tasks.iter().any(|t| t.status == "done");
         if cycle_done {
             if let Some(cycle) = cycles::get(conn, cid)? {
                 if cycle.status == "active" {
@@ -2196,6 +2207,75 @@ mod tests {
         assert_eq!(plan.status, "completed");
         let cycle = cycles::get(&s.db.conn, &s.cycle_id).unwrap().unwrap();
         assert_eq!(cycle.status, "completed");
+    }
+
+    // #51: cancelling EVERY task in a cycle must NOT auto-complete the cycle or
+    // plan. All-cancelled means the work was emptied/corrected, not finished;
+    // auto-completing freezes the cycle (completed cycles cannot restart) and
+    // closes the plan, breaking the mis-create → cancel → re-author flow.
+    #[test]
+    fn cascade_does_not_complete_when_all_tasks_cancelled() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let mk = |conn: &mut Connection, unit_id: &str, cycle_id: &str, title: &str| -> Task {
+            create(
+                conn,
+                CreateInput {
+                    unit_id,
+                    title,
+                    body: None,
+                    assignee: None,
+                    idx: None,
+                    depends_on: vec![],
+                    parent_task_id: None,
+                    priority: None,
+                    complexity: None,
+                    estimated_edits: None,
+                    cycle_id: Some(cycle_id),
+                    reporter: None,
+                    type_: None,
+                    atomic_size_hint: None,
+                    decomposition_policy: None,
+                    tier: None,
+                    qa_status: None,
+                    scenario_id: None,
+                    defect_task: None,
+                    scenario_amendment: None,
+                    evidence: None,
+                    batch_id: None,
+                },
+            )
+            .unwrap()
+            .unwrap()
+        };
+
+        let t1 = mk(&mut s.db.conn, &s.unit_id, &s.cycle_id, "cancel-1");
+        let t2 = mk(&mut s.db.conn, &s.unit_id, &s.cycle_id, "cancel-2");
+        let t3 = mk(&mut s.db.conn, &s.unit_id, &s.cycle_id, "cancel-3");
+
+        for t in [&t1, &t2, &t3] {
+            update(
+                &mut s.db.conn,
+                &t.id,
+                UpdateFields {
+                    status: Some("cancelled".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let plan = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
+        assert_eq!(
+            plan.status, "active",
+            "plan must stay active when every task is merely cancelled"
+        );
+        let cycle = cycles::get(&s.db.conn, &s.cycle_id).unwrap().unwrap();
+        assert_eq!(
+            cycle.status, "active",
+            "cycle must stay active (restartable) when every task is cancelled"
+        );
     }
 
     // LM-11031: once cascade_complete promotes the plan to `completed`,
