@@ -293,56 +293,42 @@ pub fn remove_token_file(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// FIX-DAEMON-110: SOCKET_BUSY detection.
-/// Before removing a stale socket, check if a previous daemon process is still
-/// alive by reading the pid file. If the process is alive, bail with SOCKET_BUSY
-/// so the caller (CLI restart logic) can surface the right error.
+/// FIX-DAEMON-110 / FIX-DAEMON-115: SOCKET_BUSY detection via connect-probe.
+///
+/// Liveness is decided by whether a daemon actually ANSWERS on the socket, not
+/// by whether a pid exists. A force-killed daemon can become a zombie
+/// (`<defunct>`) whose pid still satisfies `kill(pid, 0)` / `/proc/<pid>`,
+/// producing a false "alive" that wrongly blocked restart. The single source of
+/// truth is therefore a real `UnixStream::connect`:
+/// - `Ok(_)`  => a live daemon is listening (genuinely busy) -> bail SOCKET_BUSY.
+/// - `Err(_)` => ENOENT / ECONNREFUSED / etc.; the socket file is stale (no
+///   listener, e.g. left behind by a crashed/zombie daemon) -> remove it and
+///   proceed so bind can succeed.
 pub fn prepare_socket_path(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create socket parent dir: {}", parent.display()))?;
     }
     if path.exists() {
-        // Attempt to detect if a live process owns this socket via the pid file.
-        // pid file lives in the same cache dir as the socket.
-        let pid_file = path.with_file_name("clawketd.pid");
-        if let Some(pid) = read_pid_file(&pid_file) {
-            if process_is_alive(pid) {
+        // Probe the socket: a successful connect means a daemon is genuinely
+        // listening. A zombie pid cannot answer, so its leftover socket fails
+        // here and is treated as stale.
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => {
                 anyhow::bail!(
-                    "SOCKET_BUSY: another clawketd process (pid={}) is already listening on {}. \
+                    "SOCKET_BUSY: another clawketd is already listening on {}. \
                      Stop it first with `clawket daemon stop`.",
-                    pid,
                     path.display()
                 );
             }
+            Err(_) => {
+                // No listener answered — the socket file is stale; remove it so
+                // the subsequent bind can recreate it.
+                let _ = std::fs::remove_file(path);
+            }
         }
-        // Either no pid file or process is dead — safe to remove stale socket.
-        let _ = std::fs::remove_file(path);
     }
     Ok(())
-}
-
-/// FIX-DAEMON-110: Check if a process with the given PID is alive (best-effort).
-/// Uses `/proc/<pid>` on Linux; `kill -0` via std::Command on macOS/BSD.
-fn process_is_alive(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/proc/{}", pid)).exists()
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        // macOS / BSD: use `kill -0 <pid>` via shell
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
 }
 
 /// FIX-DAEMON-019: Set socket file to 0600 after bind.
@@ -442,6 +428,52 @@ mod tests {
             ensure_no_plugin_overlap("data", &p, true).is_ok(),
             "allow_overlap=true should not error"
         );
+    }
+
+    // FIX-DAEMON-115: a leftover socket FILE with no listener (e.g. left by a
+    // crashed/zombie daemon) must be treated as stale: prepare_socket_path
+    // removes it and returns Ok so a fresh bind can succeed.
+    #[test]
+    fn prepare_removes_stale_socket_with_no_listener() {
+        let dir =
+            std::env::temp_dir().join(format!("clawket-paths-test-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("clawketd.sock");
+        // Create a plain file at the socket path — nothing is listening on it.
+        std::fs::write(&sock, b"").unwrap();
+        assert!(sock.exists());
+
+        let r = prepare_socket_path(&sock);
+        assert!(r.is_ok(), "stale socket should be cleaned, got: {r:?}");
+        assert!(!sock.exists(), "stale socket file must be removed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // FIX-DAEMON-115: a real bound UnixListener means a daemon is genuinely
+    // listening — prepare_socket_path must bail SOCKET_BUSY (connect succeeds).
+    #[test]
+    fn prepare_bails_when_listener_is_bound() {
+        let dir =
+            std::env::temp_dir().join(format!("clawket-paths-test-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("clawketd.sock");
+        let _ = std::fs::remove_file(&sock);
+
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let r = prepare_socket_path(&sock);
+        assert!(r.is_err(), "a live listener must be reported busy");
+        let err = format!("{:#}", r.unwrap_err());
+        assert!(
+            err.contains("SOCKET_BUSY"),
+            "error must signal SOCKET_BUSY, got: {err}"
+        );
+        // The socket must NOT have been removed out from under the live listener.
+        assert!(sock.exists(), "live socket must be preserved");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
