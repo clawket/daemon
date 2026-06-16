@@ -117,30 +117,15 @@ pub fn create_in_tx(conn: &Transaction, input: CreateInput<'_>) -> Result<String
         }
     }
 
-    let mut cycle_id = input.cycle_id.map(String::from);
-    if cycle_id.is_none() {
-        if let Some(ref u) = unit {
-            if let Some(plan) = plans::get(conn, &u.plan_id)? {
-                let actives = cycles::list(
-                    conn,
-                    cycles::ListFilter {
-                        project_id: Some(&plan.project_id),
-                        status: Some("active"),
-                        unit_id: None,
-                    },
-                )?;
-                if actives.len() == 1 {
-                    cycle_id = Some(actives[0].id.clone());
-                } else if actives.len() > 1 {
-                    let ids: Vec<String> = actives.iter().map(|c| c.id.clone()).collect();
-                    bail!(
-                        "Multiple active cycles found. Specify cycle_id: {}",
-                        ids.join(", ")
-                    );
-                }
-            }
-        }
-    }
+    // #9: cycle_id is taken verbatim from the caller — no auto-infer from the
+    // project's active cycle. The public create/subtask routes enforce
+    // API-TASK-001 (cycle_id required) at the HTTP boundary; the import path
+    // intentionally creates cycle-less backlog tasks (cycle assigned later).
+    // The previous auto-infer here silently bound such backlog/subtask rows to
+    // whatever single cycle happened to be active project-wide — an unrelated
+    // binding — and was the dead-policy remnant that caused the cycle-gate
+    // confusion (#9). A NULL cycle_id now stays NULL.
+    let cycle_id = input.cycle_id.map(String::from);
 
     let id = new_id("TASK");
     let ts = now_ms();

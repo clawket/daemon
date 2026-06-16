@@ -50,6 +50,25 @@ impl ApiError {
         }
     }
 
+    /// 400 carrying BOTH a stable `code` and a structured `details` payload.
+    /// #11: the aggregated task-create validation response uses this to keep the
+    /// top-level `error`/`code` identical to the legacy single-gate response
+    /// (backward compatibility) while attaching every violation under
+    /// `details.violations`.
+    pub fn bad_request_coded_with_details(
+        code: impl Into<String>,
+        msg: impl Into<String>,
+        details: Value,
+    ) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: msg.into(),
+            code: Some(code.into()),
+            details: Some(details),
+            flat_details: false,
+        }
+    }
+
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -165,32 +184,47 @@ impl From<crate::envelope::sign::EnvelopeSignError> for ApiError {
     }
 }
 
+/// Single source of truth for mapping a concrete `rusqlite::Error` to an
+/// `ApiError`. Returns `Some` only for the cases that carry a meaningful HTTP
+/// status (currently SQLITE_BUSY/LOCKED → 503, retryable); `None` means "no
+/// specific mapping — let the caller decide the fallback". Both the direct
+/// `From<rusqlite::Error>` and the `From<anyhow::Error>` chain-walk go through
+/// this, so a BUSY error maps to 503 whether or not a repo layer wrapped it in
+/// `.context(...)` (#10: the anyhow path previously truncated the root cause and
+/// fell through to an uninformative 500).
+fn map_rusqlite_status(err: &rusqlite::Error) -> Option<ApiError> {
+    if matches!(
+        err,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy,
+                ..
+            },
+            _
+        ) | rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseLocked,
+                ..
+            },
+            _
+        )
+    ) {
+        return Some(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!("SQLITE_BUSY: database is busy, retry shortly: {err}"),
+            code: Some("SQLITE_BUSY".to_string()),
+            details: None,
+            flat_details: false,
+        });
+    }
+    None
+}
+
 impl From<rusqlite::Error> for ApiError {
     fn from(err: rusqlite::Error) -> Self {
-        // SQLite BUSY → 503
-        if matches!(
-            err,
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ErrorCode::DatabaseBusy,
-                    ..
-                },
-                _
-            ) | rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ErrorCode::DatabaseLocked,
-                    ..
-                },
-                _
-            )
-        ) {
-            return ApiError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: format!("SQLITE_BUSY: database is busy, retry shortly: {err}"),
-                code: Some("SQLITE_BUSY".to_string()),
-                details: None,
-                flat_details: false,
-            };
+        // SQLite BUSY/LOCKED → 503 (retryable)
+        if let Some(api) = map_rusqlite_status(&err) {
+            return api;
         }
         ApiError::internal(err.to_string())
     }
@@ -305,6 +339,20 @@ impl From<anyhow::Error> for ApiError {
                 flat_details: false,
             };
         }
+        // #10: a repo layer that wraps a rusqlite error in `.context("insert
+        // task")` truncates the SQLite root cause when only the outermost
+        // context string is matched above. Walk the anyhow chain for the
+        // concrete `rusqlite::Error` and route it through the SAME status
+        // mapping as `From<rusqlite::Error>`, so an anyhow-wrapped BUSY becomes
+        // 503 (retryable) instead of an opaque 500.
+        if let Some(rsq) = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<rusqlite::Error>())
+        {
+            if let Some(api) = map_rusqlite_status(rsq) {
+                return api;
+            }
+        }
         // Generic heuristics
         if msg.contains("not found") || msg.contains("Not found") {
             return ApiError::not_found(msg);
@@ -317,11 +365,13 @@ impl From<anyhow::Error> for ApiError {
             || msg.contains("Cannot")
             || msg.contains("draft plan")
             || msg.contains("cannot be restarted")
-            || msg.contains("Multiple active")
         {
             return ApiError::bad_request(msg);
         }
-        ApiError::internal(msg)
+        // #10: surface the FULL anyhow chain (alternate format) instead of just
+        // the outermost context, so an otherwise-opaque 500 (e.g. "insert task")
+        // still carries the underlying SQLite/root-cause detail for diagnosis.
+        ApiError::internal(format!("{err:#}"))
     }
 }
 

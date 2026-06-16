@@ -11,7 +11,7 @@ use crate::envelope::sign as env_sign;
 use crate::envelope::validate as env_validate;
 use crate::git;
 use crate::models::{Task, TaskEnvelope};
-use crate::repo::{comments, locks, plans, projects, task_envelopes, tasks, units};
+use crate::repo::{comments, cycles, locks, plans, projects, task_envelopes, tasks, units};
 use crate::routes::error::{json_or_404, ApiError, ApiResult};
 use crate::routes::util::{norm_opt, value_to_opt_string};
 use crate::secrets::redact::reject_high_entropy_in_value;
@@ -205,6 +205,71 @@ fn task_with_envelope(conn: &rusqlite::Connection, task: Task) -> ApiResult<Task
     })
 }
 
+/// #9: Build the human hint + structured detail for a `MISSING_CYCLE_ID`
+/// rejection by naming the active cycle(s) of the project that `unit_id` belongs
+/// to. The whole point of API-TASK-001 is that the caller must pass `--cycle`
+/// explicitly; this makes the error self-sufficient (the exact cycle id to pass
+/// is in the message), so the caller never has to run `clawket cycle list` as a
+/// separate step. Returns `(human_suffix, active_cycle_json)`. Lookups are
+/// best-effort — any failure degrades to the generic 0-cycle suffix.
+fn missing_cycle_detail(conn: &rusqlite::Connection, unit_id: &str) -> (String, Vec<Value>) {
+    let actives = units::get(conn, unit_id)
+        .ok()
+        .flatten()
+        .and_then(|u| plans::get(conn, &u.plan_id).ok().flatten())
+        .and_then(|plan| {
+            cycles::list(
+                conn,
+                cycles::ListFilter {
+                    project_id: Some(&plan.project_id),
+                    unit_id: None,
+                    status: Some("active"),
+                },
+            )
+            .ok()
+        })
+        .unwrap_or_default();
+
+    let active_json: Vec<Value> = actives
+        .iter()
+        .map(|c| serde_json::json!({ "id": c.id, "title": c.title, "unit_id": c.unit_id }))
+        .collect();
+
+    let suffix = match actives.as_slice() {
+        [] => "No active cycle for this project — activate one first with `clawket cycle activate <CYCLE_ID>`.".to_string(),
+        [c] => format!("Active cycle: {} ('{}') — pass --cycle {}.", c.id, c.title, c.id),
+        many => format!(
+            "Active cycles: {} — pass one via --cycle <CYCLE_ID>.",
+            many.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    (suffix, active_json)
+}
+
+/// #11: Fold one-or-more pre-mutation task-create violations into a single
+/// `ApiError`. The first violation's `code`/`message` populate the top-level
+/// fields verbatim so clients that branch on the legacy single-gate response
+/// keep working; the full set is attached under `details.violations` so a
+/// caller can resolve every blocker in one round-trip instead of N.
+fn task_create_validation_error(violations: Vec<Value>) -> ApiError {
+    let first = violations.first();
+    let code = first
+        .and_then(|v| v.get("code"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("TASK_CREATE_VALIDATION")
+        .to_string();
+    let message = first
+        .and_then(|v| v.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("task create validation failed")
+        .to_string();
+    ApiError::bad_request_coded_with_details(
+        code,
+        message,
+        serde_json::json!({ "violations": violations }),
+    )
+}
+
 async fn create(
     State(app): State<AppState>,
     Json(body): Json<CreateBody>,
@@ -264,12 +329,28 @@ async fn create(
 
     let unit_id = unit_id
         .ok_or_else(|| ApiError::bad_request("unit_id required (or supply cwd for auto-infer)"))?;
-    // API-TASK-001: hard-require cycle_id.
+
+    // #11: collect every pre-mutation validation violation (cycle + required
+    // envelope fields) and report them in ONE response. Both checks are pure
+    // (no DB side-effect), and in practice a fresh `task create` trips both at
+    // once — the legacy sequential gates forced the caller to peel them off one
+    // round-trip at a time (MISSING_CYCLE_ID → fix → ENVELOPE_REQUIRED → fix).
+    // `task_create_validation_error` keeps the first violation's `error`/`code`
+    // byte-identical to the legacy single-gate response for backward
+    // compatibility and attaches the full set under `details.violations`.
+    let mut violations: Vec<Value> = Vec::new();
+
+    // API-TASK-001: hard-require cycle_id (#9: name the active cycle so the
+    // caller's next action is contained in the error itself).
     if cycle_id.is_none() {
-        return Err(ApiError::bad_request_coded(
-            "MISSING_CYCLE_ID",
-            "MISSING_CYCLE_ID: cycle_id is required when creating a task. Activate a cycle and pass --cycle <CYCLE_ID>.",
-        ));
+        let (hint, active_cycles) = missing_cycle_detail(&conn, &unit_id);
+        violations.push(serde_json::json!({
+            "code": "MISSING_CYCLE_ID",
+            "message": format!(
+                "MISSING_CYCLE_ID: cycle_id is required when creating a task. {hint}"
+            ),
+            "active_cycles": active_cycles,
+        }));
     }
 
     // Enforce required envelope fields (intent / prompt_template /
@@ -312,14 +393,19 @@ async fn create(
             .map(|v| v.field.clone())
             .collect();
         if !missing.is_empty() {
-            return Err(ApiError::bad_request_coded(
-                "ENVELOPE_REQUIRED_FIELDS_MISSING",
-                format!(
+            violations.push(serde_json::json!({
+                "code": "ENVELOPE_REQUIRED_FIELDS_MISSING",
+                "message": format!(
                     "ENVELOPE_REQUIRED_FIELDS_MISSING: required envelope fields missing on resolved chain: {}. Supply them in the `envelope` field (intent, prompt_template, success_criteria) or inherit from a parent task.",
                     missing.join(", ")
                 ),
-            ));
+                "fields": missing,
+            }));
         }
+    }
+
+    if !violations.is_empty() {
+        return Err(task_create_validation_error(violations));
     }
 
     // LM-11058: the entropy/secret guard is a pure validation with no DB
@@ -1160,6 +1246,24 @@ async fn create_subtask(
 
     let unit_id = norm_opt(body.unit_id).unwrap_or_else(|| parent.unit_id.clone());
     let cycle_id = norm_opt(body.cycle_id).or_else(|| parent.cycle_id.clone());
+    // #9: align the subtask route with the top-level create policy (API-TASK-001
+    // — cycle_id required). A subtask inherits the parent's cycle, but when the
+    // parent is a cycle-less backlog task and no `--cycle` is supplied, the
+    // request used to fall through to a now-removed repo auto-infer that bound
+    // the subtask to whatever single cycle happened to be active project-wide.
+    // Require an explicit/inherited cycle instead, with the same self-sufficient
+    // hint as the top-level gate.
+    if cycle_id.is_none() {
+        let (hint, active_cycles) = missing_cycle_detail(&conn, &unit_id);
+        return Err(task_create_validation_error(vec![serde_json::json!({
+            "code": "MISSING_CYCLE_ID",
+            "message": format!(
+                "MISSING_CYCLE_ID: cycle_id is required (parent task '{}' has no cycle; pass --cycle). {hint}",
+                parent.id
+            ),
+            "active_cycles": active_cycles,
+        })]));
+    }
     let body_text = norm_opt(body.body);
     let assignee = norm_opt(body.assignee);
     let priority = norm_opt(body.priority);
@@ -2227,6 +2331,91 @@ mod envelope {
         assert!(
             !missing_segment.contains("intent"),
             "intent was supplied — must not appear in missing list: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_cycle_error_names_the_active_cycle() {
+        // #9: MISSING_CYCLE_ID must be self-sufficient — it names the exact
+        // active cycle the caller should pass, so no separate `cycle list`
+        // round-trip is needed. The valid envelope here isolates the cycle gate.
+        let s = setup();
+        let (status, body) = post_task(
+            &s.app,
+            serde_json::json!({
+                "unit_id": s.unit_id,
+                "title": "T1",
+                "envelope": {
+                    "version": 1,
+                    "intent": "i",
+                    "prompt_template": "p",
+                    "success_criteria": ["ok"],
+                },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Backward compatibility: top-level code/error identical to the legacy
+        // single-gate response.
+        assert_eq!(
+            body["code"].as_str(),
+            Some("MISSING_CYCLE_ID"),
+            "body: {body}"
+        );
+        let err = body["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains(&s.cycle_id),
+            "MISSING_CYCLE_ID message must name the active cycle {}: {err}",
+            s.cycle_id
+        );
+        // Structured detail carries the active cycle for programmatic callers.
+        let violations = body["details"]["violations"]
+            .as_array()
+            .expect("violations");
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0]["code"], "MISSING_CYCLE_ID");
+        let actives = violations[0]["active_cycles"]
+            .as_array()
+            .expect("active_cycles");
+        assert!(
+            actives.iter().any(|c| c["id"] == s.cycle_id.as_str()),
+            "active_cycles must include {}: {body}",
+            s.cycle_id
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_cycle_and_envelope_are_aggregated_in_one_response() {
+        // #11: when both the cycle gate and the required-envelope gate fail,
+        // the caller learns BOTH in one response instead of peeling them off
+        // one round-trip at a time. The first violation keeps the legacy
+        // top-level code (MISSING_CYCLE_ID) for backward compatibility.
+        let s = setup();
+        let (status, body) = post_task(
+            &s.app,
+            serde_json::json!({"unit_id": s.unit_id, "title": "T1"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["code"].as_str(),
+            Some("MISSING_CYCLE_ID"),
+            "body: {body}"
+        );
+        let violations = body["details"]["violations"]
+            .as_array()
+            .expect("violations");
+        let codes: Vec<&str> = violations
+            .iter()
+            .filter_map(|v| v["code"].as_str())
+            .collect();
+        assert!(
+            codes.contains(&"MISSING_CYCLE_ID"),
+            "violations must include MISSING_CYCLE_ID: {body}"
+        );
+        assert!(
+            codes.contains(&"ENVELOPE_REQUIRED_FIELDS_MISSING"),
+            "violations must include ENVELOPE_REQUIRED_FIELDS_MISSING: {body}"
         );
     }
 }
