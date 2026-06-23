@@ -519,6 +519,7 @@ mod tests {
                 description: None,
                 source: None,
                 source_path: None,
+                auto_advance: false,
             },
         )
         .unwrap()

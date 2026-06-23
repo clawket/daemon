@@ -4,6 +4,7 @@ pub mod agents;
 pub mod audit;
 pub mod backlog;
 pub mod comments;
+pub mod continuation;
 pub mod cycles;
 pub mod dashboard;
 pub mod discover;
@@ -58,6 +59,7 @@ pub fn router() -> Router<AppState> {
         .merge(discover::router())
         .merge(wiki::router())
         .merge(handoff::router())
+        .merge(continuation::router())
         .merge(import_export::router())
         .merge(locks::router())
         .merge(usage::router())

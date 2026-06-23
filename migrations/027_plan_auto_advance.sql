@@ -1,0 +1,11 @@
+-- Migration 027: plan.auto_advance opt-in flag for Stop-hook auto-advance.
+--
+-- When a plan has auto_advance=1, the Claude Code Stop hook queries the
+-- /continuation endpoint and injects the next actionable step (next todo task,
+-- or next unit/phase) so the agent proceeds without a fresh user prompt. When
+-- the plan has no remaining work, the hook allows the stop.
+--
+-- Opt-in by design (DEFAULT 0): existing plans keep the legacy behaviour where
+-- the agent stops at the end of every turn. Additive column only — no existing
+-- rows or schema are altered beyond the new column with a safe default.
+ALTER TABLE plans ADD COLUMN auto_advance INTEGER NOT NULL DEFAULT 0;

@@ -361,6 +361,11 @@ pub struct Plan {
     #[serde(serialize_with = "opt_ts_iso::serialize")]
     pub approved_at: Option<i64>,
     pub status: String,
+    /// Migration 027: opt-in Stop-hook auto-advance. When true, the Stop hook
+    /// injects the next actionable step instead of letting the agent stop while
+    /// the plan still has remaining work.
+    #[serde(default)]
+    pub auto_advance: bool,
 }
 
 // ---------------------------------------------------------------------------

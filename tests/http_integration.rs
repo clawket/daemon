@@ -339,6 +339,230 @@ async fn dashboard_empty_when_no_project() {
     assert_eq!(resp["context"], "");
 }
 
+/// Migration 027: GET /continuation drives the Stop-hook auto-advance.
+/// Verifies the actionable walk (next todo task → next todo task) and the
+/// opt-in gate (auto_advance=0 ⇒ always null).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continuation_reports_next_actionable_for_auto_advance_plan() {
+    let d = DaemonHandle::spawn().await;
+    let client = d.client();
+    let cwd = "/tmp/itest-continuation-aa";
+
+    // Project bound to a cwd so /continuation resolves it explicitly.
+    let project: serde_json::Value = client
+        .post(format!("{}/projects", d.base_url))
+        .json(&serde_json::json!({"name": "cont-aa", "key": "CAA", "cwd": cwd}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let project_id = project["id"].as_str().unwrap().to_string();
+
+    // Plan with auto_advance=true, approved.
+    let plan: serde_json::Value = client
+        .post(format!("{}/plans", d.base_url))
+        .json(&serde_json::json!({
+            "project_id": project_id, "title": "cont plan", "auto_advance": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let plan_id = plan["id"].as_str().unwrap().to_string();
+    assert_eq!(plan["auto_advance"], true);
+    let _ = client
+        .post(format!("{}/plans/{}/approve", d.base_url, plan_id))
+        .send()
+        .await
+        .unwrap();
+
+    // Unit + active cycle.
+    let unit: serde_json::Value = client
+        .post(format!("{}/units", d.base_url))
+        .json(&serde_json::json!({"plan_id": plan_id, "title": "U1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let unit_id = unit["id"].as_str().unwrap().to_string();
+    let cycle: serde_json::Value = client
+        .post(format!("{}/cycles", d.base_url))
+        .json(&serde_json::json!({
+            "project_id": project_id, "unit_id": unit_id, "title": "C1"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cycle_id = cycle["id"].as_str().unwrap().to_string();
+    let _ = client
+        .post(format!("{}/cycles/{}/activate", d.base_url, cycle_id))
+        .send()
+        .await
+        .unwrap();
+
+    // Two todo tasks (idx 0, idx 1).
+    let mk_task = |title: &'static str| {
+        let client = client.clone();
+        let base = d.base_url.clone();
+        let unit_id = unit_id.clone();
+        let cycle_id = cycle_id.clone();
+        async move {
+            let t: serde_json::Value = client
+                .post(format!("{base}/tasks"))
+                .json(&serde_json::json!({
+                    "unit_id": unit_id,
+                    "cycle_id": cycle_id,
+                    "title": title,
+                    "envelope": {
+                        "intent": title,
+                        "prompt_template": "p",
+                        "success_criteria": ["ok"],
+                    },
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            t["id"].as_str().unwrap().to_string()
+        }
+    };
+    let t1 = mk_task("T1").await;
+    let _t2 = mk_task("T2").await;
+
+    // (1) /continuation → next is the first todo task (T1).
+    let resp: serde_json::Value = client
+        .get(format!("{}/continuation?cwd={}", d.base_url, cwd))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["next"]["kind"], "task");
+    assert_eq!(resp["next"]["id"], t1);
+    assert_eq!(resp["next"]["title"], "T1");
+    assert!(resp["instruction"].as_str().unwrap().contains("T1"));
+
+    // (2) Cancel T1 (terminal, no evidence needed) → next is T2.
+    let _ = client
+        .patch(format!("{}/tasks/{}", d.base_url, t1))
+        .json(&serde_json::json!({"status": "cancelled"}))
+        .send()
+        .await
+        .unwrap();
+    let resp2: serde_json::Value = client
+        .get(format!("{}/continuation?cwd={}", d.base_url, cwd))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp2["next"]["kind"], "task");
+    assert_eq!(resp2["next"]["title"], "T2");
+}
+
+/// Migration 027: a plan with auto_advance=0 must never drive auto-advance —
+/// /continuation returns `{ next: null }` even with pending todo tasks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continuation_null_when_auto_advance_disabled() {
+    let d = DaemonHandle::spawn().await;
+    let client = d.client();
+    let cwd = "/tmp/itest-continuation-off";
+
+    let project: serde_json::Value = client
+        .post(format!("{}/projects", d.base_url))
+        .json(&serde_json::json!({"name": "cont-off", "key": "COF", "cwd": cwd}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let project_id = project["id"].as_str().unwrap().to_string();
+
+    // Plan WITHOUT auto_advance (defaults false).
+    let plan: serde_json::Value = client
+        .post(format!("{}/plans", d.base_url))
+        .json(&serde_json::json!({"project_id": project_id, "title": "off plan"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let plan_id = plan["id"].as_str().unwrap().to_string();
+    assert_eq!(plan["auto_advance"], false);
+    let _ = client
+        .post(format!("{}/plans/{}/approve", d.base_url, plan_id))
+        .send()
+        .await
+        .unwrap();
+
+    let unit: serde_json::Value = client
+        .post(format!("{}/units", d.base_url))
+        .json(&serde_json::json!({"plan_id": plan_id, "title": "U1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let unit_id = unit["id"].as_str().unwrap().to_string();
+    let cycle: serde_json::Value = client
+        .post(format!("{}/cycles", d.base_url))
+        .json(&serde_json::json!({
+            "project_id": project_id, "unit_id": unit_id, "title": "C1"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cycle_id = cycle["id"].as_str().unwrap().to_string();
+    let _ = client
+        .post(format!("{}/cycles/{}/activate", d.base_url, cycle_id))
+        .send()
+        .await
+        .unwrap();
+    let _t: serde_json::Value = client
+        .post(format!("{}/tasks", d.base_url))
+        .json(&serde_json::json!({
+            "unit_id": unit_id,
+            "cycle_id": cycle_id,
+            "title": "T1",
+            "envelope": {"intent": "i", "prompt_template": "p", "success_criteria": ["ok"]},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let resp: serde_json::Value = client
+        .get(format!("{}/continuation?cwd={}", d.base_url, cwd))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(resp["next"].is_null());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn handoff_returns_no_project_message() {
     let d = DaemonHandle::spawn().await;

@@ -170,6 +170,7 @@ async fn start(
             description: description.as_deref(),
             source: Some("discover-loop"),
             source_path: None,
+            auto_advance: false,
         },
     )?
     .ok_or_else(|| ApiError::internal("plan creation returned None"))?;

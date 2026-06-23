@@ -68,6 +68,9 @@ struct CreateBody {
     description: Option<String>,
     source: Option<String>,
     source_path: Option<String>,
+    /// Migration 027: opt-in Stop-hook auto-advance (default false when omitted).
+    #[serde(default)]
+    auto_advance: bool,
 }
 
 async fn create(
@@ -87,6 +90,7 @@ async fn create(
             description: description.as_deref(),
             source: source.as_deref(),
             source_path: source_path.as_deref(),
+            auto_advance: body.auto_advance,
         },
     )?)
 }
@@ -249,6 +253,15 @@ async fn update(
     }
     if let Some(v) = obj.get("approved_at") {
         f.approved_at = Some(v.as_i64());
+    }
+    // Migration 027: accept a boolean OR 0/1 integer for ergonomic toggling
+    // from both JSON clients and the CLI (`--auto-advance true`).
+    if let Some(v) = obj.get("auto_advance") {
+        let val = v
+            .as_bool()
+            .or_else(|| v.as_i64().map(|n| n != 0))
+            .ok_or_else(|| ApiError::bad_request("auto_advance must be a boolean"))?;
+        f.auto_advance = Some(val);
     }
     let result = plans::update(&app.conn(), &id, f)?;
     if result.is_some() {

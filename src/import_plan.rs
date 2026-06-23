@@ -1224,6 +1224,7 @@ pub fn import_parsed_plan(
             description,
             source: Some(opts.source),
             source_path: opts.source_path,
+            auto_advance: false,
         },
     )?
     .ok_or_else(|| anyhow::anyhow!("plan create failed"))?;

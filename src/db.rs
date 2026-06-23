@@ -13,7 +13,7 @@ pub type SqlitePooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 
 /// Maximum schema version this binary supports. If the on-disk DB reports a
 /// higher version, the daemon refuses to start (downgrade guard).
-pub const SCHEMA_VERSION_MAX: i64 = 26;
+pub const SCHEMA_VERSION_MAX: i64 = 27;
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
@@ -135,6 +135,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         26,
         "026_envelope_predicate_to_knowledge.sql",
         include_str!("../migrations/026_envelope_predicate_to_knowledge.sql"),
+    ),
+    (
+        27,
+        "027_plan_auto_advance.sql",
+        include_str!("../migrations/027_plan_auto_advance.sql"),
     ),
 ];
 

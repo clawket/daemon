@@ -2055,6 +2055,7 @@ mod envelope {
                 description: None,
                 source: None,
                 source_path: None,
+                auto_advance: false,
             },
         )
         .unwrap()
@@ -2479,6 +2480,7 @@ mod get_envelope {
                 description: None,
                 source: None,
                 source_path: None,
+                auto_advance: false,
             },
         )
         .unwrap()
@@ -2973,6 +2975,7 @@ mod envelope_history {
                 description: None,
                 source: None,
                 source_path: None,
+                auto_advance: false,
             },
         )
         .unwrap()
@@ -3250,6 +3253,7 @@ mod subtasks {
                 description: None,
                 source: None,
                 source_path: None,
+                auto_advance: false,
             },
         )
         .unwrap()
@@ -3665,6 +3669,7 @@ mod tree {
                 description: None,
                 source: None,
                 source_path: None,
+                auto_advance: false,
             },
         )
         .unwrap()
@@ -4158,6 +4163,7 @@ mod planned_sha_autofill {
                 description: None,
                 source: None,
                 source_path: None,
+                auto_advance: false,
             },
         )
         .unwrap()
@@ -4452,6 +4458,7 @@ mod drift {
                 description: None,
                 source: None,
                 source_path: None,
+                auto_advance: false,
             },
         )
         .unwrap()
@@ -4820,6 +4827,7 @@ mod conditions_hook {
                 description: None,
                 source: None,
                 source_path: None,
+                auto_advance: false,
             },
         )
         .unwrap()
@@ -5131,6 +5139,7 @@ mod entropy_hook {
                 description: None,
                 source: None,
                 source_path: None,
+                auto_advance: false,
             },
         )
         .unwrap()
@@ -5384,6 +5393,7 @@ mod lease {
                 description: None,
                 source: None,
                 source_path: None,
+                auto_advance: false,
             },
         )
         .unwrap()
