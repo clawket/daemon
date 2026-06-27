@@ -14,6 +14,16 @@
 //! with no whitespace. We therefore only flag a high-entropy leaf when it also
 //! looks like a key (see `looks_like_secret`), which exempts prose in any
 //! script.
+//!
+//! Whitespace is not the only ASCII prose shape, though. Dense English
+//! identifier text — camelCase / snake_case success criteria, acronym-laden
+//! descriptions — is ASCII *and* whitespace-free, yet routinely clears 4.5
+//! bits/char (observed 4.56–4.61 during INV-37 registration; see LM-11091).
+//! Entropy alone cannot separate it from an opaque token. A second linguistic
+//! signal can: English keeps a vowel-to-letter ratio around 0.35–0.45, while a
+//! base64/hex/random key — a uniform draw over a wide alphabet — lands near
+//! 0.19. `looks_like_secret` therefore also exempts whitespace-free leaves whose
+//! vowel ratio reads as natural language (see `is_word_dense`).
 
 use serde_json::Value;
 
@@ -22,6 +32,16 @@ use serde_json::Value;
 /// 4.0-4.4 bits/char; anything above 4.5 with ≥20 characters is suspect.
 pub const ENTROPY_THRESHOLD: f64 = 4.5;
 pub const MIN_LENGTH: usize = 20;
+
+/// Vowel-to-letter ratio floor below which an ASCII, whitespace-free leaf is
+/// treated as a possible secret rather than identifier prose (LM-11091).
+///
+/// English text (including camelCase identifiers and acronym-mixed
+/// descriptions) sits around 0.35–0.45; a uniform random token over a
+/// base64/hex alphabet lands near 0.19. A floor of 0.26 sits comfortably
+/// between the two populations, so real keys stay flagged while dense English
+/// success criteria pass.
+pub const MIN_NATURAL_VOWEL_RATIO: f64 = 0.26;
 
 #[derive(Debug, PartialEq)]
 pub struct EntropyHit {
@@ -58,8 +78,31 @@ pub fn shannon_entropy(s: &str) -> f64 {
 /// per-character entropy is the actual source of the false positive) carries
 /// non-ASCII letters. Requiring *both* "no whitespace" and "pure ASCII" keeps
 /// the detector firing on actual keys while exempting prose in any script.
+///
+/// One ASCII prose shape slips past the whitespace gate: dense English
+/// identifier text (camelCase / snake_case / acronym-laden) has no spaces. We
+/// additionally exempt any leaf whose vowel ratio reads as natural language
+/// (see `is_word_dense`), which keeps the detector firing on opaque tokens
+/// while letting whitespace-free English through (LM-11091).
 fn looks_like_secret(s: &str) -> bool {
-    s.is_ascii() && !s.chars().any(|c| c.is_whitespace())
+    s.is_ascii() && !s.chars().any(|c| c.is_whitespace()) && !is_word_dense(s)
+}
+
+/// Returns true when the ASCII letters in `s` carry a natural-language vowel
+/// ratio (≥ `MIN_NATURAL_VOWEL_RATIO`), i.e. the leaf reads as English/identifier
+/// prose rather than a uniform-random token. Leaves with no ASCII letters
+/// (pure digits/symbols) return `false` — they are not prose and should fall
+/// through to the entropy check.
+fn is_word_dense(s: &str) -> bool {
+    let letters = s.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    if letters == 0 {
+        return false;
+    }
+    let vowels = s
+        .chars()
+        .filter(|c| matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u'))
+        .count();
+    (vowels as f64) / (letters as f64) >= MIN_NATURAL_VOWEL_RATIO
 }
 
 /// Walk every string leaf of `value` and return the first leaf whose
@@ -292,5 +335,43 @@ mod tests {
         assert!(looks_like_secret("abcDEF0123456789ghijkl"));
         assert!(!looks_like_secret("has a space in it somewhere here"));
         assert!(!looks_like_secret("한글이라서ASCII아님"));
+        // Dense English camelCase reads as prose, not a key (LM-11091).
+        assert!(!looks_like_secret(
+            "WebhookRetryUsesExponentialBackoffJitter"
+        ));
+    }
+
+    #[test]
+    fn is_word_dense_classifies_english_vs_tokens() {
+        // English / camelCase identifier prose: vowel ratio ~0.35–0.45.
+        assert!(is_word_dense("WebhookRetryUsesExponentialBackoffJitter"));
+        assert!(is_word_dense(
+            "PlanAgentInceptionBackboneStyleSuccessCriteria"
+        ));
+        // Opaque tokens: vowel ratio near 0.19, well below the floor.
+        assert!(!is_word_dense("Xk7Qm2Zv9Wb4Rt6Yn1Lp3Hs8Dg5Fj0Ca"));
+        assert!(!is_word_dense("abcdefghijklmnopqrstuvwxyz0123456789ABCDE"));
+        // No ASCII letters at all → not prose, falls through to entropy.
+        assert!(!is_word_dense("0123456789012345678901234"));
+    }
+
+    #[test]
+    fn camelcase_english_envelope_passes_despite_high_entropy() {
+        // Regression for LM-11091: a dense English camelCase success_criteria is
+        // ASCII and whitespace-free, and its per-char entropy clears 4.5 — yet it
+        // is prose, not a secret, and must not be flagged.
+        let criteria = "WebhookRetryUsesExponentialBackoffJitterAndIdempotencyKeyV3";
+        assert!(
+            shannon_entropy(criteria) > ENTROPY_THRESHOLD,
+            "precondition: camelCase criteria entropy should exceed the threshold"
+        );
+        let v = json!({
+            "intent": "HardenWebhookDelivery",
+            "success_criteria": criteria,
+        });
+        assert!(
+            find_high_entropy(&v).is_none(),
+            "dense English camelCase must not be flagged as a secret"
+        );
     }
 }
