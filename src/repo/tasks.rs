@@ -365,8 +365,29 @@ pub fn list(conn: &Connection, filter: ListFilter<'_>) -> Result<Vec<Task>> {
         vals.push(u.to_string().into());
     }
     if let Some(s) = filter.status {
-        clauses.push("s.status = ?".into());
-        vals.push(s.to_string().into());
+        // LM-11092: the status filter accepts a comma-separated list and
+        // matches any of the given statuses (OR). A single status — the common
+        // case, and what every internal caller passes — is the degenerate
+        // one-element list. Empty segments (e.g. trailing commas) are ignored.
+        let statuses: Vec<&str> = s
+            .split(',')
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .collect();
+        match statuses.as_slice() {
+            [] => {}
+            [single] => {
+                clauses.push("s.status = ?".into());
+                vals.push((*single).to_string().into());
+            }
+            many => {
+                let placeholders = vec!["?"; many.len()].join(", ");
+                clauses.push(format!("s.status IN ({placeholders})"));
+                for st in many {
+                    vals.push((*st).to_string().into());
+                }
+            }
+        }
     }
     if let Some(c) = filter.cycle_id {
         clauses.push("s.cycle_id = ?".into());
@@ -2636,5 +2657,90 @@ mod tests {
         let s = setup(true);
         let hits = keyword_search_envelope_only(&s.db.conn, "anything", 10).unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn list_status_filter_accepts_comma_separated_values() {
+        // LM-11092: `status` matches any of a comma-separated list of statuses.
+        let mut s = setup(true);
+        let mk = |conn: &mut rusqlite::Connection, unit: &str, title: &str| -> String {
+            create(
+                conn,
+                CreateInput {
+                    unit_id: unit,
+                    title,
+                    body: None,
+                    assignee: None,
+                    idx: None,
+                    depends_on: vec![],
+                    parent_task_id: None,
+                    priority: None,
+                    complexity: None,
+                    estimated_edits: None,
+                    cycle_id: None,
+                    reporter: None,
+                    type_: None,
+                    atomic_size_hint: None,
+                    decomposition_policy: None,
+                    tier: None,
+                    qa_status: None,
+                    scenario_id: None,
+                    defect_task: None,
+                    scenario_amendment: None,
+                    evidence: None,
+                    batch_id: None,
+                },
+            )
+            .unwrap()
+            .unwrap()
+            .id
+        };
+        let _t1 = mk(&mut s.db.conn, &s.unit_id, "T1");
+        let _t2 = mk(&mut s.db.conn, &s.unit_id, "T2");
+        let t3 = mk(&mut s.db.conn, &s.unit_id, "T3");
+        // todo → cancelled is a valid transition that needs neither an active
+        // cycle nor evidence, so it gives us a second status to filter on.
+        update(
+            &mut s.db.conn,
+            &t3,
+            UpdateFields {
+                status: Some("cancelled".to_string()),
+                ..UpdateFields::default()
+            },
+        )
+        .unwrap();
+
+        let count = |status: Option<&str>| -> usize {
+            list(
+                &s.db.conn,
+                ListFilter {
+                    unit_id: Some(&s.unit_id),
+                    status,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .len()
+        };
+
+        assert_eq!(count(Some("todo")), 2, "single status filters as before");
+        assert_eq!(count(Some("cancelled")), 1);
+        assert_eq!(
+            count(Some("todo,cancelled")),
+            3,
+            "comma list matches any of the statuses"
+        );
+        assert_eq!(
+            count(Some("todo, cancelled")),
+            3,
+            "surrounding whitespace in segments is trimmed"
+        );
+        assert_eq!(
+            count(Some("todo,,")),
+            2,
+            "empty segments from stray commas are ignored"
+        );
+        assert_eq!(count(Some("")), 3, "an empty filter matches everything");
+        assert_eq!(count(None), 3, "no status filter matches everything");
     }
 }
