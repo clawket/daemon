@@ -1228,11 +1228,11 @@ struct ConvergenceStatusResponse {
 }
 
 #[derive(Serialize)]
-struct TaskCounts {
-    pass: i64,
-    defect: i64,
-    scenario_error: i64,
-    total: i64,
+pub(crate) struct TaskCounts {
+    pub(crate) pass: i64,
+    pub(crate) defect: i64,
+    pub(crate) scenario_error: i64,
+    pub(crate) total: i64,
 }
 
 #[derive(Serialize)]
@@ -1519,7 +1519,7 @@ fn resolve_plan(
     }
 }
 
-/// SQL aggregate of task counts for all tasks in a plan (via units join).
+/// SQL aggregate of task counts for a plan's **scheduled** tasks (via units join).
 ///
 /// R2 DOGFOOD-039 fix: count by EITHER qa_status (round-result column written
 /// by bulk_sync) OR task.status (workflow column also written by bulk_sync).
@@ -1527,7 +1527,23 @@ fn resolve_plan(
 /// "defect 수 = blocked status task 수" so we tally a row as defect when
 /// either signal indicates defect — this catches drift from manual edits
 /// (e.g. an agent that flips status=blocked without setting qa_status).
-fn query_plan_task_counts(
+///
+/// LM-11093: backlog tasks (`cycle_id IS NULL`) are excluded. A task detached
+/// via `task update --cycle ""` is deferred to a later round, so counting it
+/// against *this* round's numbers describes work nobody scheduled. Concretely:
+/// a deferred `blocked` task tallied as `defect`, which held `converged` false
+/// (:1266) — and since the ALREADY_CONVERGED guard (:286) refuses the next
+/// round only when `defect == 0 && scenario_error == 0`, that phantom defect
+/// also kept the guard from firing. A deferred `todo` task never reached either
+/// arm, but still inflated `total`.
+///
+/// Note `blocked` stays a defect signal here: unlike the plan-completion gates
+/// (`repo::tasks::CONTAINER_TERMINAL`), a QA round asks "did the scenarios
+/// pass", and a blocked scenario did not pass. Same status, different question
+/// — the exclusion that carries across is deferral, not blockedness. This is
+/// one reader of "what belongs to this plan"; they are enumerated in one place,
+/// at `routes::plans::counts`.
+pub(crate) fn query_plan_task_counts(
     conn: &rusqlite::Connection,
     plan_id: &str,
 ) -> anyhow::Result<TaskCounts> {
@@ -1543,7 +1559,7 @@ fn query_plan_task_counts(
                 COUNT(t.id)
              FROM tasks t
              JOIN units u ON t.unit_id = u.id
-             WHERE u.plan_id = ?1",
+             WHERE u.plan_id = ?1 AND t.cycle_id IS NOT NULL",
             rusqlite::params![plan_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )

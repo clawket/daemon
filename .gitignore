@@ -16,3 +16,7 @@ target/
 *.swp
 *.swo
 *~
+
+# Local review-gate artifacts (airpilot run-gate): per-HEAD reports, verdict
+# slots and the KPI log. Regenerated on every gate run, machine-specific.
+.airpilot/

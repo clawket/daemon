@@ -375,35 +375,25 @@ async fn dashboard(
             lines.push("## Discover-Loop Rounds".into());
             let mut prev_defect: Option<i64> = None;
             for (round_num, plan) in &indexed {
-                // Tally task qa_status.
-                let plan_units = units::list(
-                    &conn,
-                    units::ListFilter {
-                        plan_id: Some(&plan.id),
-                    },
-                )
-                .unwrap_or_default();
-                let mut defect = 0i64;
-                let mut scenario_error = 0i64;
-                let mut pass = 0i64;
-                for u in &plan_units {
-                    let ts = tasks::list(
-                        &conn,
-                        tasks::ListFilter {
-                            unit_id: Some(&u.id),
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap_or_default();
-                    for t in &ts {
-                        match t.qa_status.as_deref() {
-                            Some("defect") => defect += 1,
-                            Some("scenario_error") => scenario_error += 1,
-                            Some("pass") => pass += 1,
-                            _ => {}
-                        }
-                    }
-                }
+                // LM-11093: one definition, shared with `/discover/*`. This
+                // panel renders the same round verdict and applies the identical
+                // `defect == 0 && scenario_error == 0` decision, so it must read
+                // the same tally — it used to re-implement one over units, which
+                // both included backlog tasks (a deferred defect made
+                // `/discover/*` report converged while this said `continue` for
+                // the very same round) and read `qa_status` alone, missing the
+                // DOGFOOD-039 two-signal defect (`qa_status IS NULL AND status =
+                // 'blocked'`). Calling the same function is what keeps them
+                // from drifting again.
+                let counts = crate::routes::discover::query_plan_task_counts(&conn, &plan.id)
+                    .unwrap_or(crate::routes::discover::TaskCounts {
+                        pass: 0,
+                        defect: 0,
+                        scenario_error: 0,
+                        total: 0,
+                    });
+                let (defect, scenario_error, pass) =
+                    (counts.defect, counts.scenario_error, counts.pass);
                 let decision = if defect == 0 && scenario_error == 0 {
                     "converged"
                 } else if defect > 0 && prev_defect.map(|prev| defect > prev).unwrap_or(false) {
