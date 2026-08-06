@@ -421,7 +421,23 @@ pub(crate) fn round_tasks_for_cycle(
 ) -> Result<Vec<RoundTask>, ApiError> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, COALESCE(scenario_id, ''), COALESCE(qa_status, ''), body
+            // Fall back to `status` when no verdict is recorded, the same
+            // two-signal reading `routes::discover::query_plan_task_counts` uses
+            // (DOGFOOD-039). Reading `qa_status` alone made a fixed defect
+            // unclassifiable: completing it clears the verdict, so the pair became
+            // `("defect", "")`, which matches no arm in `compute_round_diff` — the
+            // row vanished from every bucket, `flipped_pass` became unreachable, and
+            // the one transition that endpoint exists to show was the one it lost.
+            "SELECT id,
+                    COALESCE(scenario_id, ''),
+                    CASE
+                        WHEN qa_status IS NOT NULL THEN qa_status
+                        WHEN status = 'done' THEN 'pass'
+                        WHEN status = 'blocked' THEN 'defect'
+                        WHEN status = 'cancelled' THEN 'scenario_error'
+                        ELSE ''
+                    END,
+                    body
              FROM tasks
              WHERE cycle_id = ?1 AND COALESCE(scenario_id, '') != ''",
         )

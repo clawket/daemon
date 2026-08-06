@@ -634,12 +634,7 @@ pub fn update(
     // `defect` on the row, a pair five readers each interpreted their own way, and
     // their disagreements are what this change set spent six rounds chasing.
     //
-    // Folded into `f` here — before the SQL, the audit comparison and the cascade
-    // dispatch read it — rather than appended to the SQL alone. Writing the column
-    // behind their backs made this the one `qa_status` transition with no audit
-    // trail, and it is the most frequent one.
-    //
-    // Narrow on purpose: `old` must actually hold `defect`, not merely "the patch
+    // Narrow on purpose: the row must actually hold `defect`, not merely "the patch
     // said nothing about the verdict".
     //   - `bulk_sync` transcribes a fresh row by CREATE-ing with the verdict and then
     //     patching `status` alone (create hardcodes `todo`). A blanket rule NULLed the
@@ -653,16 +648,15 @@ pub fn update(
     // indistinguishable from `bulk_sync`'s `scenario_error` transcription (also
     // `cancelled`), so a withdrawal would report a scenario-layer failure and hold
     // the round open — the lockout, reintroduced.
-    let mut f = f;
-    if f.qa_status.is_none()
-        && f.status.as_deref() == Some("done")
-        && old
-            .as_ref()
-            .is_some_and(|t| t.qa_status.as_deref() == Some("defect"))
-    {
-        f.qa_status = Some(None);
-    }
-    let f = f;
+    //
+    // The predicate is evaluated in the UPDATE itself (see `qa_status = CASE …`
+    // below), NOT against the `old` snapshot read above. `old` is read outside the
+    // transaction on a pooled WAL connection, so a concurrent
+    // `{"qa_status":"pass"}` committing in between would make this clear NULL a
+    // `pass` — round 7's defect reached through a stale read — and write an audit row
+    // claiming the prior value was `defect`. Deciding inside the statement removes
+    // the window instead of narrowing it.
+    let clear_stale_defect = f.qa_status.is_none() && f.status.as_deref() == Some("done");
 
     if let Some(ref new_title) = f.title {
         if new_title.trim().is_empty() {
@@ -865,9 +859,13 @@ pub fn update(
         "escalation_reason = ?",
         &f.escalation_reason,
     );
-    // Carries the stale-defect clear folded in at the top of this function, so the
-    // SQL, the audit row and the cascade dispatch all see one decision.
     push_str_opt(&mut sets, &mut vals, "qa_status = ?", &f.qa_status);
+    if clear_stale_defect {
+        // Read-and-write in one statement: only a row that still holds `defect` at
+        // write time is cleared, so a verdict written concurrently survives. No bind
+        // parameter — the literal is a fixed enum value, not caller input.
+        sets.push("qa_status = CASE WHEN qa_status = 'defect' THEN NULL ELSE qa_status END");
+    }
     push_str_opt(&mut sets, &mut vals, "scenario_id = ?", &f.scenario_id);
     push_str_opt(&mut sets, &mut vals, "defect_task = ?", &f.defect_task);
     push_str_opt(
@@ -1077,8 +1075,28 @@ pub fn update(
                 write_audit("tier", "updated", old_t, new_t);
             }
         }
-        // FIX-DAEMON-r2-qa: qa_status change audit
-        if let Some(ref new_qa_opt) = f.qa_status {
+        // FIX-DAEMON-r2-qa: qa_status change audit.
+        //
+        // The stale-defect clear decides inside the UPDATE, so what it actually did
+        // is only knowable by reading the row back — hence the `else` arm rather than
+        // an assumption. Skipping it would leave the clear as the one `qa_status`
+        // transition with no trail, and it is the most frequent one; assuming it
+        // fired would log a change that a concurrent write may have prevented.
+        let audited_qa: Option<Option<String>> = if f.qa_status.is_some() {
+            f.qa_status.clone()
+        } else if clear_stale_defect {
+            tx.query_row(
+                "SELECT qa_status FROM tasks WHERE id = ?1",
+                params![canonical],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .map(Some)
+            .unwrap_or(None)
+        } else {
+            None
+        };
+        if let Some(ref new_qa_opt) = audited_qa {
             let old_q: Option<&str> = old_task.qa_status.as_deref();
             let new_q: Option<&str> = new_qa_opt.as_deref();
             if old_q != new_q {
@@ -1162,6 +1180,9 @@ pub fn update(
     // cycle would re-close the plan the user just re-opened, since the scheduled
     // set is container-terminal again the moment the task lands in it.
     let detaching = matches!(f.cycle_id, Some(None));
+    // The implicit stale-defect clear needs no axis of its own: it only fires on a
+    // patch that also sets `status = "done"`, which dispatches on the status axis
+    // above. This one covers the verdict-only patch.
     let clearing_defect = matches!(&f.qa_status, Some(v) if v.as_deref() != Some("defect"))
         && old
             .as_ref()

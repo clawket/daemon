@@ -1338,15 +1338,7 @@ async fn convergence_status(
     };
     let line = format_audit_line(round.unwrap_or(0), &counts, decision);
     let audit_title = audit_log_title(&plan.project_id, &domain);
-    let existing_audit = knowledge::list(
-        &conn,
-        knowledge::ListFilter {
-            type_: Some("convergence_audit"),
-            ..Default::default()
-        },
-    )
-    .ok()
-    .and_then(|list| list.into_iter().find(|a| a.title == audit_title));
+    let existing_audit = find_audit_entry(&conn, &plan.project_id, &domain);
     if let Some(a) = existing_audit {
         // Append (idempotent on identical line — only append if last differs).
         let prev_body = a.content.clone();
@@ -1371,19 +1363,38 @@ async fn convergence_status(
             );
         }
     } else {
-        let _ = knowledge::create(
+        // `plan_id` is required, not optional: `knowledge::create` rejects a row
+        // attached to nothing (`KNOWLEDGE_NEEDS_ATTACHMENT`), so passing `None` here
+        // meant the entry was NEVER created — and `let _ =` swallowed the error, so
+        // the audit log silently did not exist. The snapshot baseline built on top of
+        // it could therefore never find anything and always fell back to the live
+        // re-tally it was meant to replace.
+        //
+        // The entry spans every round of a domain, so no single plan owns it; the
+        // round that first creates it supplies the attachment, and the project
+        // scoping lives in the title. A failure is logged rather than dropped —
+        // silently losing the log is what hid this.
+        if let Err(e) = knowledge::create(
             &conn,
             knowledge::CreateInput {
                 title: &audit_title,
                 content: Some(&line),
                 content_format: Some("text"),
                 type_: "convergence_audit",
-                plan_id: None,
+                plan_id: Some(&plan.id),
                 unit_id: None,
                 task_id: None,
                 parent_id: None,
             },
-        );
+        ) {
+            tracing::warn!(
+                plan_id = %plan.id,
+                audit_title = %audit_title,
+                error = %e,
+                "discover-loop:status — could not create the convergence audit entry; \
+                 regression detection will fall back to a live re-tally"
+            );
+        }
     }
 
     Ok(Json(ConvergenceStatusResponse {
@@ -1679,6 +1690,32 @@ fn audit_log_title(project_id: &str, domain: &str) -> String {
     format!("convergence audit log — {project_id} — {domain}")
 }
 
+/// The audit entry for this project+domain.
+///
+/// Exact title match, deliberately — rows written under the pre-scoping title are
+/// rewritten by migration 028 rather than papered over with a fallback here. A code
+/// fallback would make the scoping cosmetic: the reader would keep accepting an
+/// entry that may hold another project's rounds, which is the collision the scoping
+/// removes. `schema-migration-discipline.md` puts a data rename in a migration, and
+/// 026 set the precedent for exactly this shape.
+fn find_audit_entry(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    domain: &str,
+) -> Option<crate::models::Knowledge> {
+    let title = audit_log_title(project_id, domain);
+    knowledge::list(
+        conn,
+        knowledge::ListFilter {
+            type_: Some("convergence_audit"),
+            ..Default::default()
+        },
+    )
+    .ok()?
+    .into_iter()
+    .find(|e| e.title == title)
+}
+
 /// One round's line in that entry. Paired with `parse_logged_round_defects`, which
 /// reads it back; the round-trip is pinned by tests so a reformat here cannot
 /// silently stop the reader from finding `defect=`.
@@ -1713,18 +1750,7 @@ pub(crate) fn logged_round_defects(
     round: u32,
 ) -> Option<i64> {
     let domain = parse_round_plan_title(current_title).map(|(d, _)| d)?;
-    let audit_title = audit_log_title(project_id, &domain);
-    let entry = knowledge::list(
-        conn,
-        knowledge::ListFilter {
-            type_: Some("convergence_audit"),
-            ..Default::default()
-        },
-    )
-    .ok()?
-    .into_iter()
-    .find(|a| a.title == audit_title)?;
-
+    let entry = find_audit_entry(conn, project_id, &domain)?;
     parse_logged_round_defects(&entry.content, round)
 }
 

@@ -13,7 +13,7 @@ pub type SqlitePooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 
 /// Maximum schema version this binary supports. If the on-disk DB reports a
 /// higher version, the daemon refuses to start (downgrade guard).
-pub const SCHEMA_VERSION_MAX: i64 = 27;
+pub const SCHEMA_VERSION_MAX: i64 = 28;
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
@@ -140,6 +140,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         27,
         "027_plan_auto_advance.sql",
         include_str!("../migrations/027_plan_auto_advance.sql"),
+    ),
+    (
+        28,
+        "028_scope_convergence_audit_titles.sql",
+        include_str!("../migrations/028_scope_convergence_audit_titles.sql"),
     ),
 ];
 
@@ -954,6 +959,172 @@ mod tests {
         assert!(
             err.is_err(),
             "atomic_size_hint='gigantic' should fail CHECK"
+        );
+    }
+}
+
+#[cfg(test)]
+mod migration_028_tests {
+    use super::*;
+    use rusqlite::params;
+
+    /// Migration 028 rewrites the pre-scoping convergence audit title in place.
+    /// Both the writer and the reader of that entry find it by exact title, so a
+    /// row left under the old name is unreachable: the reader falls back to a live
+    /// re-tally (the moving baseline the snapshot replaced) and the writer starts a
+    /// second entry. Neither failure surfaces — hence the migration, and hence this
+    /// test, since the attribution SQL is doing real work.
+    fn open_migrated(path: &std::path::Path) -> Connection {
+        let db = Db::open(path).unwrap();
+        db.conn
+    }
+
+    fn seed_pre_028(conn: &Connection, project: &str, domain: &str, body: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO projects (id, name, created_at, updated_at)
+             VALUES (?1, ?1, 0, 0)",
+            params![project],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO plans (id, project_id, title, source, status, created_at)
+             VALUES (?1, ?2, ?3, 'manual', 'active', 0)",
+            params![
+                format!("PLAN-{project}-{domain}"),
+                project,
+                format!("{domain} Round 1")
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO knowledge (id, plan_id, type, title, content, content_format, created_at)
+             VALUES (?1, ?2, 'convergence_audit', ?3, ?4, 'text', 0)",
+            params![
+                format!("KN-{project}-{domain}"),
+                format!("PLAN-{project}-{domain}"),
+                format!("convergence audit log — {domain}"),
+                body
+            ],
+        )
+        .unwrap();
+    }
+
+    fn title_of(conn: &Connection, id: &str) -> String {
+        conn.query_row(
+            "SELECT title FROM knowledge WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn scopes_an_unambiguous_entry_and_keeps_its_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m028.db");
+        {
+            let conn = open_migrated(&path);
+            // Undo 028 for this row so we can watch it re-apply: seeding happens
+            // after migrations ran, so write the legacy shape directly.
+            seed_pre_028(&conn, "PROJ-solo", "Dogfood", "R1: defect=5, pass=3");
+            conn.execute(
+                "DELETE FROM schema_version WHERE version = 28",
+                rusqlite::params![],
+            )
+            .unwrap();
+        }
+        // Re-open: the runner replays 028 over the seeded row.
+        let conn = open_migrated(&path);
+        assert_eq!(
+            title_of(&conn, "KN-PROJ-solo-Dogfood"),
+            "convergence audit log — PROJ-solo — Dogfood",
+            "the entry must be reachable under the scoped title the code now builds"
+        );
+        let body: String = conn
+            .query_row(
+                "SELECT content FROM knowledge WHERE id = 'KN-PROJ-solo-Dogfood'",
+                rusqlite::params![],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            body.contains("R1: defect=5"),
+            "and its history must survive the rename — that history IS the baseline; got: {body}"
+        );
+    }
+
+    #[test]
+    fn leaves_an_ambiguous_entry_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m028_ambig.db");
+        {
+            let conn = open_migrated(&path);
+            // Two projects, same domain — the collision the scoping exists to end.
+            // Guessing an owner here would re-create it, so the row stays put.
+            seed_pre_028(&conn, "PROJ-a", "Shared", "R1: defect=1");
+            conn.execute(
+                "INSERT INTO projects (id, name, created_at, updated_at)
+                 VALUES ('PROJ-b', 'PROJ-b', 0, 0)",
+                rusqlite::params![],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plans (id, project_id, title, source, status, created_at)
+                 VALUES ('PLAN-b', 'PROJ-b', 'Shared Round 1', 'manual', 'active', 0)",
+                rusqlite::params![],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM schema_version WHERE version = 28",
+                rusqlite::params![],
+            )
+            .unwrap();
+        }
+        let conn = open_migrated(&path);
+        assert_eq!(
+            title_of(&conn, "KN-PROJ-a-Shared"),
+            "convergence audit log — Shared",
+            "ambiguous ownership must not be guessed — an untouched row is inert, a \
+             mis-attributed one feeds another project's numbers into a durable verdict"
+        );
+    }
+
+    #[test]
+    fn is_idempotent_on_an_already_scoped_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m028_idem.db");
+        {
+            let conn = open_migrated(&path);
+            conn.execute(
+                "INSERT INTO projects (id, name, created_at, updated_at)
+                 VALUES ('PROJ-x', 'PROJ-x', 0, 0)",
+                rusqlite::params![],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plans (id, project_id, title, source, status, created_at)
+                 VALUES ('PLAN-x', 'PROJ-x', 'Dogfood Round 1', 'manual', 'active', 0)",
+                rusqlite::params![],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO knowledge (id, plan_id, type, title, content, content_format, created_at)
+                 VALUES ('KN-scoped', 'PLAN-x', 'convergence_audit',
+                         'convergence audit log — PROJ-x — Dogfood', 'R1: defect=0', 'text', 0)",
+                rusqlite::params![],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM schema_version WHERE version = 28",
+                rusqlite::params![],
+            )
+            .unwrap();
+        }
+        let conn = open_migrated(&path);
+        assert_eq!(
+            title_of(&conn, "KN-scoped"),
+            "convergence audit log — PROJ-x — Dogfood",
+            "re-running must not double-scope a title"
         );
     }
 }

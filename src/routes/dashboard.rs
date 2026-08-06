@@ -403,13 +403,26 @@ async fn dashboard(
                 // tally above was extracted to end, one layer up in the comparison
                 // instead of the count. Falls back to the walked value for rounds
                 // logged before the snapshot existed.
-                let baseline = crate::routes::discover::logged_round_defects(
-                    &conn,
-                    &plan.project_id,
-                    &plan.title,
-                    round_num.saturating_sub(1),
-                )
-                .or(prev_defect);
+                // `checked_sub`, matching `/discover-loop/status`: round 1 has no
+                // predecessor, and `saturating_sub` would look up round 0 — a real
+                // key, since a plan whose title has no round number logs `R0:`.
+                //
+                // The fallback is only for rounds logged before the snapshot
+                // existed. It is per-round, so a rendered sequence can mix a logged
+                // baseline with a walked one; that is visible drift rather than
+                // silent, and the alternative (refusing to score any round once one
+                // is unlogged) hides more than it tells.
+                let baseline = round_num
+                    .checked_sub(1)
+                    .and_then(|prev| {
+                        crate::routes::discover::logged_round_defects(
+                            &conn,
+                            &plan.project_id,
+                            &plan.title,
+                            prev,
+                        )
+                    })
+                    .or(prev_defect);
                 let decision = if defect == 0 && scenario_error == 0 {
                     "converged"
                 } else if defect > 0 && baseline.map(|prev| defect > prev).unwrap_or(false) {
