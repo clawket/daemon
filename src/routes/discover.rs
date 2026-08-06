@@ -359,7 +359,15 @@ async fn next_round(
         let mut superseded: Vec<String> = Vec::new();
         for cid in &cycles_to_complete {
             match cycles::force_complete(&conn, cid) {
-                Ok(_) => superseded.push(cid.clone()),
+                // `Some` only: `Ok(None)` means the row was gone by the time we
+                // read it back (deleted concurrently), and announcing an update to
+                // a cycle that no longer exists sends subscribers after nothing.
+                // Every other `cycle:updated` site guards the same way.
+                Ok(Some(_)) => superseded.push(cid.clone()),
+                Ok(None) => tracing::warn!(
+                    cycle_id = %cid,
+                    "discover-loop:next-round — previous cycle vanished before it could be closed"
+                ),
                 Err(e) => tracing::warn!(
                     cycle_id = %cid,
                     error = %e,
@@ -381,11 +389,13 @@ async fn next_round(
     // `cycle:updated` emit lives in the route handlers this path bypasses, so
     // without this a subscriber keeps rendering round R as active until some
     // unrelated event arrives — the row is repaired, the wire is not.
+    //
+    // Payload is `{"id"}` only, matching `routes::cycles`: subscribers refetch on
+    // this event, so adding fields here would create a second shape for the same
+    // event name — and a client that read them would be trusting a payload the
+    // other emit sites do not send.
     for cid in &prep.superseded_cycles {
-        app.emit(
-            "cycle:updated",
-            serde_json::json!({ "id": cid, "status": "completed" }),
-        );
+        app.emit("cycle:updated", serde_json::json!({ "id": cid }));
     }
 
     let start_body = StartBody {
@@ -1287,6 +1297,14 @@ async fn convergence_status(
     };
 
     let converged = counts.defect == 0 && counts.scenario_error == 0;
+    // The baseline is recomputed from the previous plan's rows on every call, not
+    // snapshotted — so anything that changes what those rows tally moves it after
+    // the fact. Cancelling one of round R's defects lowers R's count, which can
+    // make R+1 read as a regression against the corrected figure, and this verdict
+    // is appended to a durable audit entry below. That is arguably the honest
+    // reading (a withdrawn defect was never a real one), and the live-baseline
+    // property predates this criterion — but a per-round snapshot is what would
+    // make the audit trail immutable, and that is a design change, not a fix.
     let regression_detected = prev_summary
         .as_ref()
         .map(|p| counts.defect > 0 && counts.defect > p.counts.defect)
@@ -1569,25 +1587,42 @@ fn resolve_plan(
 ///
 /// `cancelled` is the one place this reader must agree with those gates, and the
 /// reason is not symmetry but termination: a cancelled row is finished work, so
-/// the gates close the plan on it. If this reader still called it a defect,
-/// `converged` would stay false for a plan that can never reopen. So a cancelled
-/// row scores as `scenario_error` (withdrawn) regardless of the verdict left on
-/// it — the buckets stay mutually exclusive, and `total` is unaffected.
+/// the gates close the plan on it. `qa_status` is not cleared by a status change,
+/// so abandoning a defect leaves `cancelled` + `defect` behind — and if that
+/// counted as an unresolved signal, `converged` would stay false for a plan that
+/// is already `completed` and cannot reopen (`PLAN_COMPLETED` freezes `create`,
+/// and the only edge out of `cancelled` leads back to `todo`).
+///
+/// So a cancelled row counts toward `total` and **neither** unresolved bucket.
+/// Moving it between them would achieve nothing: every convergence predicate ANDs
+/// the two (`defect == 0 && scenario_error == 0`, at `:1289`, `:1405`, `:289`, and
+/// rendered in `routes::dashboard`), so a row in either one holds the round open
+/// exactly the same. `scenario_error` means "the scenario itself was wrong and
+/// needs rewriting" — a live signal `/scenario-refine` acts on — which is not what
+/// an abandoned row is saying.
+///
+/// The three buckets are mutually exclusive but never were exhaustive — `todo`
+/// and `in_progress` rows with no verdict score in none of them, which is correct
+/// (a scenario that has not run yet has no result). So `pass + defect +
+/// scenario_error < total` is the normal case, not a symptom; `total` is
+/// `COUNT(t.id)` and no consumer treats the three as a partition. An abandoned
+/// defect joins that unscored set.
 pub(crate) fn query_plan_task_counts(
     conn: &rusqlite::Connection,
     plan_id: &str,
 ) -> anyhow::Result<TaskCounts> {
     let (pass, defect, scenario_error, total): (i64, i64, i64, i64) = conn
         .query_row(
-            // A `cancelled` row does not report a defect, whatever verdict it still
-            // carries. `qa_status` is not cleared by a status change, so abandoning
-            // a defect leaves `cancelled` + `defect` behind — and the completion
-            // gates treat that as finished (`repo::tasks::container_terminal` keys
-            // on the pair `blocked AND defect`). Counting it here would put this
-            // reader out of step with them: the plan would be `completed` while
-            // `converged` stayed false forever, which is the two-paths-disagree
-            // failure the shared criterion exists to prevent. Scored as
-            // scenario_error instead, matching the status arm just below.
+            // `AND t.status != 'cancelled'` on the defect arm, and no matching arm
+            // added anywhere else: an abandoned defect reports NEITHER unresolved
+            // signal. See the doc above for why moving it to `scenario_error` would
+            // have been pointless — the convergence predicates AND the two buckets.
+            //
+            // The `qa_status IS NULL AND status = 'cancelled'` arm below stays: that
+            // is DOGFOOD-039's drift catch for a scenario_error row whose verdict
+            // column was never written, mirroring the `blocked` → defect arm. Only
+            // an EXPLICIT `defect` verdict on a cancelled row is dropped, because
+            // only that pair means "this defect was abandoned, not withdrawn".
             "SELECT
                 SUM(CASE WHEN t.qa_status = 'pass' OR (t.qa_status IS NULL AND t.status = 'done')
                          THEN 1 ELSE 0 END),
@@ -1596,7 +1631,6 @@ pub(crate) fn query_plan_task_counts(
                          THEN 1 ELSE 0 END),
                 SUM(CASE WHEN t.qa_status = 'scenario_error'
                             OR (t.qa_status IS NULL AND t.status = 'cancelled')
-                            OR (t.qa_status = 'defect' AND t.status = 'cancelled')
                          THEN 1 ELSE 0 END),
                 COUNT(t.id)
              FROM tasks t

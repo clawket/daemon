@@ -3077,11 +3077,25 @@ mod tests {
             "a cancelled row is withdrawn work, not an open defect"
         );
         assert_eq!(
-            counts.scenario_error, 1,
-            "it is scored as withdrawn instead — the buckets stay exclusive"
+            counts.scenario_error, 0,
+            "nor a scenario_error — that bucket means the scenario needs rewriting, \
+             and every convergence predicate ANDs the two, so moving it there would \
+             hold the round open exactly the same"
         );
         assert_eq!(counts.pass, 1, "the passing scenario is unaffected");
-        assert_eq!(counts.total, 2, "and total counts both scheduled rows");
+        assert_eq!(
+            counts.total, 2,
+            "total still counts both scheduled rows — the three buckets are not a partition"
+        );
+        // The assertion that actually matters: the convergence predicate every
+        // reader shares must now hold. Checking the buckets individually is not
+        // enough — they are ANDed, so a row in either one keeps the round open and
+        // an operator has no action left that clears it (the plan is `completed`,
+        // `PLAN_COMPLETED` freezes `create`, and `cancelled` only leads to `todo`).
+        assert!(
+            counts.defect == 0 && counts.scenario_error == 0,
+            "the round must read converged — the plan is closed and cannot reopen"
+        );
     }
 
     // Clearing the verdict is itself a settling transition. `routes::tasks` accepts

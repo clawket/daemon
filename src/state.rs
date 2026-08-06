@@ -190,10 +190,18 @@ fn parse_event_name(event: &'static str) -> (&'static str, &'static str) {
         "knowledge:deleted" => ("knowledge", "deleted"),
         "comment:created" => ("comment", "created"),
         "comment:deleted" => ("comment", "deleted"),
-        // `routes::discover` emits this when a QA round begins. Unmapped it fell
-        // to ("unknown","unknown"), so `/events?entity_types=…` could not filter
-        // it and subscribers saw an event they could not classify.
+        // Every name this daemon actually emits belongs here. An unmapped one
+        // falls to ("unknown","unknown"), which is worse than invisible: a client
+        // filtering `/events?entity_types=run` receives nothing while runs are
+        // being created, so the filter looks like "no activity" rather than
+        // "unsupported". The `run:*` and `discover-loop:*` families were in that
+        // state; `sse-event-wire-contract.md` names the fallthrough as the hazard.
+        //
+        // Adding a name here is part of adding an `emit` call, not a follow-up.
+        "run:created" => ("run", "created"),
+        "run:updated" => ("run", "updated"),
         "discover-loop:started" => ("discover-loop", "started"),
+        "discover-loop:active-plan-warning" => ("discover-loop", "active-plan-warning"),
         _ => {
             // Fallback: split on ':'
             if let Some(pos) = event.find(':') {
@@ -206,5 +214,84 @@ fn parse_event_name(event: &'static str) -> (&'static str, &'static str) {
                 ("unknown", event)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_event_name;
+
+    /// Every event name the daemon emits must be mapped. An unmapped name falls to
+    /// ("unknown","unknown"), so a client filtering `/events?entity_types=run`
+    /// silently receives nothing while runs are happening — the filter reads as "no
+    /// activity" rather than "unsupported", and nothing fails loudly.
+    ///
+    /// This scans the route sources for `app.emit("…")` literals rather than
+    /// restating a list, so adding an emit without a mapping fails here instead of
+    /// in production. It reads files at test time; `CARGO_MANIFEST_DIR` keeps that
+    /// independent of the working directory.
+    #[test]
+    fn every_emitted_event_name_is_mapped() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut names: Vec<String> = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                // `emit(` then the next string literal on the same or a later line.
+                for chunk in src.split("emit(").skip(1) {
+                    let Some(open) = chunk.find('"') else {
+                        continue;
+                    };
+                    let rest = &chunk[open + 1..];
+                    let Some(close) = rest.find('"') else {
+                        continue;
+                    };
+                    let name = &rest[..close];
+                    // Event names are "<entity>:<change>"; anything else is a
+                    // different `emit(` (e.g. a log macro) and is skipped.
+                    if name.contains(':') && !name.contains(' ') && !name.contains('{') {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !names.is_empty(),
+            "scan found no emit() call sites — the pattern must have changed, so this \
+             test is no longer checking anything"
+        );
+
+        let unmapped: Vec<&String> = names
+            .iter()
+            .filter(|n| parse_event_name_is_unknown(n))
+            .collect();
+        assert!(
+            unmapped.is_empty(),
+            "these emitted events are not mapped in parse_event_name, so they reach \
+             subscribers as entity_type=\"unknown\" and cannot be filtered: {unmapped:?}"
+        );
+    }
+
+    /// `parse_event_name` takes `&'static str`, but scanned names are owned. Match
+    /// on the mapped set by round-tripping through the same function with a leaked
+    /// string — test-only, and the leak is bounded by the number of event names.
+    fn parse_event_name_is_unknown(name: &str) -> bool {
+        let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+        parse_event_name(leaked).0 == "unknown"
     }
 }
