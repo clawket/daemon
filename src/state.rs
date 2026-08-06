@@ -226,10 +226,22 @@ mod tests {
     /// silently receives nothing while runs are happening — the filter reads as "no
     /// activity" rather than "unsupported", and nothing fails loudly.
     ///
-    /// This scans the route sources for `app.emit("…")` literals rather than
-    /// restating a list, so adding an emit without a mapping fails here instead of
-    /// in production. It reads files at test time; `CARGO_MANIFEST_DIR` keeps that
-    /// independent of the working directory.
+    /// This scans the sources for event-name literals rather than restating a list,
+    /// so adding an emit without a mapping fails here instead of in production. Two
+    /// patterns are covered, because names reach `emit` two ways:
+    ///   - `emit("name", …)` — the direct call in the route handlers.
+    ///   - `cascaded.push(("name", …))` — `repo::tasks::cascade_complete` returns
+    ///     names for the route layer to emit through a variable, so the literal is
+    ///     nowhere near an `emit(`. Scanning only the first pattern left the whole
+    ///     cascade family unchecked while appearing to cover everything.
+    ///
+    /// What it still cannot see: a name assembled at runtime (`format!`) or read
+    /// from a constant. There is none today, and the `!names.is_empty()` guard only
+    /// catches a wholesale pattern change, not a single new indirection — so a
+    /// future author introducing one must extend this scan.
+    ///
+    /// It reads files at test time; `CARGO_MANIFEST_DIR` keeps that independent of
+    /// the working directory.
     #[test]
     fn every_emitted_event_name_is_mapped() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -251,20 +263,22 @@ mod tests {
                 let Ok(src) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                // `emit(` then the next string literal on the same or a later line.
-                for chunk in src.split("emit(").skip(1) {
-                    let Some(open) = chunk.find('"') else {
-                        continue;
-                    };
-                    let rest = &chunk[open + 1..];
-                    let Some(close) = rest.find('"') else {
-                        continue;
-                    };
-                    let name = &rest[..close];
-                    // Event names are "<entity>:<change>"; anything else is a
-                    // different `emit(` (e.g. a log macro) and is skipped.
-                    if name.contains(':') && !name.contains(' ') && !name.contains('{') {
-                        names.push(name.to_string());
+                for marker in ["emit(", "cascaded.push(("] {
+                    // The marker, then the next string literal after it.
+                    for chunk in src.split(marker).skip(1) {
+                        let Some(open) = chunk.find('"') else {
+                            continue;
+                        };
+                        let rest = &chunk[open + 1..];
+                        let Some(close) = rest.find('"') else {
+                            continue;
+                        };
+                        let name = &rest[..close];
+                        // Event names are "<entity>:<change>"; anything else is a
+                        // different call (e.g. a log macro) and is skipped.
+                        if name.contains(':') && !name.contains(' ') && !name.contains('{') {
+                            names.push(name.to_string());
+                        }
                     }
                 }
             }
@@ -276,6 +290,8 @@ mod tests {
              test is no longer checking anything"
         );
 
+        names.sort();
+        names.dedup();
         let unmapped: Vec<&String> = names
             .iter()
             .filter(|n| parse_event_name_is_unknown(n))

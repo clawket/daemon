@@ -1572,11 +1572,11 @@ fn resolve_plan(
 /// LM-11093: backlog tasks (`cycle_id IS NULL`) are excluded. A task detached
 /// via `task update --cycle ""` is deferred to a later round, so counting it
 /// against *this* round's numbers describes work nobody scheduled. Concretely:
-/// a deferred `blocked` task tallied as `defect`, which held `converged` false
-/// (:1266) — and since the ALREADY_CONVERGED guard (:286) refuses the next
-/// round only when `defect == 0 && scenario_error == 0`, that phantom defect
-/// also kept the guard from firing. A deferred `todo` task never reached either
-/// arm, but still inflated `total`.
+/// a deferred `blocked` task tallied as `defect`, which held `converged` false in
+/// `convergence_status` — and since `next_round`'s ALREADY_CONVERGED guard refuses
+/// the next round only when `defect == 0 && scenario_error == 0`, that phantom
+/// defect also kept the guard from firing. A deferred `todo` task never reached
+/// either arm, but still inflated `total`.
 ///
 /// Note `blocked` stays a defect signal here: unlike the plan-completion gates
 /// (`repo::tasks::container_terminal`), a QA round asks "did the scenarios
@@ -1595,11 +1595,12 @@ fn resolve_plan(
 ///
 /// So a cancelled row counts toward `total` and **neither** unresolved bucket.
 /// Moving it between them would achieve nothing: every convergence predicate ANDs
-/// the two (`defect == 0 && scenario_error == 0`, at `:1289`, `:1405`, `:289`, and
-/// rendered in `routes::dashboard`), so a row in either one holds the round open
-/// exactly the same. `scenario_error` means "the scenario itself was wrong and
-/// needs rewriting" — a live signal `/scenario-refine` acts on — which is not what
-/// an abandoned row is saying.
+/// the two (`defect == 0 && scenario_error == 0` — in `convergence_status`,
+/// `converged`, `next_round`'s ALREADY_CONVERGED guard, and rendered in
+/// `routes::dashboard`), so a row in either one holds the round open exactly the
+/// same. `scenario_error` means "the scenario itself was wrong and needs
+/// rewriting" — a live signal `/scenario-refine` acts on — which is not what an
+/// abandoned row is saying.
 ///
 /// The three buckets are mutually exclusive but never were exhaustive — `todo`
 /// and `in_progress` rows with no verdict score in none of them, which is correct
@@ -1613,20 +1614,30 @@ pub(crate) fn query_plan_task_counts(
 ) -> anyhow::Result<TaskCounts> {
     let (pass, defect, scenario_error, total): (i64, i64, i64, i64) = conn
         .query_row(
-            // `AND t.status != 'cancelled'` on the defect arm, and no matching arm
-            // added anywhere else: an abandoned defect reports NEITHER unresolved
-            // signal. See the doc above for why moving it to `scenario_error` would
-            // have been pointless — the convergence predicates AND the two buckets.
+            // A `defect` verdict counts UNLESS the row has since reached a terminal
+            // status. `qa_status` is not cleared by a status change, so a verdict
+            // outlives the state it was written for: `blocked → done` and
+            // `blocked → cancelled` are both legal, and either leaves `defect` on a
+            // row the cascade treats as finished — plan `completed`, `converged`
+            // false forever, nothing an operator can clear. Excluding only
+            // `cancelled` fixed one of those axes and left the other, which is how
+            // this arm and the cascade drifted apart to begin with; the condition is
+            // "still open", not a list of statuses.
             //
-            // The `qa_status IS NULL AND status = 'cancelled'` arm below stays: that
-            // is DOGFOOD-039's drift catch for a scenario_error row whose verdict
-            // column was never written, mirroring the `blocked` → defect arm. Only
-            // an EXPLICIT `defect` verdict on a cancelled row is dropped, because
-            // only that pair means "this defect was abandoned, not withdrawn".
+            // It is NOT `status = 'blocked'`: a defect verdict on a `todo` or
+            // `in_progress` row is a real unresolved defect (DOGFOOD-039 pins
+            // exactly that — a verdict written without the matching status), and the
+            // cascade agrees, since neither status is container-terminal.
+            //
+            // The `qa_status IS NULL AND status = …` arms stay: they are
+            // DOGFOOD-039's drift catch for rows whose verdict column was never
+            // written, and they key on status precisely because there is no verdict
+            // to consult.
             "SELECT
                 SUM(CASE WHEN t.qa_status = 'pass' OR (t.qa_status IS NULL AND t.status = 'done')
                          THEN 1 ELSE 0 END),
-                SUM(CASE WHEN (t.qa_status = 'defect' AND t.status != 'cancelled')
+                SUM(CASE WHEN (t.qa_status = 'defect'
+                               AND t.status NOT IN ('done', 'cancelled'))
                             OR (t.qa_status IS NULL AND t.status = 'blocked')
                          THEN 1 ELSE 0 END),
                 SUM(CASE WHEN t.qa_status = 'scenario_error'

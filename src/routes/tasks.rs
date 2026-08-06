@@ -1969,7 +1969,14 @@ fn parse_update(v: &Value) -> ApiResult<tasks::UpdateFields> {
     // accepting whatever coerces.
     if let Some(v) = obj.get("qa_status") {
         if !v.is_null() && !v.is_string() {
-            return Err(ApiError::bad_request(
+            // `bad_request_coded`, not `bad_request`: the latter sets `code: None`,
+            // so a client branching on `code` would see this rejection as an
+            // anonymous 400 while the repo layer's rejection of a bad enum VALUE
+            // arrives as `code: "INVALID_QA_STATUS"` (mapped in `routes::error`).
+            // One error class, two shapes — `error-code-stability.md` requires the
+            // prefix and the code to travel together.
+            return Err(ApiError::bad_request_coded(
+                "INVALID_QA_STATUS",
                 "INVALID_QA_STATUS: qa_status must be a string or null. Valid: pass, defect, scenario_error",
             ));
         }

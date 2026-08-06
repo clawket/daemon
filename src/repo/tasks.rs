@@ -3098,6 +3098,95 @@ mod tests {
         );
     }
 
+    // The same trap on the other terminal axis. `blocked → done` is legal too, and
+    // a patch that carries only `status` leaves the `defect` verdict on the row —
+    // so gating the tally on "not cancelled" fixed one axis and left this one. Both
+    // readers must key on the live condition (`blocked` AND `defect`), not on a
+    // list of statuses to exclude.
+    #[test]
+    fn cascade_and_tally_agree_when_a_defect_row_is_completed() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let passed = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "scenario A");
+        let defect = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "scenario B");
+
+        update(
+            &mut s.db.conn,
+            &passed.id,
+            UpdateFields {
+                status: Some("done".into()),
+                qa_status: Some(Some("pass".into())),
+                evidence: Some(Some("test:defect-done".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update(
+            &mut s.db.conn,
+            &defect.id,
+            UpdateFields {
+                status: Some("blocked".into()),
+                qa_status: Some(Some("defect".into())),
+                blocked_reason: Some(Some("assertion failed".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "active",
+            "precondition: the open defect holds the plan"
+        );
+
+        // Fixed and completed, but the patch carries no verdict — so `defect` stays.
+        update(
+            &mut s.db.conn,
+            &defect.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:fixed-verdict-not-rewritten".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let finished = get(&s.db.conn, &defect.id).unwrap().unwrap();
+        assert_eq!(finished.status, "done");
+        assert_eq!(
+            finished.qa_status.as_deref(),
+            Some("defect"),
+            "precondition: the stale verdict is still on the row — that is the trap"
+        );
+
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "completed",
+            "completed work is finished regardless of a stale QA verdict"
+        );
+        assert_eq!(
+            plans::count_completion_residue(&s.db.conn, &s.plan_id).unwrap(),
+            0,
+            "the SQL gate must agree"
+        );
+        let counts =
+            crate::routes::discover::query_plan_task_counts(&s.db.conn, &s.plan_id).unwrap();
+        assert!(
+            counts.defect == 0 && counts.scenario_error == 0,
+            "and so must the QA tally — otherwise `converged` stays false for a plan \
+             that is closed and cannot reopen"
+        );
+        // It does not score as `pass` either: the verdict says `defect` and the
+        // `pass` arm keys on `qa_status='pass'` or an absent verdict. So the row is
+        // in `total` and no bucket — the same unscored set `todo`/`in_progress`
+        // occupy. That is the honest reading: nobody recorded a passing result for
+        // this scenario, and the tally does not invent one.
+        assert_eq!(
+            counts.pass, 1,
+            "only the scenario with a recorded pass counts as one"
+        );
+        assert_eq!(counts.total, 2, "both rows are still scheduled work");
+    }
+
     // Clearing the verdict is itself a settling transition. `routes::tasks` accepts
     // `qa_status` independently of `status`, so a lone `{"qa_status":"pass"}` patch
     // on the last blocked defect row settles the plan — and must dispatch the
