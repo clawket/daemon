@@ -9,7 +9,7 @@
 - emit 위치는 그대로 두고 매핑 테이블만 지우는 역방향 실수.
 
 ## Evidence
-- `src/state.rs:162-200` — `parse_event_name` 의 정적 `match`. fallback 은 `("unknown", "unknown")` 로 떨어지며 entity / change 라벨이 사라진다.
+- `src/state.rs` `parse_event_name` — 정적 `match`. fallback 은 `("unknown", "unknown")` 로 떨어지며 entity / change 라벨이 사라진다. (줄번호는 적지 않는다 — 이 표의 참조가 실제로 낡아 세 라운드 연속 지적됐다.)
 - `src/routes/knowledge.rs:117,134,189` — `app.emit("knowledge:created" | "knowledge:deleted" | "knowledge:updated", …)` 의 세 emit 사이트.
 - `daemon/CLAUDE.md:110` — "`/knowledge/*` 라우트를 변경하면 **같은 커밋에서** `state.rs` 의 mapping 을 함께 갱신한다" 라는 invariant 본문.
 
@@ -18,7 +18,7 @@
 
 ## Enforcement gap
 - 라우트가 `app.emit(...)` 를 추가했을 때 `state.rs` 매핑 누락을 컴파일 타임에 잡는 매크로/타입이 없다. 이벤트명이 `&'static str` 로 흘러가서 unknown fallback 까지 통과한다.
-- `cargo test` 가 새 이벤트와 매핑의 짝을 검증하는 테이블 테스트를 강제하지 않는다.
+- 테스트 타임에는 잡는다: `state::tests::every_emitted_event_name_is_mapped` 가 소스에서 이벤트명 리터럴을 스캔해 매핑 누락을 실패로 만든다(`emit("…"` 직접 호출과 `cascade_complete` 가 반환하는 `.push(("…"` 두 형태). 런타임에 조립되는 이름(`format!`)은 여전히 못 본다 — 그런 이름을 도입하면 그 스캔을 함께 확장해야 한다.
 
 ## Rule body
 새 SSE 이벤트를 추가/변경/삭제할 때는 다음을 **같은 커밋에서** 함께 처리한다.

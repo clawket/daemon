@@ -230,10 +230,14 @@ mod tests {
     /// so adding an emit without a mapping fails here instead of in production. Two
     /// patterns are covered, because names reach `emit` two ways:
     ///   - `emit("name", …)` — the direct call in the route handlers.
-    ///   - `cascaded.push(("name", …))` — `repo::tasks::cascade_complete` returns
-    ///     names for the route layer to emit through a variable, so the literal is
-    ///     nowhere near an `emit(`. Scanning only the first pattern left the whole
-    ///     cascade family unchecked while appearing to cover everything.
+    ///   - `.push(("name", …))` — `repo::tasks::cascade_complete` returns names for
+    ///     the route layer to emit through a variable, so those literals sit in a
+    ///     file with no `emit(` in it.
+    ///
+    /// Honest about today's coverage: both cascade names are ALSO emitted directly
+    /// elsewhere, so the second pattern adds nothing right now. It is here for the
+    /// next name that is only ever returned — verified by deleting the direct sites
+    /// in a scratch copy and confirming the scan still finds it.
     ///
     /// What it still cannot see: a name assembled at runtime (`format!`) or read
     /// from a constant. There is none today, and the `!names.is_empty()` guard only
@@ -263,13 +267,24 @@ mod tests {
                 let Ok(src) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                for marker in ["emit(", "cascaded.push(("] {
-                    // The marker, then the next string literal after it.
+                // Two marker shapes, and the difference matters:
+                //   `emit(`      — the literal may be on a later line (rustfmt wraps
+                //                  multi-arg calls), so skip ahead to the next quote.
+                //   `.push((\"`  — the marker already consumes the opening quote, so
+                //                  the name starts at byte 0. Skipping to "the next
+                //                  quote" here lands on the CLOSING one and yields an
+                //                  empty string, which is how this marker silently
+                //                  contributed nothing when first added.
+                for (marker, quote_consumed) in [("emit(", false), (".push((\"", true)] {
                     for chunk in src.split(marker).skip(1) {
-                        let Some(open) = chunk.find('"') else {
-                            continue;
+                        let rest = if quote_consumed {
+                            chunk
+                        } else {
+                            let Some(open) = chunk.find('"') else {
+                                continue;
+                            };
+                            &chunk[open + 1..]
                         };
-                        let rest = &chunk[open + 1..];
                         let Some(close) = rest.find('"') else {
                             continue;
                         };

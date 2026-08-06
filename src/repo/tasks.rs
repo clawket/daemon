@@ -831,6 +831,29 @@ pub fn update(
         &f.escalation_reason,
     );
     push_str_opt(&mut sets, &mut vals, "qa_status = ?", &f.qa_status);
+    // A `defect` verdict cannot outlive the work it was written about. Completing a
+    // task without saying anything about `qa_status` clears it, because
+    // `PATCH {"status":"done","evidence":"…"}` IS how a defect gets fixed — and
+    // leaving the verdict behind produced a row that was finished to the cascade and
+    // an open defect to the QA tally. Five readers each special-cased that pair,
+    // slightly differently, and their disagreements are what this change set spent
+    // six rounds chasing. Removing the pair at the write site beats teaching every
+    // reader to interpret it.
+    //
+    // The cleared row then reads as `pass` through the status-based drift catch,
+    // which is the honest result: the scenario was fixed and completed.
+    //
+    // Only `done`. Clearing on `cancelled` would make a withdrawn row
+    // indistinguishable from `bulk_sync`'s `scenario_error` transcription (which is
+    // also `cancelled`), so a withdrawal would start reporting a scenario-layer
+    // failure and hold the round open — the lockout, reintroduced.
+    //
+    // An explicit `qa_status` in the same patch wins: `bulk_sync` writes status and
+    // verdict together, and that is a report, not a state change to reinterpret.
+    if f.qa_status.is_none() && f.status.as_deref() == Some("done") {
+        sets.push("qa_status = ?");
+        vals.push(rusqlite::types::Value::Null);
+    }
     push_str_opt(&mut sets, &mut vals, "scenario_id = ?", &f.scenario_id);
     push_str_opt(&mut sets, &mut vals, "defect_task = ?", &f.defect_task);
     push_str_opt(
@@ -3037,8 +3060,9 @@ mod tests {
             "precondition: the open defect holds the plan"
         );
 
-        // Cancel it — the scenario is withdrawn, not fixed. The patch carries no
-        // `qa_status`, so `defect` stays on the row.
+        // Cancel it — the scenario is withdrawn, not fixed. The patch says nothing
+        // about `qa_status`, and the clear-on-completion rule is `done`-only, so the
+        // verdict stays. See the tally: a cancelled row is scored as withdrawn.
         update(
             &mut s.db.conn,
             &defect.id,
@@ -3053,7 +3077,9 @@ mod tests {
         assert_eq!(
             cancelled.qa_status.as_deref(),
             Some("defect"),
-            "precondition: the stale verdict is still on the row — that is the trap"
+            "withdrawal keeps the verdict: clearing it here would make the row \
+             indistinguishable from bulk_sync's scenario_error transcription, which is \
+             also cancelled — so the tally must handle this pair, and does"
         );
 
         assert_eq!(
@@ -3152,16 +3178,17 @@ mod tests {
         .unwrap();
         let finished = get(&s.db.conn, &defect.id).unwrap().unwrap();
         assert_eq!(finished.status, "done");
-        assert_eq!(
-            finished.qa_status.as_deref(),
-            Some("defect"),
-            "precondition: the stale verdict is still on the row — that is the trap"
+        assert!(
+            finished.qa_status.is_none(),
+            "the `defect` verdict must not survive the fix — leaving it produced a row \
+             that was finished to the cascade and an open defect to the tally, or \
+             worse, unscored by both while its last recorded verdict said `defect`"
         );
 
         assert_eq!(
             plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
             "completed",
-            "completed work is finished regardless of a stale QA verdict"
+            "completed work closes the plan"
         );
         assert_eq!(
             plans::count_completion_residue(&s.db.conn, &s.plan_id).unwrap(),
@@ -3175,14 +3202,14 @@ mod tests {
             "and so must the QA tally — otherwise `converged` stays false for a plan \
              that is closed and cannot reopen"
         );
-        // It does not score as `pass` either: the verdict says `defect` and the
-        // `pass` arm keys on `qa_status='pass'` or an absent verdict. So the row is
-        // in `total` and no bucket — the same unscored set `todo`/`in_progress`
-        // occupy. That is the honest reading: nobody recorded a passing result for
-        // this scenario, and the tally does not invent one.
+        // And it scores as `pass`, via the status-based drift catch — which is the
+        // honest result once the verdict is gone: the scenario was fixed and
+        // completed. Leaving `defect` on the row instead put it in NO bucket, so a
+        // domain could be declared converged while the last recorded verdict for one
+        // of its scenarios said `defect`, with nothing surfacing that.
         assert_eq!(
-            counts.pass, 1,
-            "only the scenario with a recorded pass counts as one"
+            counts.pass, 2,
+            "the fixed scenario counts as passing, not as unscored"
         );
         assert_eq!(counts.total, 2, "both rows are still scheduled work");
     }

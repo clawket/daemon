@@ -1297,17 +1297,29 @@ async fn convergence_status(
     };
 
     let converged = counts.defect == 0 && counts.scenario_error == 0;
-    // The baseline is recomputed from the previous plan's rows on every call, not
-    // snapshotted — so anything that changes what those rows tally moves it after
-    // the fact. Cancelling one of round R's defects lowers R's count, which can
-    // make R+1 read as a regression against the corrected figure, and this verdict
-    // is appended to a durable audit entry below. That is arguably the honest
-    // reading (a withdrawn defect was never a real one), and the live-baseline
-    // property predates this criterion — but a per-round snapshot is what would
-    // make the audit trail immutable, and that is a design change, not a fix.
-    let regression_detected = prev_summary
-        .as_ref()
-        .map(|p| counts.defect > 0 && counts.defect > p.counts.defect)
+
+    // The baseline is the count round R-1 REPORTED at the time, read from the audit
+    // log, not a re-tally of R-1's rows now.
+    //
+    // Re-tallying makes the comparison unstable in the ordinary case: fixing a
+    // defect is `blocked → done` with no verdict on the patch, which drops that row
+    // from R-1's count. R1 finds 5, R2 has 2 left, R1 re-tallies as 0 — and R2 is
+    // written to a durable audit entry as `regression` when defects strictly
+    // decreased. Cancellation has the same effect, and the previous reasoning
+    // ("a withdrawn defect was never a real one") was at least arguable there; it
+    // does not survive being extended to a defect that was fixed.
+    //
+    // The audit log already records what each round reported, so the snapshot needs
+    // no new storage. Falling back to the live tally keeps rounds that predate the
+    // audit entry working — those can still drift, which is strictly better than
+    // refusing to compare.
+    let logged_prev_defect = round
+        .and_then(|r| r.checked_sub(1))
+        .and_then(|prev| read_logged_round_defects(&conn, &plan.title, prev));
+    let baseline_defect =
+        logged_prev_defect.or_else(|| prev_summary.as_ref().map(|p| p.counts.defect));
+    let regression_detected = baseline_defect
+        .map(|base| counts.defect > 0 && counts.defect > base)
         .unwrap_or(false);
 
     // R3 DOGFOOD-035 fix: append a per-round decision line to a domain-scoped
@@ -1659,6 +1671,58 @@ pub(crate) fn query_plan_task_counts(
     })
 }
 
+/// The defect count round `n` reported when it ran, read back from the audit log
+/// that `convergence_status` appends to (`R<n>: defect=X, …`).
+///
+/// This exists so regression detection compares against what was reported rather
+/// than a re-tally of that round's rows, which moves whenever a defect is fixed or
+/// withdrawn. The log line is the only per-round snapshot in the system; parsing it
+/// avoids adding a second store that could disagree with it.
+///
+/// `None` when the entry, the round's line, or the field is absent — the caller
+/// falls back to the live tally rather than refusing to compare.
+fn read_logged_round_defects(
+    conn: &rusqlite::Connection,
+    current_title: &str,
+    round: u32,
+) -> Option<i64> {
+    let domain = parse_round_plan_title(current_title).map(|(d, _)| d)?;
+    let audit_title = format!("convergence audit log — {}", domain);
+    let entry = knowledge::list(
+        conn,
+        knowledge::ListFilter {
+            type_: Some("convergence_audit"),
+            ..Default::default()
+        },
+    )
+    .ok()?
+    .into_iter()
+    .find(|a| a.title == audit_title)?;
+
+    parse_logged_round_defects(&entry.content, round)
+}
+
+/// Pull `defect=N` for round `n` out of an audit-log body. Split from the DB lookup
+/// so the parsing — which is where a format drift would bite — is testable.
+///
+/// Last matching line wins: a re-run appends a fresh line, and the newest is what
+/// that round last reported.
+fn parse_logged_round_defects(body: &str, round: u32) -> Option<i64> {
+    let prefix = format!("R{round}:");
+    body.lines()
+        .filter_map(|l| {
+            // The round label and the first field share a segment
+            // (`R1: defect=5`), so strip the label before splitting on commas —
+            // otherwise the first field never matches `defect=`.
+            let rest = l.trim_start().strip_prefix(&prefix)?;
+            rest.split(',')
+                .map(str::trim)
+                .find_map(|f| f.strip_prefix("defect="))
+                .and_then(|v| v.trim().parse::<i64>().ok())
+        })
+        .next_back()
+}
+
 /// Find the previous round's plan (round = prev_round_num) in the same project.
 fn find_prev_round_plan(
     conn: &rusqlite::Connection,
@@ -1698,4 +1762,55 @@ fn count_scenario_ids_in_content(content: &str) -> u32 {
     static SC_LINE_RE: OnceLock<Regex> = OnceLock::new();
     let re = SC_LINE_RE.get_or_init(|| Regex::new(r"US-[A-Z][A-Z0-9-]*-\d{3,}").unwrap());
     content.lines().filter(|line| re.is_match(line)).count() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_logged_round_defects;
+
+    /// The audit line is written by `convergence_status` as
+    /// `R<n>: defect=X, scenario_error=Y, pass=Z, decision=…`. Regression detection
+    /// reads its baseline back out of it, so a format drift would silently make
+    /// every comparison fall back to the live re-tally — the instability the
+    /// snapshot exists to remove. These pin the shape.
+    #[test]
+    fn reads_the_defect_count_a_round_reported() {
+        let body = "R1: defect=5, scenario_error=0, pass=3, decision=continue\n\
+                    R2: defect=2, scenario_error=1, pass=6, decision=continue";
+        assert_eq!(parse_logged_round_defects(body, 1), Some(5));
+        assert_eq!(parse_logged_round_defects(body, 2), Some(2));
+    }
+
+    #[test]
+    fn a_rerun_appends_and_the_newest_line_wins() {
+        // A round re-run logs again; the later line is what it last reported.
+        let body = "R1: defect=5, scenario_error=0, pass=3, decision=continue\n\
+                    R1: defect=1, scenario_error=0, pass=7, decision=continue";
+        assert_eq!(parse_logged_round_defects(body, 1), Some(1));
+    }
+
+    #[test]
+    fn round_numbers_are_not_matched_by_prefix() {
+        // "R1:" must not match the R10 line — otherwise round 1's baseline would
+        // silently come from round 10.
+        let body = "R10: defect=9, scenario_error=0, pass=0, decision=continue";
+        assert_eq!(parse_logged_round_defects(body, 1), None);
+        assert_eq!(parse_logged_round_defects(body, 10), Some(9));
+    }
+
+    #[test]
+    fn absent_or_malformed_yields_none_so_the_caller_falls_back() {
+        assert_eq!(parse_logged_round_defects("", 1), None);
+        assert_eq!(parse_logged_round_defects("R2: defect=1", 1), None);
+        assert_eq!(
+            parse_logged_round_defects("R1: scenario_error=0, pass=3", 1),
+            None,
+            "no defect field"
+        );
+        assert_eq!(
+            parse_logged_round_defects("R1: defect=oops, pass=3", 1),
+            None,
+            "unparsable count"
+        );
+    }
 }
