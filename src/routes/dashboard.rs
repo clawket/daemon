@@ -394,9 +394,25 @@ async fn dashboard(
                     });
                 let (defect, scenario_error, pass) =
                     (counts.defect, counts.scenario_error, counts.pass);
+                // Baseline from the audit log, the same snapshot
+                // `/discover-loop/status` compares against — not the count this
+                // loop just re-derived for the previous round. Re-deriving moves
+                // after the fact (fixing a defect drops its row from the earlier
+                // round's tally), so the two surfaces would print different
+                // verdicts for the same round: exactly the divergence the shared
+                // tally above was extracted to end, one layer up in the comparison
+                // instead of the count. Falls back to the walked value for rounds
+                // logged before the snapshot existed.
+                let baseline = crate::routes::discover::logged_round_defects(
+                    &conn,
+                    &plan.project_id,
+                    &plan.title,
+                    round_num.saturating_sub(1),
+                )
+                .or(prev_defect);
                 let decision = if defect == 0 && scenario_error == 0 {
                     "converged"
-                } else if defect > 0 && prev_defect.map(|prev| defect > prev).unwrap_or(false) {
+                } else if defect > 0 && baseline.map(|prev| defect > prev).unwrap_or(false) {
                     "regression"
                 } else {
                     "continue"

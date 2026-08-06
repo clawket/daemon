@@ -1315,7 +1315,7 @@ async fn convergence_status(
     // refusing to compare.
     let logged_prev_defect = round
         .and_then(|r| r.checked_sub(1))
-        .and_then(|prev| read_logged_round_defects(&conn, &plan.title, prev));
+        .and_then(|prev| logged_round_defects(&conn, &plan.project_id, &plan.title, prev));
     let baseline_defect =
         logged_prev_defect.or_else(|| prev_summary.as_ref().map(|p| p.counts.defect));
     let regression_detected = baseline_defect
@@ -1336,15 +1336,8 @@ async fn convergence_status(
     } else {
         "continue"
     };
-    let line = format!(
-        "R{round}: defect={defect}, scenario_error={se}, pass={pass}, decision={decision}",
-        round = round.unwrap_or(0),
-        defect = counts.defect,
-        se = counts.scenario_error,
-        pass = counts.pass,
-        decision = decision,
-    );
-    let audit_title = format!("convergence audit log — {}", domain);
+    let line = format_audit_line(round.unwrap_or(0), &counts, decision);
+    let audit_title = audit_log_title(&plan.project_id, &domain);
     let existing_audit = knowledge::list(
         &conn,
         knowledge::ListFilter {
@@ -1671,6 +1664,33 @@ pub(crate) fn query_plan_task_counts(
     })
 }
 
+/// Title of the per-domain convergence audit entry.
+///
+/// One function so the writer (`convergence_status`) and the reader
+/// (`logged_round_defects`) cannot drift: the reader finds the entry by exact
+/// title, so a change here that reached only one of them would silently degrade the
+/// snapshot back to a live re-tally.
+///
+/// Scoped by project because two projects can share a domain name, and the baseline
+/// this feeds must not cross that boundary. Knowledge rows carry `plan_id` only, and
+/// this entry spans every round of a domain, so no single plan can own it — the
+/// project id goes in the title instead.
+fn audit_log_title(project_id: &str, domain: &str) -> String {
+    format!("convergence audit log — {project_id} — {domain}")
+}
+
+/// One round's line in that entry. Paired with `parse_logged_round_defects`, which
+/// reads it back; the round-trip is pinned by tests so a reformat here cannot
+/// silently stop the reader from finding `defect=`.
+fn format_audit_line(round: u32, counts: &TaskCounts, decision: &str) -> String {
+    format!(
+        "R{round}: defect={defect}, scenario_error={se}, pass={pass}, decision={decision}",
+        defect = counts.defect,
+        se = counts.scenario_error,
+        pass = counts.pass,
+    )
+}
+
 /// The defect count round `n` reported when it ran, read back from the audit log
 /// that `convergence_status` appends to (`R<n>: defect=X, …`).
 ///
@@ -1681,13 +1701,19 @@ pub(crate) fn query_plan_task_counts(
 ///
 /// `None` when the entry, the round's line, or the field is absent — the caller
 /// falls back to the live tally rather than refusing to compare.
-fn read_logged_round_defects(
+///
+/// Scoped by project as well as domain. The baseline this replaced came from
+/// `find_prev_round_plan`, which filters on `project_id`; the audit entry is keyed
+/// by title alone, so two projects using the same domain name would have read each
+/// other's counts into a durable `regression` verdict.
+pub(crate) fn logged_round_defects(
     conn: &rusqlite::Connection,
+    project_id: &str,
     current_title: &str,
     round: u32,
 ) -> Option<i64> {
     let domain = parse_round_plan_title(current_title).map(|(d, _)| d)?;
-    let audit_title = format!("convergence audit log — {}", domain);
+    let audit_title = audit_log_title(project_id, &domain);
     let entry = knowledge::list(
         conn,
         knowledge::ListFilter {
@@ -1766,7 +1792,44 @@ fn count_scenario_ids_in_content(content: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_logged_round_defects;
+    use super::{audit_log_title, format_audit_line, parse_logged_round_defects, TaskCounts};
+
+    /// The writer and the reader are two halves of one format. Pinning only the
+    /// parser (which is what the previous round did) leaves a reformat of
+    /// `format_audit_line` green while the reader silently stops finding `defect=`
+    /// and every comparison degrades to the live re-tally — the drift the snapshot
+    /// exists to prevent. This closes the loop.
+    #[test]
+    fn the_written_line_is_readable_by_the_parser() {
+        let counts = TaskCounts {
+            pass: 6,
+            defect: 3,
+            scenario_error: 1,
+            total: 10,
+        };
+        let line = format_audit_line(4, &counts, "continue");
+        assert_eq!(
+            parse_logged_round_defects(&line, 4),
+            Some(3),
+            "round-trip must hold; got line: {line}"
+        );
+        assert_eq!(
+            parse_logged_round_defects(&line, 3),
+            None,
+            "and must not match a different round"
+        );
+    }
+
+    /// Two projects can use the same domain name, and the baseline must not cross
+    /// that boundary — it would put another project's defect count into a durable
+    /// `regression` verdict.
+    #[test]
+    fn audit_titles_are_scoped_per_project() {
+        let a = audit_log_title("PROJ-a", "Dogfood");
+        let b = audit_log_title("PROJ-b", "Dogfood");
+        assert_ne!(a, b, "same domain, different project → different entry");
+        assert!(a.contains("PROJ-a") && a.contains("Dogfood"), "got: {a}");
+    }
 
     /// The audit line is written by `convergence_status` as
     /// `R<n>: defect=X, scenario_error=Y, pass=Z, decision=…`. Regression detection

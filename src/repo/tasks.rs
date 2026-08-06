@@ -629,6 +629,41 @@ pub fn update(
         resolve_id(conn, id)?.ok_or_else(|| anyhow::anyhow!("Task not found: {}", id))?;
     let old = get(conn, &canonical)?;
 
+    // A `defect` verdict cannot outlive the work it was written about: completing a
+    // fixed defect with `PATCH {"status":"done","evidence":"…"}` left `done` +
+    // `defect` on the row, a pair five readers each interpreted their own way, and
+    // their disagreements are what this change set spent six rounds chasing.
+    //
+    // Folded into `f` here — before the SQL, the audit comparison and the cascade
+    // dispatch read it — rather than appended to the SQL alone. Writing the column
+    // behind their backs made this the one `qa_status` transition with no audit
+    // trail, and it is the most frequent one.
+    //
+    // Narrow on purpose: `old` must actually hold `defect`, not merely "the patch
+    // said nothing about the verdict".
+    //   - `bulk_sync` transcribes a fresh row by CREATE-ing with the verdict and then
+    //     patching `status` alone (create hardcodes `todo`). A blanket rule NULLed the
+    //     `pass` it wrote one statement earlier — silently, because the tally's
+    //     status-based drift arm re-scored it as pass while `stats_by_batch`,
+    //     `?qa_status=pass` and the round-diff endpoints, which read the column,
+    //     saw nothing.
+    //   - A `pass` verdict on a completed row is not stale; it agrees with the state.
+    //
+    // Only `done`. Clearing on `cancelled` would make a withdrawn row
+    // indistinguishable from `bulk_sync`'s `scenario_error` transcription (also
+    // `cancelled`), so a withdrawal would report a scenario-layer failure and hold
+    // the round open — the lockout, reintroduced.
+    let mut f = f;
+    if f.qa_status.is_none()
+        && f.status.as_deref() == Some("done")
+        && old
+            .as_ref()
+            .is_some_and(|t| t.qa_status.as_deref() == Some("defect"))
+    {
+        f.qa_status = Some(None);
+    }
+    let f = f;
+
     if let Some(ref new_title) = f.title {
         if new_title.trim().is_empty() {
             bail!("INVALID_TITLE: title cannot be empty");
@@ -830,30 +865,9 @@ pub fn update(
         "escalation_reason = ?",
         &f.escalation_reason,
     );
+    // Carries the stale-defect clear folded in at the top of this function, so the
+    // SQL, the audit row and the cascade dispatch all see one decision.
     push_str_opt(&mut sets, &mut vals, "qa_status = ?", &f.qa_status);
-    // A `defect` verdict cannot outlive the work it was written about. Completing a
-    // task without saying anything about `qa_status` clears it, because
-    // `PATCH {"status":"done","evidence":"…"}` IS how a defect gets fixed — and
-    // leaving the verdict behind produced a row that was finished to the cascade and
-    // an open defect to the QA tally. Five readers each special-cased that pair,
-    // slightly differently, and their disagreements are what this change set spent
-    // six rounds chasing. Removing the pair at the write site beats teaching every
-    // reader to interpret it.
-    //
-    // The cleared row then reads as `pass` through the status-based drift catch,
-    // which is the honest result: the scenario was fixed and completed.
-    //
-    // Only `done`. Clearing on `cancelled` would make a withdrawn row
-    // indistinguishable from `bulk_sync`'s `scenario_error` transcription (which is
-    // also `cancelled`), so a withdrawal would start reporting a scenario-layer
-    // failure and hold the round open — the lockout, reintroduced.
-    //
-    // An explicit `qa_status` in the same patch wins: `bulk_sync` writes status and
-    // verdict together, and that is a report, not a state change to reinterpret.
-    if f.qa_status.is_none() && f.status.as_deref() == Some("done") {
-        sets.push("qa_status = ?");
-        vals.push(rusqlite::types::Value::Null);
-    }
     push_str_opt(&mut sets, &mut vals, "scenario_id = ?", &f.scenario_id);
     push_str_opt(&mut sets, &mut vals, "defect_task = ?", &f.defect_task);
     push_str_opt(
@@ -3122,6 +3136,60 @@ mod tests {
             counts.defect == 0 && counts.scenario_error == 0,
             "the round must read converged — the plan is closed and cannot reopen"
         );
+    }
+
+    // `bulk_sync` transcribes a fresh row in two calls: CREATE with the verdict
+    // (status is hardcoded `todo` there), then a patch carrying `status` alone. That
+    // second call looks exactly like an operator completing a task, so a clear keyed
+    // on "the patch said nothing about the verdict" wiped the `pass` written one
+    // statement earlier. Nothing failed: the tally re-scores a `(done, NULL)` row as
+    // pass through its drift arm, while `stats_by_batch`, `?qa_status=pass` and the
+    // round-diff endpoints read the column and saw an empty result.
+    #[test]
+    fn a_verdict_written_at_create_survives_the_status_patch() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        // Both rows up front: completing the first would close the plan and
+        // `PLAN_COMPLETED` would then refuse the second create.
+        let rows: Vec<(&str, Task)> = ["pass", "scenario_error"]
+            .into_iter()
+            .map(|v| (v, mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), v)))
+            .collect();
+
+        for (verdict, t) in &rows {
+            let verdict = *verdict;
+            update(
+                &mut s.db.conn,
+                &t.id,
+                UpdateFields {
+                    qa_status: Some(Some(verdict.into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // The status-only follow-up, byte for byte what bulk_sync sends.
+            update(
+                &mut s.db.conn,
+                &t.id,
+                UpdateFields {
+                    status: Some("done".into()),
+                    evidence: Some(Some("test:create-then-status".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                get(&s.db.conn, &t.id)
+                    .unwrap()
+                    .unwrap()
+                    .qa_status
+                    .as_deref(),
+                Some(verdict),
+                "a `{verdict}` verdict agrees with its terminal status and must survive \
+                 it — only a stale `defect` is cleared"
+            );
+        }
     }
 
     // The same trap on the other terminal axis. `blocked → done` is legal too, and
