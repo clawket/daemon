@@ -105,10 +105,16 @@ pub struct UpdateFields {
 /// to the same set in memory.
 pub fn count_completion_residue(conn: &Connection, plan_id: &str) -> Result<i64> {
     let n: i64 = conn.query_row(
+        // The `qa_status` clause is the SQL half of `repo::tasks::container_terminal`:
+        // a QA defect is transcribed as `status = 'blocked'` but is work inside the
+        // plan, so it still counts as residue. Without it this gate would pass a
+        // plan the cascade now refuses to complete — the two-paths-disagree defect
+        // this function exists to prevent.
         "SELECT COUNT(*) FROM tasks t
          JOIN units u ON t.unit_id = u.id
          WHERE u.plan_id = ?1 AND t.cycle_id IS NOT NULL
-           AND t.status NOT IN ('done', 'cancelled', 'blocked')",
+           AND (t.status NOT IN ('done', 'cancelled', 'blocked')
+                OR t.qa_status = 'defect')",
         rusqlite::params![plan_id],
         |r| r.get(0),
     )?;

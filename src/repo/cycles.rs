@@ -251,10 +251,17 @@ pub fn complete(conn: &Connection, id: &str) -> Result<Option<Cycle>> {
 /// Terminal statuses: done, cancelled, blocked. (`blocked` is treated terminal because
 /// it indicates external dependency — the cycle Exit Gate can pass on tracked blockers.)
 /// Sentinel phrase "cannot complete cycle:" maps to HTTP 409 in routes/error.rs.
+///
+/// A QA defect is the exception, and it is why `qa_status` appears here: it is
+/// transcribed as `status = 'blocked'` but is work inside the round, not an
+/// external blocker. `repo::tasks::container_terminal` makes the same distinction
+/// in memory; if this gate omitted it, the manual `cycle complete` would accept a
+/// round the cascade refuses to close.
 fn assert_no_todo_residue(conn: &Connection, cycle_id: &str) -> Result<()> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM tasks
-         WHERE cycle_id = ?1 AND status NOT IN ('done', 'cancelled', 'blocked')",
+         WHERE cycle_id = ?1
+           AND (status NOT IN ('done', 'cancelled', 'blocked') OR qa_status = 'defect')",
         params![cycle_id],
         |r| r.get(0),
     )?;
@@ -263,7 +270,8 @@ fn assert_no_todo_residue(conn: &Connection, cycle_id: &str) -> Result<()> {
     }
     let mut stmt = conn.prepare(
         "SELECT COALESCE(ticket_number, id) FROM tasks
-         WHERE cycle_id = ?1 AND status NOT IN ('done', 'cancelled', 'blocked')
+         WHERE cycle_id = ?1
+           AND (status NOT IN ('done', 'cancelled', 'blocked') OR qa_status = 'defect')
          ORDER BY idx
          LIMIT 5",
     )?;
