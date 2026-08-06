@@ -190,6 +190,10 @@ fn parse_event_name(event: &'static str) -> (&'static str, &'static str) {
         "knowledge:deleted" => ("knowledge", "deleted"),
         "comment:created" => ("comment", "created"),
         "comment:deleted" => ("comment", "deleted"),
+        // `routes::discover` emits this when a QA round begins. Unmapped it fell
+        // to ("unknown","unknown"), so `/events?entity_types=…` could not filter
+        // it and subscribers saw an event they could not classify.
+        "discover-loop:started" => ("discover-loop", "started"),
         _ => {
             // Fallback: split on ':'
             if let Some(pos) = event.find(':') {

@@ -266,6 +266,9 @@ async fn next_round(
         domain: String,
         round: u32,
         unit_areas: Vec<String>,
+        /// Cycles this call closed, carried out so the SSE emit can happen after
+        /// the guard is dropped.
+        superseded_cycles: Vec<String>,
     }
     let prep: PrepResult = {
         let conn = app.conn();
@@ -347,20 +350,21 @@ async fn next_round(
                 .map(|c| c.id)
                 .collect()
         };
-        // `force_complete`, not `complete`: this path is by construction the
-        // had-defects path — the ALREADY_CONVERGED guard above refuses the call at
-        // defect=0 — so the prior cycle always holds defect rows, which the residue
-        // gate refuses. With only a warning on failure the cycle would stay
-        // `active` and R+1 would run beside it, which is exactly what this block
-        // exists to prevent. Superseding a round is not the same act as declaring
-        // it finished.
+        // `force_complete`, not `complete`: starting round R+1 supersedes round R
+        // whatever R left behind, and an unresolved defect is exactly what it
+        // leaves. The residue gate refuses those rows, and the only handling here
+        // is a warning, so a gated close would leave the cycle `active` and let
+        // R+1 run beside it — which is what this block exists to prevent.
+        // Superseding a round is not the same act as declaring it finished.
+        let mut superseded: Vec<String> = Vec::new();
         for cid in &cycles_to_complete {
-            if let Err(e) = cycles::force_complete(&conn, cid) {
-                tracing::warn!(
+            match cycles::force_complete(&conn, cid) {
+                Ok(_) => superseded.push(cid.clone()),
+                Err(e) => tracing::warn!(
                     cycle_id = %cid,
                     error = %e,
                     "discover-loop:next-round — failed to auto-complete previous cycle (continuing)"
-                );
+                ),
             }
         }
 
@@ -369,8 +373,20 @@ async fn next_round(
             domain,
             round: next_round_num,
             unit_areas,
+            superseded_cycles: superseded,
         }
     };
+
+    // Announce the closures. `force_complete` is a repo-layer UPDATE and the
+    // `cycle:updated` emit lives in the route handlers this path bypasses, so
+    // without this a subscriber keeps rendering round R as active until some
+    // unrelated event arrives — the row is repaired, the wire is not.
+    for cid in &prep.superseded_cycles {
+        app.emit(
+            "cycle:updated",
+            serde_json::json!({ "id": cid, "status": "completed" }),
+        );
+    }
 
     let start_body = StartBody {
         project_id: prep.project_id,
@@ -1545,23 +1561,42 @@ fn resolve_plan(
 /// arm, but still inflated `total`.
 ///
 /// Note `blocked` stays a defect signal here: unlike the plan-completion gates
-/// (`repo::tasks::CONTAINER_TERMINAL`), a QA round asks "did the scenarios
+/// (`repo::tasks::container_terminal`), a QA round asks "did the scenarios
 /// pass", and a blocked scenario did not pass. Same status, different question
 /// — the exclusion that carries across is deferral, not blockedness. This is
 /// one reader of "what belongs to this plan"; they are enumerated in one place,
 /// at `routes::plans::counts`.
+///
+/// `cancelled` is the one place this reader must agree with those gates, and the
+/// reason is not symmetry but termination: a cancelled row is finished work, so
+/// the gates close the plan on it. If this reader still called it a defect,
+/// `converged` would stay false for a plan that can never reopen. So a cancelled
+/// row scores as `scenario_error` (withdrawn) regardless of the verdict left on
+/// it — the buckets stay mutually exclusive, and `total` is unaffected.
 pub(crate) fn query_plan_task_counts(
     conn: &rusqlite::Connection,
     plan_id: &str,
 ) -> anyhow::Result<TaskCounts> {
     let (pass, defect, scenario_error, total): (i64, i64, i64, i64) = conn
         .query_row(
+            // A `cancelled` row does not report a defect, whatever verdict it still
+            // carries. `qa_status` is not cleared by a status change, so abandoning
+            // a defect leaves `cancelled` + `defect` behind — and the completion
+            // gates treat that as finished (`repo::tasks::container_terminal` keys
+            // on the pair `blocked AND defect`). Counting it here would put this
+            // reader out of step with them: the plan would be `completed` while
+            // `converged` stayed false forever, which is the two-paths-disagree
+            // failure the shared criterion exists to prevent. Scored as
+            // scenario_error instead, matching the status arm just below.
             "SELECT
                 SUM(CASE WHEN t.qa_status = 'pass' OR (t.qa_status IS NULL AND t.status = 'done')
                          THEN 1 ELSE 0 END),
-                SUM(CASE WHEN t.qa_status = 'defect' OR (t.qa_status IS NULL AND t.status = 'blocked')
+                SUM(CASE WHEN (t.qa_status = 'defect' AND t.status != 'cancelled')
+                            OR (t.qa_status IS NULL AND t.status = 'blocked')
                          THEN 1 ELSE 0 END),
-                SUM(CASE WHEN t.qa_status = 'scenario_error' OR (t.qa_status IS NULL AND t.status = 'cancelled')
+                SUM(CASE WHEN t.qa_status = 'scenario_error'
+                            OR (t.qa_status IS NULL AND t.status = 'cancelled')
+                            OR (t.qa_status = 'defect' AND t.status = 'cancelled')
                          THEN 1 ELSE 0 END),
                 COUNT(t.id)
              FROM tasks t

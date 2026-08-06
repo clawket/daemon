@@ -1954,8 +1954,14 @@ fn parse_update(v: &Value) -> ApiResult<tasks::UpdateFields> {
     if let Some(v) = obj.get("escalation_reason") {
         f.escalation_reason = Some(value_to_opt_string(v));
     }
-    if let Some(s) = obj.get("qa_status").and_then(Value::as_str) {
-        f.qa_status = Some(Some(s.into()));
+    // `value_to_opt_string`, not `as_str`: an explicit `null` must CLEAR the
+    // verdict, the same 3-state contract `blocked_reason` / `tier_used` /
+    // `scenario_id` follow. With `as_str` a `{"qa_status": null}` patch parsed to
+    // `None` and returned 200 having changed nothing — and since the completion
+    // criterion reads this field, that silently withheld the one transition that
+    // settles a `blocked` defect row without also changing its status.
+    if let Some(v) = obj.get("qa_status") {
+        f.qa_status = Some(value_to_opt_string(v));
     }
     if let Some(v) = obj.get("scenario_id") {
         // US-CKT-SCHEMA-007: allow null to clear scenario_id, or regex-validated string.

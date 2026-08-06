@@ -106,8 +106,8 @@ pub struct UpdateFields {
 /// the two cannot drift — they used to hold separate copies of the predicate,
 /// and a test could pin one while the other silently regressed. The Rust-side
 /// twin is `repo::tasks::container_terminal`, which `cascade_complete` applies to
-/// the same criterion in memory (it wraps the `CONTAINER_TERMINAL` set with the
-/// defect carve-out). Change one and the other must move.
+/// the same criterion in memory (`container_terminal` wraps the terminal-status
+/// set with the defect carve-out). Change one and the other must move.
 pub fn count_completion_residue(conn: &Connection, plan_id: &str) -> Result<i64> {
     let n: i64 = conn.query_row(
         // The `qa_status` clause is the SQL half of `repo::tasks::container_terminal`:

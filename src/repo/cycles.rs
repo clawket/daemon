@@ -250,15 +250,18 @@ pub fn complete(conn: &Connection, id: &str) -> Result<Option<Cycle>> {
 /// Close a cycle without consulting the residue gate.
 ///
 /// For callers that are *superseding* a cycle rather than declaring it finished.
-/// The QA next-round flow is the case that needs it: `next_round` is reachable
-/// only when the previous round had defects (its `ALREADY_CONVERGED` guard
-/// refuses the call at defect=0), so the prior cycle always holds defect rows and
-/// the residue gate would always refuse it. Its caller only warns on failure, so
-/// the cycle would silently stay `active` and the next round would run alongside
-/// it — defeating the very invariant that block exists to keep (DOGFOOD-004).
+/// Superseding is a decision about the container, so the contents cannot veto it —
+/// the QA next-round flow moves on whether or not the previous round resolved
+/// everything, and a defect row is precisely what it leaves behind. Its caller
+/// only warns on failure, so a gated close would leave the cycle `active` and let
+/// the next round run alongside it, which is the invariant that block exists to
+/// keep (DOGFOOD-004).
 ///
-/// `activate` already does exactly this for auto-deactivation, and for the same
-/// reason: superseding must not be blocked by the superseded cycle's contents.
+/// `activate` does the same thing inline for auto-deactivation, and for the same
+/// reason. Left as-is rather than routed through here: `activate`'s copy runs
+/// inside its own multi-statement flow against a borrowed `&Connection`, and
+/// collapsing them is a refactor with no behavioural content — worth doing, not
+/// worth smuggling into a fix.
 pub fn force_complete(conn: &Connection, id: &str) -> Result<Option<Cycle>> {
     conn.execute(
         "UPDATE cycles SET status = 'completed', ended_at = ?1 WHERE id = ?2",
@@ -270,7 +273,10 @@ pub fn force_complete(conn: &Connection, id: &str) -> Result<Option<Cycle>> {
 /// PDD-230: Reject completion when the cycle still has tasks NOT in terminal status.
 /// Terminal statuses: done, cancelled, blocked. (`blocked` is treated terminal because
 /// it indicates external dependency — the cycle Exit Gate can pass on tracked blockers.)
-/// Sentinel phrase "cannot complete cycle:" maps to HTTP 409 in routes/error.rs.
+/// The message carries the `CYCLE_HAS_NON_TERMINAL_TASKS:` prefix, which
+/// `routes::error` maps to a coded 409. (Its older `contains("cannot complete
+/// cycle:")` arm still matches the same text and yields the same status, so it
+/// never fires first — the coded prefix is the live path.)
 ///
 /// A QA defect is the exception, and it is why `qa_status` appears here: it is
 /// transcribed as `status = 'blocked'` but is work inside the round, not an
@@ -672,10 +678,10 @@ mod tests {
             "the defect is the only residue, got: {msg}"
         );
 
-        // Superseding is a different act from finishing. `next_round` reaches this
-        // path ONLY when the round had defects, so a gated close would always
-        // refuse — and its caller merely warns, leaving the cycle `active` while
-        // the next round runs beside it. `force_complete` is what that flow uses.
+        // Superseding is a different act from finishing. `next_round` moves past a
+        // round whatever it left behind, and a defect row is what it leaves — a
+        // gated close refuses those, and its caller merely warns, leaving the cycle
+        // `active` while the next round runs beside it. Hence `force_complete`.
         let superseded = force_complete(&db.conn, &cycle_id).unwrap().unwrap();
         assert_eq!(
             superseded.status, "completed",
