@@ -221,8 +221,9 @@ async fn update(
                         ));
                     }
                     // Existing residue gate: planning cycles still block, as do
-                    // scheduled tasks that are todo/in_progress. `blocked` and
-                    // backlog tasks do not — see the query comment below.
+                    // scheduled tasks that are todo/in_progress. An external
+                    // `blocked` and backlog tasks do not; a `blocked` row carrying
+                    // an open QA defect does — see `count_completion_residue`.
                     let pending_cycles: i64 = conn
                         .query_row(
                             "SELECT COUNT(*) FROM cycles c
@@ -240,7 +241,7 @@ async fn update(
                     let pending_tasks = plans::count_completion_residue(&conn, &id).unwrap_or(0);
                     if pending_cycles > 0 || pending_tasks > 0 {
                         return Err(ApiError::conflict(format!(
-                            "Cannot complete plan: {} planning cycle(s) and {} scheduled task(s) still todo/in_progress",
+                            "Cannot complete plan: {} planning cycle(s) and {} scheduled task(s) still open (todo/in_progress, or an unresolved QA defect)",
                             pending_cycles, pending_tasks
                         )));
                     }

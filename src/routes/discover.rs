@@ -347,8 +347,15 @@ async fn next_round(
                 .map(|c| c.id)
                 .collect()
         };
+        // `force_complete`, not `complete`: this path is by construction the
+        // had-defects path — the ALREADY_CONVERGED guard above refuses the call at
+        // defect=0 — so the prior cycle always holds defect rows, which the residue
+        // gate refuses. With only a warning on failure the cycle would stay
+        // `active` and R+1 would run beside it, which is exactly what this block
+        // exists to prevent. Superseding a round is not the same act as declaring
+        // it finished.
         for cid in &cycles_to_complete {
-            if let Err(e) = cycles::complete(&conn, cid) {
+            if let Err(e) = cycles::force_complete(&conn, cid) {
                 tracing::warn!(
                     cycle_id = %cid,
                     error = %e,

@@ -87,7 +87,7 @@ pub struct UpdateFields {
 /// How much of this plan's own work is still outstanding — the single
 /// definition every completion gate asks (LM-11093).
 ///
-/// Two exclusions, for two different reasons:
+/// Two exclusions and one carve-out:
 ///   `blocked`          — waiting on something outside this plan, so holding the
 ///                        plan open cannot resolve it. Matches
 ///                        `repo::cycles::assert_no_todo_residue` (PDD-230),
@@ -97,24 +97,31 @@ pub struct UpdateFields {
 ///   `cycle_id IS NULL` — backlog: deferred via `task update --cycle ""`.
 ///                        `tasks.unit_id` is NOT NULL, so a detached task keeps
 ///                        its unit and this JOIN still reaches it.
+///   `blocked` + `qa_status = 'defect'`
+///                      — NOT excluded. `routes::discover::bulk_sync` transcribes
+///                        a QA defect as `blocked`, and a defect is work inside
+///                        the plan, so it still counts. See the body comment.
 ///
 /// Both the repo gate below and the route gate in `routes::plans` call this, so
 /// the two cannot drift — they used to hold separate copies of the predicate,
 /// and a test could pin one while the other silently regressed. The Rust-side
-/// twin is `repo::tasks::CONTAINER_TERMINAL`, which `cascade_complete` applies
-/// to the same set in memory.
+/// twin is `repo::tasks::container_terminal`, which `cascade_complete` applies to
+/// the same criterion in memory (it wraps the `CONTAINER_TERMINAL` set with the
+/// defect carve-out). Change one and the other must move.
 pub fn count_completion_residue(conn: &Connection, plan_id: &str) -> Result<i64> {
     let n: i64 = conn.query_row(
         // The `qa_status` clause is the SQL half of `repo::tasks::container_terminal`:
         // a QA defect is transcribed as `status = 'blocked'` but is work inside the
         // plan, so it still counts as residue. Without it this gate would pass a
         // plan the cascade now refuses to complete — the two-paths-disagree defect
-        // this function exists to prevent.
+        // this function exists to prevent. It is `blocked` AND `defect` for the
+        // same reason as the Rust twin: a stale verdict on a `cancelled` row must
+        // not pin the plan open forever.
         "SELECT COUNT(*) FROM tasks t
          JOIN units u ON t.unit_id = u.id
          WHERE u.plan_id = ?1 AND t.cycle_id IS NOT NULL
            AND (t.status NOT IN ('done', 'cancelled', 'blocked')
-                OR t.qa_status = 'defect')",
+                OR (t.status = 'blocked' AND t.qa_status = 'defect'))",
         rusqlite::params![plan_id],
         |r| r.get(0),
     )?;
@@ -134,11 +141,13 @@ pub fn update(conn: &Connection, id: &str, f: UpdateFields) -> Result<Option<Pla
         if status == "completed" {
             let pending_tasks = count_completion_residue(conn, id)?;
             if pending_tasks > 0 {
-                // Name the real criterion: a blocked or backlog task no longer
-                // appears here, so listing only done/cancelled would send the
-                // user looking for tasks the gate already accepted.
+                // Name the real criterion. A blocked or backlog task no longer
+                // appears here, so listing only done/cancelled would send the user
+                // looking for tasks the gate already accepted — and the count now
+                // also includes open QA defects, which ARE spelled `blocked`, so
+                // saying only "todo/in_progress" would hide them the other way.
                 bail!(
-                    "Cannot complete plan: {} scheduled task(s) are still todo/in_progress",
+                    "Cannot complete plan: {} scheduled task(s) still open (todo/in_progress, or an unresolved QA defect)",
                     pending_tasks
                 );
             }
