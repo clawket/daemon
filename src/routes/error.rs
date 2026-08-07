@@ -330,6 +330,49 @@ impl From<anyhow::Error> for ApiError {
         if msg.starts_with("ESCALATION_REASON_REQUIRED:") {
             return ApiError::bad_request_coded("ESCALATION_REASON_REQUIRED", msg);
         }
+        // ── /backup, /restore (repo::backup) ──────────────────────────────
+        // Bad user-supplied path (relative, empty, NUL byte) — the request
+        // itself is malformed, so 400.
+        if msg.starts_with("INVALID_BACKUP_PATH:") {
+            return ApiError::bad_request_coded("INVALID_BACKUP_PATH", msg);
+        }
+        // The named archive is not there — 404 matches the other *_NOT_FOUND
+        // codes in this ladder.
+        if msg.starts_with("BACKUP_ARCHIVE_NOT_FOUND:") {
+            return ApiError::not_found_coded("BACKUP_ARCHIVE_NOT_FOUND", msg);
+        }
+        // Archive is present but unreadable / not a Clawket backup / payload
+        // fails integrity_check. 400: the caller handed us bad input.
+        if msg.starts_with("BACKUP_ARCHIVE_INVALID:") {
+            return ApiError::bad_request_coded("BACKUP_ARCHIVE_INVALID", msg);
+        }
+        // `--merge` is refused outright rather than silently downgraded to a
+        // replace. 400 so the CLI surfaces the reason verbatim.
+        if msg.starts_with("MERGE_NOT_SUPPORTED:") {
+            return ApiError::bad_request_coded("MERGE_NOT_SUPPORTED", msg);
+        }
+        // Archive was produced by a newer schema than this binary understands.
+        // Deliberately NOT db.rs's SCHEMA_DOWNGRADE_REFUSED: that one aborts
+        // startup over the daemon's own store, this rejects one request over a
+        // caller-supplied file. The daemon stays up and another archive may
+        // work, so a client must be able to tell them apart.
+        if msg.starts_with("ARCHIVE_SCHEMA_TOO_NEW:") {
+            return ApiError::bad_request_coded("ARCHIVE_SCHEMA_TOO_NEW", msg);
+        }
+        // Backup could not be produced (e.g. header overflow). 500: the
+        // request was fine; the daemon failed. Built by hand rather than via
+        // `ApiError::internal`, which drops `code` — the same reason
+        // SQLITE_BUSY below does. A 500 is still an error clients branch on,
+        // and every other prefix in this ladder carries its code.
+        if msg.starts_with("BACKUP_FAILED:") {
+            return ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: msg,
+                code: Some("BACKUP_FAILED".to_string()),
+                details: None,
+                flat_details: false,
+            };
+        }
         if msg.starts_with("SQLITE_BUSY:") {
             return ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,

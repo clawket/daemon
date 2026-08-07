@@ -1,5 +1,6 @@
 pub mod activity_log;
 pub mod audit_log;
+pub mod backup;
 pub mod comments;
 pub mod cycles;
 pub mod knowledge;

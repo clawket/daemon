@@ -3,6 +3,7 @@ pub mod admin;
 pub mod agents;
 pub mod audit;
 pub mod backlog;
+pub mod backup;
 pub mod comments;
 pub mod continuation;
 pub mod cycles;
@@ -51,6 +52,7 @@ pub fn router() -> Router<AppState> {
         .merge(admin::router())
         .merge(audit::router())
         .merge(backlog::router())
+        .merge(backup::router())
         .merge(embed::router())
         .merge(events::router())
         .merge(timeline::router())

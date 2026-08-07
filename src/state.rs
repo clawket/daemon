@@ -50,6 +50,17 @@ struct Inner {
     /// this for online/runtime migrations, since startup migrations finish
     /// before the listener binds — but the contract is uniform either way).
     migration_in_progress: AtomicBool,
+    /// A restore replaced the database file under this process. The pool still
+    /// holds the old inode, so reads return pre-restore data and — worse —
+    /// writes COMMIT successfully into a file nothing will ever open again.
+    /// Measured: a write issued after the swap returns success and is absent
+    /// from the on-disk database once the connection closes.
+    ///
+    /// Once set, mutating routes answer 503 RESTART_REQUIRED until the daemon
+    /// restarts. There is no clearing path by design: the only way back is a
+    /// process that opens the restored file. Silently accepting writes that are
+    /// guaranteed to be discarded is the one outcome this must not allow.
+    restore_pending: AtomicBool,
     /// LM-10833: TCP auth token. Same value the tcp_auth middleware validates
     /// against. Held here so the SPA index handler can inject it as an
     /// HttpOnly cookie on first page load — browsers can't read the token
@@ -74,6 +85,7 @@ impl AppState {
                 pid: std::process::id(),
                 event_seq: AtomicU64::new(0),
                 migration_in_progress: AtomicBool::new(false),
+                restore_pending: AtomicBool::new(false),
                 tcp_token,
             }),
         }
@@ -93,6 +105,20 @@ impl AppState {
     /// US-CKT-SCHEMA-037: mark the migration gate. Migration runner must
     /// `set_migrating(true)` before opening a transaction and reset to false
     /// in both success and failure paths (typically via a guard/Drop).
+    /// True once a restore has swapped the database file under this process.
+    pub fn is_restore_pending(&self) -> bool {
+        self.inner
+            .restore_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Latch the restore-pending state. One-way: see the field docs.
+    pub fn mark_restore_pending(&self) {
+        self.inner
+            .restore_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn set_migrating(&self, v: bool) {
         self.inner.migration_in_progress.store(v, Ordering::SeqCst);
     }

@@ -30,6 +30,26 @@ pub async fn migration_gate(State(app): State<AppState>, req: Request, next: Nex
         method,
         &Method::POST | &Method::PATCH | &Method::PUT | &Method::DELETE
     );
+    // A restore swapped the database file under this process. Reads are stale
+    // and writes commit into an orphaned inode that nothing will reopen, so
+    // they are acknowledged and then lost. Refuse them until a restart binds
+    // the restored file. Checked before the migration branch because it is
+    // terminal for this process — there is no waiting it out.
+    if mutating && app.is_restore_pending() {
+        return ApiError {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: concat!(
+                "RESTART_REQUIRED: a restore replaced the database under this daemon. ",
+                "Writes would be accepted and then discarded, so they are refused. ",
+                "Restart clawketd to serve the restored data."
+            )
+            .to_string(),
+            code: Some("RESTART_REQUIRED".to_string()),
+            details: None,
+            flat_details: false,
+        }
+        .into_response();
+    }
     if mutating && app.is_migrating() {
         // Single source of truth for the 503 contract — see ApiError::migration_in_progress
         // (US-CKT-SCHEMA-037). The Retry-After header is added on the response after
