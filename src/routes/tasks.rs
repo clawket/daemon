@@ -1954,8 +1954,33 @@ fn parse_update(v: &Value) -> ApiResult<tasks::UpdateFields> {
     if let Some(v) = obj.get("escalation_reason") {
         f.escalation_reason = Some(value_to_opt_string(v));
     }
-    if let Some(s) = obj.get("qa_status").and_then(Value::as_str) {
-        f.qa_status = Some(Some(s.into()));
+    // `value_to_opt_string`, not `as_str`: an explicit `null` must CLEAR the
+    // verdict, the same 3-state contract `blocked_reason` / `tier_used` /
+    // `scenario_id` follow. With `as_str` a `{"qa_status": null}` patch parsed to
+    // `None` and returned 200 having changed nothing — and since the completion
+    // criterion reads this field, that silently withheld the one transition that
+    // settles a `blocked` defect row without also changing its status.
+    //
+    // Non-string values are REJECTED rather than coerced. `value_to_opt_string`
+    // folds numbers, bools and arrays to `None`, and the repo's enum validation
+    // only inspects `Some(Some(..))` — so `{"qa_status": 42}` would have slipped
+    // through as a clear, and clearing a `defect` cascades plan completion. Same
+    // shape as `scenario_id` below, which validates its string rather than
+    // accepting whatever coerces.
+    if let Some(v) = obj.get("qa_status") {
+        if !v.is_null() && !v.is_string() {
+            // `bad_request_coded`, not `bad_request`: the latter sets `code: None`,
+            // so a client branching on `code` would see this rejection as an
+            // anonymous 400 while the repo layer's rejection of a bad enum VALUE
+            // arrives as `code: "INVALID_QA_STATUS"` (mapped in `routes::error`).
+            // One error class, two shapes — `error-code-stability.md` requires the
+            // prefix and the code to travel together.
+            return Err(ApiError::bad_request_coded(
+                "INVALID_QA_STATUS",
+                "INVALID_QA_STATUS: qa_status must be a string or null. Valid: pass, defect, scenario_error",
+            ));
+        }
+        f.qa_status = Some(value_to_opt_string(v));
     }
     if let Some(v) = obj.get("scenario_id") {
         // US-CKT-SCHEMA-007: allow null to clear scenario_id, or regex-validated string.

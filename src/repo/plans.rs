@@ -84,6 +84,50 @@ pub struct UpdateFields {
     pub auto_advance: Option<bool>,
 }
 
+/// How much of this plan's own work is still outstanding — the single
+/// definition every completion gate asks (LM-11093).
+///
+/// Two exclusions and one carve-out:
+///   `blocked`          — waiting on something outside this plan, so holding the
+///                        plan open cannot resolve it. Matches
+///                        `repo::cycles::assert_no_todo_residue` (PDD-230),
+///                        which has always read it this way; the disagreement
+///                        let a cycle complete while its own plan refused,
+///                        citing a task that cycle had already accepted.
+///   `cycle_id IS NULL` — backlog: deferred via `task update --cycle ""`.
+///                        `tasks.unit_id` is NOT NULL, so a detached task keeps
+///                        its unit and this JOIN still reaches it.
+///   `blocked` + `qa_status = 'defect'`
+///                      — NOT excluded. `routes::discover::bulk_sync` transcribes
+///                        a QA defect as `blocked`, and a defect is work inside
+///                        the plan, so it still counts. See the body comment.
+///
+/// Both the repo gate below and the route gate in `routes::plans` call this, so
+/// the two cannot drift — they used to hold separate copies of the predicate,
+/// and a test could pin one while the other silently regressed. The Rust-side
+/// twin is `repo::tasks::container_terminal`, which `cascade_complete` applies to
+/// the same criterion in memory (`container_terminal` wraps the terminal-status
+/// set with the defect carve-out). Change one and the other must move.
+pub fn count_completion_residue(conn: &Connection, plan_id: &str) -> Result<i64> {
+    let n: i64 = conn.query_row(
+        // The `qa_status` clause is the SQL half of `repo::tasks::container_terminal`:
+        // a QA defect is transcribed as `status = 'blocked'` but is work inside the
+        // plan, so it still counts as residue. Without it this gate would pass a
+        // plan the cascade now refuses to complete — the two-paths-disagree defect
+        // this function exists to prevent. It is `blocked` AND `defect` for the
+        // same reason as the Rust twin: a stale verdict on a `cancelled` row must
+        // not pin the plan open forever.
+        "SELECT COUNT(*) FROM tasks t
+         JOIN units u ON t.unit_id = u.id
+         WHERE u.plan_id = ?1 AND t.cycle_id IS NOT NULL
+           AND (t.status NOT IN ('done', 'cancelled', 'blocked')
+                OR (t.status = 'blocked' AND t.qa_status = 'defect'))",
+        rusqlite::params![plan_id],
+        |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
 pub fn update(conn: &Connection, id: &str, f: UpdateFields) -> Result<Option<Plan>> {
     if let Some(status) = &f.status {
         if !matches!(status.as_str(), "draft" | "active" | "completed") {
@@ -95,16 +139,15 @@ pub fn update(conn: &Connection, id: &str, f: UpdateFields) -> Result<Option<Pla
 
         // FIX-DAEMON-003: completion residue gate
         if status == "completed" {
-            let pending_tasks: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM tasks t
-                 JOIN units u ON t.unit_id = u.id
-                 WHERE u.plan_id = ?1 AND t.status NOT IN ('done', 'cancelled')",
-                rusqlite::params![id],
-                |r| r.get(0),
-            )?;
+            let pending_tasks = count_completion_residue(conn, id)?;
             if pending_tasks > 0 {
+                // Name the real criterion. A blocked or backlog task no longer
+                // appears here, so listing only done/cancelled would send the user
+                // looking for tasks the gate already accepted — and the count now
+                // also includes open QA defects, which ARE spelled `blocked`, so
+                // saying only "todo/in_progress" would hide them the other way.
                 bail!(
-                    "Cannot complete plan: {} task(s) are not in done/cancelled state",
+                    "Cannot complete plan: {} scheduled task(s) still open (todo/in_progress, or an unresolved QA defect)",
                     pending_tasks
                 );
             }
@@ -445,6 +488,150 @@ mod tests {
                 params![status, task_id],
             )
             .unwrap();
+    }
+
+    /// `make_task` builds backlog tasks (`cycle_id: None`); these tests need
+    /// scheduled ones. `tasks.cycle_id` has a FK, so the cycle has to be real.
+    fn make_cycle(db: &Db, project_id: &str, unit_id: &str) -> String {
+        crate::repo::cycles::create(
+            &db.conn,
+            crate::repo::cycles::CreateInput {
+                project_id,
+                unit_id,
+                title: "C1",
+                goal: None,
+                idx: None,
+            },
+        )
+        .unwrap()
+        .unwrap()
+        .id
+    }
+
+    fn schedule(db: &Db, task_id: &str, cycle_id: &str) {
+        db.conn
+            .execute(
+                "UPDATE tasks SET cycle_id = ?1 WHERE id = ?2",
+                params![cycle_id, task_id],
+            )
+            .unwrap();
+    }
+
+    // LM-11093: `count_completion_residue` is the single definition both the
+    // repo gate (below) and the route gate (`routes::plans`) ask, so this pins
+    // the predicate for both. Before they shared a function each held its own
+    // copy, and a test could pin one while the other silently regressed — which
+    // is exactly what happened: the repo copy was covered, the HTTP path users
+    // actually reach was not.
+    #[test]
+    fn completion_residue_counts_only_unfinished_scheduled_work() {
+        let (_d, mut db) = tmp_db();
+        let pid = make_project(&mut db);
+        let plan_id = make_plan(&mut db, &pid, false);
+        let unit_id = make_unit(&mut db, &plan_id, "U1");
+        let cyc = make_cycle(&db, &pid, &unit_id);
+
+        // Residue: scheduled and genuinely unfinished.
+        let todo = make_task(&mut db, &unit_id, "todo");
+        schedule(&db, &todo, &cyc);
+        let running = make_task(&mut db, &unit_id, "running");
+        schedule(&db, &running, &cyc);
+        set_status(&db, &running, "in_progress");
+        assert_eq!(count_completion_residue(&db.conn, &plan_id).unwrap(), 2);
+
+        // Not residue: finished, abandoned, or waiting on something outside.
+        for (title, status) in [
+            ("shipped", "done"),
+            ("dropped", "cancelled"),
+            ("waiting", "blocked"),
+        ] {
+            let id = make_task(&mut db, &unit_id, title);
+            schedule(&db, &id, &cyc);
+            set_status(&db, &id, status);
+        }
+        assert_eq!(
+            count_completion_residue(&db.conn, &plan_id).unwrap(),
+            2,
+            "done/cancelled/blocked are not this plan's remaining work"
+        );
+
+        // Not residue: deferred to a later round, whatever its status.
+        let deferred = make_task(&mut db, &unit_id, "deferred");
+        assert_eq!(
+            count_completion_residue(&db.conn, &plan_id).unwrap(),
+            2,
+            "a backlog task is deferred work, not remaining work"
+        );
+
+        // Scheduling that same task makes it count — the exclusion is keyed on
+        // attachment, not on the task.
+        schedule(&db, &deferred, &cyc);
+        assert_eq!(
+            count_completion_residue(&db.conn, &plan_id).unwrap(),
+            3,
+            "re-attaching returns the task to the plan's remaining work"
+        );
+
+        // Clearing the last two leaves the plan completable.
+        for id in [&todo, &running, &deferred] {
+            set_status(&db, id, "done");
+        }
+        assert_eq!(count_completion_residue(&db.conn, &plan_id).unwrap(), 0);
+    }
+
+    // LM-11093: the QA round tally. `/discover/*` and the dashboard's
+    // Discover-Loop panel both call this, so pinning it here covers both — the
+    // panel used to re-implement the tally and disagreed on two counts at once
+    // (it included backlog, and read `qa_status` alone, missing the
+    // DOGFOOD-039 two-signal defect). Lives in this module rather than
+    // `routes::discover` because that file has no test scaffolding.
+    #[test]
+    fn qa_round_counts_exclude_backlog_and_read_both_signals() {
+        use crate::routes::discover::query_plan_task_counts;
+
+        let (_d, mut db) = tmp_db();
+        let pid = make_project(&mut db);
+        let plan_id = make_plan(&mut db, &pid, false);
+        let unit_id = make_unit(&mut db, &plan_id, "U1");
+        let cyc = make_cycle(&db, &pid, &unit_id);
+
+        let set_qa = |db: &Db, id: &str, qa: &str| {
+            db.conn
+                .execute(
+                    "UPDATE tasks SET qa_status = ?1 WHERE id = ?2",
+                    params![qa, id],
+                )
+                .unwrap();
+        };
+
+        // Explicit qa_status on scheduled tasks.
+        let ok = make_task(&mut db, &unit_id, "ok");
+        schedule(&db, &ok, &cyc);
+        set_qa(&db, &ok, "pass");
+        let bad = make_task(&mut db, &unit_id, "bad");
+        schedule(&db, &bad, &cyc);
+        set_qa(&db, &bad, "defect");
+
+        // DOGFOOD-039: a scheduled task with no qa_status still signals through
+        // `status`. Dropping this arm is the divergence the dashboard had.
+        let implicit = make_task(&mut db, &unit_id, "implicit-defect");
+        schedule(&db, &implicit, &cyc);
+        set_status(&db, &implicit, "blocked");
+
+        let c = query_plan_task_counts(&db.conn, &plan_id).unwrap();
+        assert_eq!(c.pass, 1);
+        assert_eq!(c.defect, 2, "qa_status=defect plus the blocked-without-qa");
+        assert_eq!(c.total, 3);
+
+        // A deferred defect must not count against this round — it is not in it.
+        let deferred = make_task(&mut db, &unit_id, "deferred-defect");
+        set_qa(&db, &deferred, "defect");
+        let c = query_plan_task_counts(&db.conn, &plan_id).unwrap();
+        assert_eq!(
+            c.defect, 2,
+            "a backlog task belongs to a later round, not this one"
+        );
+        assert_eq!(c.total, 3, "and it is not part of this round's denominator");
     }
 
     #[test]

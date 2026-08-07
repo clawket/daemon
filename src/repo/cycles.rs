@@ -247,14 +247,53 @@ pub fn complete(conn: &Connection, id: &str) -> Result<Option<Cycle>> {
     )
 }
 
+/// Close a cycle without consulting the residue gate.
+///
+/// For callers that are *superseding* a cycle rather than declaring it finished.
+/// Superseding is a decision about the container, so the contents cannot veto it —
+/// the QA next-round flow moves on whether or not the previous round resolved
+/// everything, and a defect row is precisely what it leaves behind. Its caller
+/// only warns on failure, so a gated close would leave the cycle `active` and let
+/// the next round run alongside it, which is the invariant that block exists to
+/// keep (DOGFOOD-004).
+///
+/// `activate` does the same thing inline for auto-deactivation, and for the same
+/// reason. Left as-is rather than routed through here: `activate`'s copy runs
+/// inside its own multi-statement flow against a borrowed `&Connection`, and
+/// collapsing them is a refactor with no behavioural content — worth doing, not
+/// worth smuggling into a fix.
+pub fn force_complete(conn: &Connection, id: &str) -> Result<Option<Cycle>> {
+    conn.execute(
+        "UPDATE cycles SET status = 'completed', ended_at = ?1 WHERE id = ?2",
+        params![now_ms(), id],
+    )?;
+    get(conn, id)
+}
+
 /// PDD-230: Reject completion when the cycle still has tasks NOT in terminal status.
 /// Terminal statuses: done, cancelled, blocked. (`blocked` is treated terminal because
 /// it indicates external dependency — the cycle Exit Gate can pass on tracked blockers.)
-/// Sentinel phrase "cannot complete cycle:" maps to HTTP 409 in routes/error.rs.
+/// The message carries the `CYCLE_HAS_NON_TERMINAL_TASKS:` prefix, which
+/// `routes::error` maps to a coded 409. (Its older `contains("cannot complete
+/// cycle:")` arm still matches the same text and yields the same status, so it
+/// never fires first — the coded prefix is the live path.)
+///
+/// A QA defect is the exception, and it is why `qa_status` appears here: it is
+/// transcribed as `status = 'blocked'` but is work inside the round, not an
+/// external blocker. `repo::tasks::container_terminal` makes the same distinction
+/// in memory; if this gate omitted it, the manual `cycle complete` would accept a
+/// round the cascade refuses to close. It is `blocked` AND `defect` for the same
+/// reason as the Rust twin — a stale verdict on a `cancelled` row must not pin the
+/// cycle open forever.
+///
+/// Callers that supersede a cycle instead of finishing it use `force_complete`,
+/// which bypasses this gate deliberately.
 fn assert_no_todo_residue(conn: &Connection, cycle_id: &str) -> Result<()> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM tasks
-         WHERE cycle_id = ?1 AND status NOT IN ('done', 'cancelled', 'blocked')",
+         WHERE cycle_id = ?1
+           AND (status NOT IN ('done', 'cancelled', 'blocked')
+                OR (status = 'blocked' AND qa_status = 'defect'))",
         params![cycle_id],
         |r| r.get(0),
     )?;
@@ -263,7 +302,9 @@ fn assert_no_todo_residue(conn: &Connection, cycle_id: &str) -> Result<()> {
     }
     let mut stmt = conn.prepare(
         "SELECT COALESCE(ticket_number, id) FROM tasks
-         WHERE cycle_id = ?1 AND status NOT IN ('done', 'cancelled', 'blocked')
+         WHERE cycle_id = ?1
+           AND (status NOT IN ('done', 'cancelled', 'blocked')
+                OR (status = 'blocked' AND qa_status = 'defect'))
          ORDER BY idx
          LIMIT 5",
     )?;
@@ -276,7 +317,7 @@ fn assert_no_todo_residue(conn: &Connection, cycle_id: &str) -> Result<()> {
         String::new()
     };
     bail!(
-        "CYCLE_HAS_NON_TERMINAL_TASKS: cannot complete cycle: {} task(s) still non-terminal (todo/in_progress): {}{}",
+        "CYCLE_HAS_NON_TERMINAL_TASKS: cannot complete cycle: {} task(s) still open (todo/in_progress, or an unresolved QA defect): {}{}",
         count,
         labels.join(", "),
         suffix
@@ -589,6 +630,66 @@ mod tests {
         assert!(
             msg.contains("1 task(s)"),
             "expected residue count 1, got: {msg}"
+        );
+    }
+
+    // A QA defect is residue even though it is spelled `blocked`: it is work
+    // inside the round, not an external blocker. `repo::tasks::container_terminal`
+    // draws the same line in memory, and the two must agree or the manual gate
+    // accepts a round the cascade refuses to close.
+    #[test]
+    fn complete_blocks_on_a_qa_defect_but_force_complete_supersedes_it() {
+        let (_d, mut db, _plan_id, unit_id, cycle_id) = setup_with_unit();
+
+        let passed = add_task(&mut db, &unit_id, &cycle_id, "scenario A");
+        let defect = add_task(&mut db, &unit_id, &cycle_id, "scenario B");
+
+        tasks::update(
+            &mut db.conn,
+            &passed,
+            tasks::UpdateFields {
+                status: Some("done".into()),
+                qa_status: Some(Some("pass".into())),
+                evidence: Some(Some("test:qa-pass".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        tasks::update(
+            &mut db.conn,
+            &defect,
+            tasks::UpdateFields {
+                status: Some("blocked".into()),
+                qa_status: Some(Some("defect".into())),
+                blocked_reason: Some(Some("assertion failed".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = complete(&db.conn, &cycle_id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot complete cycle:"),
+            "expected sentinel phrase, got: {msg}"
+        );
+        assert!(
+            msg.contains("1 task(s)"),
+            "the defect is the only residue, got: {msg}"
+        );
+
+        // Superseding is a different act from finishing. `next_round` moves past a
+        // round whatever it left behind, and a defect row is what it leaves — a
+        // gated close refuses those, and its caller merely warns, leaving the cycle
+        // `active` while the next round runs beside it. Hence `force_complete`.
+        let superseded = force_complete(&db.conn, &cycle_id).unwrap().unwrap();
+        assert_eq!(
+            superseded.status, "completed",
+            "force_complete must close a defect-bearing round"
+        );
+        assert!(
+            superseded.ended_at.is_some(),
+            "force_complete must stamp ended_at like the gated path does"
         );
     }
 

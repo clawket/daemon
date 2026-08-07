@@ -266,6 +266,9 @@ async fn next_round(
         domain: String,
         round: u32,
         unit_areas: Vec<String>,
+        /// Cycles this call closed, carried out so the SSE emit can happen after
+        /// the guard is dropped.
+        superseded_cycles: Vec<String>,
     }
     let prep: PrepResult = {
         let conn = app.conn();
@@ -347,13 +350,29 @@ async fn next_round(
                 .map(|c| c.id)
                 .collect()
         };
+        // `force_complete`, not `complete`: starting round R+1 supersedes round R
+        // whatever R left behind, and an unresolved defect is exactly what it
+        // leaves. The residue gate refuses those rows, and the only handling here
+        // is a warning, so a gated close would leave the cycle `active` and let
+        // R+1 run beside it — which is what this block exists to prevent.
+        // Superseding a round is not the same act as declaring it finished.
+        let mut superseded: Vec<String> = Vec::new();
         for cid in &cycles_to_complete {
-            if let Err(e) = cycles::complete(&conn, cid) {
-                tracing::warn!(
+            match cycles::force_complete(&conn, cid) {
+                // `Some` only: `Ok(None)` means the row was gone by the time we
+                // read it back (deleted concurrently), and announcing an update to
+                // a cycle that no longer exists sends subscribers after nothing.
+                // Every other `cycle:updated` site guards the same way.
+                Ok(Some(_)) => superseded.push(cid.clone()),
+                Ok(None) => tracing::warn!(
+                    cycle_id = %cid,
+                    "discover-loop:next-round — previous cycle vanished before it could be closed"
+                ),
+                Err(e) => tracing::warn!(
                     cycle_id = %cid,
                     error = %e,
                     "discover-loop:next-round — failed to auto-complete previous cycle (continuing)"
-                );
+                ),
             }
         }
 
@@ -362,8 +381,22 @@ async fn next_round(
             domain,
             round: next_round_num,
             unit_areas,
+            superseded_cycles: superseded,
         }
     };
+
+    // Announce the closures. `force_complete` is a repo-layer UPDATE and the
+    // `cycle:updated` emit lives in the route handlers this path bypasses, so
+    // without this a subscriber keeps rendering round R as active until some
+    // unrelated event arrives — the row is repaired, the wire is not.
+    //
+    // Payload is `{"id"}` only, matching `routes::cycles`: subscribers refetch on
+    // this event, so adding fields here would create a second shape for the same
+    // event name — and a client that read them would be trusting a payload the
+    // other emit sites do not send.
+    for cid in &prep.superseded_cycles {
+        app.emit("cycle:updated", serde_json::json!({ "id": cid }));
+    }
 
     let start_body = StartBody {
         project_id: prep.project_id,
@@ -1228,11 +1261,11 @@ struct ConvergenceStatusResponse {
 }
 
 #[derive(Serialize)]
-struct TaskCounts {
-    pass: i64,
-    defect: i64,
-    scenario_error: i64,
-    total: i64,
+pub(crate) struct TaskCounts {
+    pub(crate) pass: i64,
+    pub(crate) defect: i64,
+    pub(crate) scenario_error: i64,
+    pub(crate) total: i64,
 }
 
 #[derive(Serialize)]
@@ -1264,9 +1297,29 @@ async fn convergence_status(
     };
 
     let converged = counts.defect == 0 && counts.scenario_error == 0;
-    let regression_detected = prev_summary
-        .as_ref()
-        .map(|p| counts.defect > 0 && counts.defect > p.counts.defect)
+
+    // The baseline is the count round R-1 REPORTED at the time, read from the audit
+    // log, not a re-tally of R-1's rows now.
+    //
+    // Re-tallying makes the comparison unstable in the ordinary case: fixing a
+    // defect is `blocked → done` with no verdict on the patch, which drops that row
+    // from R-1's count. R1 finds 5, R2 has 2 left, R1 re-tallies as 0 — and R2 is
+    // written to a durable audit entry as `regression` when defects strictly
+    // decreased. Cancellation has the same effect, and the previous reasoning
+    // ("a withdrawn defect was never a real one") was at least arguable there; it
+    // does not survive being extended to a defect that was fixed.
+    //
+    // The audit log already records what each round reported, so the snapshot needs
+    // no new storage. Falling back to the live tally keeps rounds that predate the
+    // audit entry working — those can still drift, which is strictly better than
+    // refusing to compare.
+    let logged_prev_defect = round
+        .and_then(|r| r.checked_sub(1))
+        .and_then(|prev| logged_round_defects(&conn, &plan.project_id, &plan.title, prev));
+    let baseline_defect =
+        logged_prev_defect.or_else(|| prev_summary.as_ref().map(|p| p.counts.defect));
+    let regression_detected = baseline_defect
+        .map(|base| counts.defect > 0 && counts.defect > base)
         .unwrap_or(false);
 
     // R3 DOGFOOD-035 fix: append a per-round decision line to a domain-scoped
@@ -1283,24 +1336,9 @@ async fn convergence_status(
     } else {
         "continue"
     };
-    let line = format!(
-        "R{round}: defect={defect}, scenario_error={se}, pass={pass}, decision={decision}",
-        round = round.unwrap_or(0),
-        defect = counts.defect,
-        se = counts.scenario_error,
-        pass = counts.pass,
-        decision = decision,
-    );
-    let audit_title = format!("convergence audit log — {}", domain);
-    let existing_audit = knowledge::list(
-        &conn,
-        knowledge::ListFilter {
-            type_: Some("convergence_audit"),
-            ..Default::default()
-        },
-    )
-    .ok()
-    .and_then(|list| list.into_iter().find(|a| a.title == audit_title));
+    let line = format_audit_line(round.unwrap_or(0), &counts, decision);
+    let audit_title = audit_log_title(&plan.project_id, &domain);
+    let existing_audit = find_audit_entry(&conn, &plan.project_id, &domain);
     if let Some(a) = existing_audit {
         // Append (idempotent on identical line — only append if last differs).
         let prev_body = a.content.clone();
@@ -1325,19 +1363,38 @@ async fn convergence_status(
             );
         }
     } else {
-        let _ = knowledge::create(
+        // `plan_id` is required, not optional: `knowledge::create` rejects a row
+        // attached to nothing (`KNOWLEDGE_NEEDS_ATTACHMENT`), so passing `None` here
+        // meant the entry was NEVER created — and `let _ =` swallowed the error, so
+        // the audit log silently did not exist. The snapshot baseline built on top of
+        // it could therefore never find anything and always fell back to the live
+        // re-tally it was meant to replace.
+        //
+        // The entry spans every round of a domain, so no single plan owns it; the
+        // round that first creates it supplies the attachment, and the project
+        // scoping lives in the title. A failure is logged rather than dropped —
+        // silently losing the log is what hid this.
+        if let Err(e) = knowledge::create(
             &conn,
             knowledge::CreateInput {
                 title: &audit_title,
                 content: Some(&line),
                 content_format: Some("text"),
                 type_: "convergence_audit",
-                plan_id: None,
+                plan_id: Some(&plan.id),
                 unit_id: None,
                 task_id: None,
                 parent_id: None,
             },
-        );
+        ) {
+            tracing::warn!(
+                plan_id = %plan.id,
+                audit_title = %audit_title,
+                error = %e,
+                "discover-loop:status — could not create the convergence audit entry; \
+                 regression detection will fall back to a live re-tally"
+            );
+        }
     }
 
     Ok(Json(ConvergenceStatusResponse {
@@ -1519,7 +1576,7 @@ fn resolve_plan(
     }
 }
 
-/// SQL aggregate of task counts for all tasks in a plan (via units join).
+/// SQL aggregate of task counts for a plan's **scheduled** tasks (via units join).
 ///
 /// R2 DOGFOOD-039 fix: count by EITHER qa_status (round-result column written
 /// by bulk_sync) OR task.status (workflow column also written by bulk_sync).
@@ -1527,23 +1584,85 @@ fn resolve_plan(
 /// "defect 수 = blocked status task 수" so we tally a row as defect when
 /// either signal indicates defect — this catches drift from manual edits
 /// (e.g. an agent that flips status=blocked without setting qa_status).
-fn query_plan_task_counts(
+///
+/// LM-11093: backlog tasks (`cycle_id IS NULL`) are excluded. A task detached
+/// via `task update --cycle ""` is deferred to a later round, so counting it
+/// against *this* round's numbers describes work nobody scheduled. Concretely:
+/// a deferred `blocked` task tallied as `defect`, which held `converged` false in
+/// `convergence_status` — and since `next_round`'s ALREADY_CONVERGED guard refuses
+/// the next round only when `defect == 0 && scenario_error == 0`, that phantom
+/// defect also kept the guard from firing. A deferred `todo` task never reached
+/// either arm, but still inflated `total`.
+///
+/// Note `blocked` stays a defect signal here: unlike the plan-completion gates
+/// (`repo::tasks::container_terminal`), a QA round asks "did the scenarios
+/// pass", and a blocked scenario did not pass. Same status, different question
+/// — the exclusion that carries across is deferral, not blockedness. This is
+/// one reader of "what belongs to this plan"; they are enumerated in one place,
+/// at `routes::plans::counts`.
+///
+/// `cancelled` is the one place this reader must agree with those gates, and the
+/// reason is not symmetry but termination: a cancelled row is finished work, so
+/// the gates close the plan on it. `qa_status` is not cleared by a status change,
+/// so abandoning a defect leaves `cancelled` + `defect` behind — and if that
+/// counted as an unresolved signal, `converged` would stay false for a plan that
+/// is already `completed` and cannot reopen (`PLAN_COMPLETED` freezes `create`,
+/// and the only edge out of `cancelled` leads back to `todo`).
+///
+/// So a cancelled row counts toward `total` and **neither** unresolved bucket.
+/// Moving it between them would achieve nothing: every convergence predicate ANDs
+/// the two (`defect == 0 && scenario_error == 0` — in `convergence_status`,
+/// `converged`, `next_round`'s ALREADY_CONVERGED guard, and rendered in
+/// `routes::dashboard`), so a row in either one holds the round open exactly the
+/// same. `scenario_error` means "the scenario itself was wrong and needs
+/// rewriting" — a live signal `/scenario-refine` acts on — which is not what an
+/// abandoned row is saying.
+///
+/// The three buckets are mutually exclusive but never were exhaustive — `todo`
+/// and `in_progress` rows with no verdict score in none of them, which is correct
+/// (a scenario that has not run yet has no result). So `pass + defect +
+/// scenario_error < total` is the normal case, not a symptom; `total` is
+/// `COUNT(t.id)` and no consumer treats the three as a partition. An abandoned
+/// defect joins that unscored set.
+pub(crate) fn query_plan_task_counts(
     conn: &rusqlite::Connection,
     plan_id: &str,
 ) -> anyhow::Result<TaskCounts> {
     let (pass, defect, scenario_error, total): (i64, i64, i64, i64) = conn
         .query_row(
+            // A `defect` verdict counts UNLESS the row has since reached a terminal
+            // status. `qa_status` is not cleared by a status change, so a verdict
+            // outlives the state it was written for: `blocked → done` and
+            // `blocked → cancelled` are both legal, and either leaves `defect` on a
+            // row the cascade treats as finished — plan `completed`, `converged`
+            // false forever, nothing an operator can clear. Excluding only
+            // `cancelled` fixed one of those axes and left the other, which is how
+            // this arm and the cascade drifted apart to begin with; the condition is
+            // "still open", not a list of statuses.
+            //
+            // It is NOT `status = 'blocked'`: a defect verdict on a `todo` or
+            // `in_progress` row is a real unresolved defect (DOGFOOD-039 pins
+            // exactly that — a verdict written without the matching status), and the
+            // cascade agrees, since neither status is container-terminal.
+            //
+            // The `qa_status IS NULL AND status = …` arms stay: they are
+            // DOGFOOD-039's drift catch for rows whose verdict column was never
+            // written, and they key on status precisely because there is no verdict
+            // to consult.
             "SELECT
                 SUM(CASE WHEN t.qa_status = 'pass' OR (t.qa_status IS NULL AND t.status = 'done')
                          THEN 1 ELSE 0 END),
-                SUM(CASE WHEN t.qa_status = 'defect' OR (t.qa_status IS NULL AND t.status = 'blocked')
+                SUM(CASE WHEN (t.qa_status = 'defect'
+                               AND t.status NOT IN ('done', 'cancelled'))
+                            OR (t.qa_status IS NULL AND t.status = 'blocked')
                          THEN 1 ELSE 0 END),
-                SUM(CASE WHEN t.qa_status = 'scenario_error' OR (t.qa_status IS NULL AND t.status = 'cancelled')
+                SUM(CASE WHEN t.qa_status = 'scenario_error'
+                            OR (t.qa_status IS NULL AND t.status = 'cancelled')
                          THEN 1 ELSE 0 END),
                 COUNT(t.id)
              FROM tasks t
              JOIN units u ON t.unit_id = u.id
-             WHERE u.plan_id = ?1",
+             WHERE u.plan_id = ?1 AND t.cycle_id IS NOT NULL",
             rusqlite::params![plan_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
@@ -1554,6 +1673,106 @@ fn query_plan_task_counts(
         scenario_error,
         total,
     })
+}
+
+/// Title of the per-domain convergence audit entry.
+///
+/// One function so the writer (`convergence_status`) and the reader
+/// (`logged_round_defects`) cannot drift: the reader finds the entry by exact
+/// title, so a change here that reached only one of them would silently degrade the
+/// snapshot back to a live re-tally.
+///
+/// Scoped by project because two projects can share a domain name, and the baseline
+/// this feeds must not cross that boundary. Knowledge rows carry `plan_id` only, and
+/// this entry spans every round of a domain, so no single plan can own it — the
+/// project id goes in the title instead.
+fn audit_log_title(project_id: &str, domain: &str) -> String {
+    format!("convergence audit log — {project_id} — {domain}")
+}
+
+/// The audit entry for this project+domain.
+///
+/// Exact title match, deliberately — rows written under the pre-scoping title are
+/// rewritten by migration 028 rather than papered over with a fallback here. A code
+/// fallback would make the scoping cosmetic: the reader would keep accepting an
+/// entry that may hold another project's rounds, which is the collision the scoping
+/// removes. `schema-migration-discipline.md` puts a data rename in a migration, and
+/// 026 set the precedent for exactly this shape.
+fn find_audit_entry(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    domain: &str,
+) -> Option<crate::models::Knowledge> {
+    let title = audit_log_title(project_id, domain);
+    knowledge::list(
+        conn,
+        knowledge::ListFilter {
+            type_: Some("convergence_audit"),
+            ..Default::default()
+        },
+    )
+    .ok()?
+    .into_iter()
+    .find(|e| e.title == title)
+}
+
+/// One round's line in that entry. Paired with `parse_logged_round_defects`, which
+/// reads it back; the round-trip is pinned by tests so a reformat here cannot
+/// silently stop the reader from finding `defect=`.
+fn format_audit_line(round: u32, counts: &TaskCounts, decision: &str) -> String {
+    format!(
+        "R{round}: defect={defect}, scenario_error={se}, pass={pass}, decision={decision}",
+        defect = counts.defect,
+        se = counts.scenario_error,
+        pass = counts.pass,
+    )
+}
+
+/// The defect count round `n` reported when it ran, read back from the audit log
+/// that `convergence_status` appends to (`R<n>: defect=X, …`).
+///
+/// This exists so regression detection compares against what was reported rather
+/// than a re-tally of that round's rows, which moves whenever a defect is fixed or
+/// withdrawn. The log line is the only per-round snapshot in the system; parsing it
+/// avoids adding a second store that could disagree with it.
+///
+/// `None` when the entry, the round's line, or the field is absent — the caller
+/// falls back to the live tally rather than refusing to compare.
+///
+/// Scoped by project as well as domain. The baseline this replaced came from
+/// `find_prev_round_plan`, which filters on `project_id`; the audit entry is keyed
+/// by title alone, so two projects using the same domain name would have read each
+/// other's counts into a durable `regression` verdict.
+pub(crate) fn logged_round_defects(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    current_title: &str,
+    round: u32,
+) -> Option<i64> {
+    let domain = parse_round_plan_title(current_title).map(|(d, _)| d)?;
+    let entry = find_audit_entry(conn, project_id, &domain)?;
+    parse_logged_round_defects(&entry.content, round)
+}
+
+/// Pull `defect=N` for round `n` out of an audit-log body. Split from the DB lookup
+/// so the parsing — which is where a format drift would bite — is testable.
+///
+/// Last matching line wins: a re-run appends a fresh line, and the newest is what
+/// that round last reported.
+fn parse_logged_round_defects(body: &str, round: u32) -> Option<i64> {
+    let prefix = format!("R{round}:");
+    body.lines()
+        .filter_map(|l| {
+            // The round label and the first field share a segment
+            // (`R1: defect=5`), so strip the label before splitting on commas —
+            // otherwise the first field never matches `defect=`.
+            let rest = l.trim_start().strip_prefix(&prefix)?;
+            rest.split(',')
+                .map(str::trim)
+                .find_map(|f| f.strip_prefix("defect="))
+                .and_then(|v| v.trim().parse::<i64>().ok())
+        })
+        .next_back()
 }
 
 /// Find the previous round's plan (round = prev_round_num) in the same project.
@@ -1595,4 +1814,92 @@ fn count_scenario_ids_in_content(content: &str) -> u32 {
     static SC_LINE_RE: OnceLock<Regex> = OnceLock::new();
     let re = SC_LINE_RE.get_or_init(|| Regex::new(r"US-[A-Z][A-Z0-9-]*-\d{3,}").unwrap());
     content.lines().filter(|line| re.is_match(line)).count() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{audit_log_title, format_audit_line, parse_logged_round_defects, TaskCounts};
+
+    /// The writer and the reader are two halves of one format. Pinning only the
+    /// parser (which is what the previous round did) leaves a reformat of
+    /// `format_audit_line` green while the reader silently stops finding `defect=`
+    /// and every comparison degrades to the live re-tally — the drift the snapshot
+    /// exists to prevent. This closes the loop.
+    #[test]
+    fn the_written_line_is_readable_by_the_parser() {
+        let counts = TaskCounts {
+            pass: 6,
+            defect: 3,
+            scenario_error: 1,
+            total: 10,
+        };
+        let line = format_audit_line(4, &counts, "continue");
+        assert_eq!(
+            parse_logged_round_defects(&line, 4),
+            Some(3),
+            "round-trip must hold; got line: {line}"
+        );
+        assert_eq!(
+            parse_logged_round_defects(&line, 3),
+            None,
+            "and must not match a different round"
+        );
+    }
+
+    /// Two projects can use the same domain name, and the baseline must not cross
+    /// that boundary — it would put another project's defect count into a durable
+    /// `regression` verdict.
+    #[test]
+    fn audit_titles_are_scoped_per_project() {
+        let a = audit_log_title("PROJ-a", "Dogfood");
+        let b = audit_log_title("PROJ-b", "Dogfood");
+        assert_ne!(a, b, "same domain, different project → different entry");
+        assert!(a.contains("PROJ-a") && a.contains("Dogfood"), "got: {a}");
+    }
+
+    /// The audit line is written by `convergence_status` as
+    /// `R<n>: defect=X, scenario_error=Y, pass=Z, decision=…`. Regression detection
+    /// reads its baseline back out of it, so a format drift would silently make
+    /// every comparison fall back to the live re-tally — the instability the
+    /// snapshot exists to remove. These pin the shape.
+    #[test]
+    fn reads_the_defect_count_a_round_reported() {
+        let body = "R1: defect=5, scenario_error=0, pass=3, decision=continue\n\
+                    R2: defect=2, scenario_error=1, pass=6, decision=continue";
+        assert_eq!(parse_logged_round_defects(body, 1), Some(5));
+        assert_eq!(parse_logged_round_defects(body, 2), Some(2));
+    }
+
+    #[test]
+    fn a_rerun_appends_and_the_newest_line_wins() {
+        // A round re-run logs again; the later line is what it last reported.
+        let body = "R1: defect=5, scenario_error=0, pass=3, decision=continue\n\
+                    R1: defect=1, scenario_error=0, pass=7, decision=continue";
+        assert_eq!(parse_logged_round_defects(body, 1), Some(1));
+    }
+
+    #[test]
+    fn round_numbers_are_not_matched_by_prefix() {
+        // "R1:" must not match the R10 line — otherwise round 1's baseline would
+        // silently come from round 10.
+        let body = "R10: defect=9, scenario_error=0, pass=0, decision=continue";
+        assert_eq!(parse_logged_round_defects(body, 1), None);
+        assert_eq!(parse_logged_round_defects(body, 10), Some(9));
+    }
+
+    #[test]
+    fn absent_or_malformed_yields_none_so_the_caller_falls_back() {
+        assert_eq!(parse_logged_round_defects("", 1), None);
+        assert_eq!(parse_logged_round_defects("R2: defect=1", 1), None);
+        assert_eq!(
+            parse_logged_round_defects("R1: scenario_error=0, pass=3", 1),
+            None,
+            "no defect field"
+        );
+        assert_eq!(
+            parse_logged_round_defects("R1: defect=oops, pass=3", 1),
+            None,
+            "unparsable count"
+        );
+    }
 }

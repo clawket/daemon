@@ -220,7 +220,10 @@ async fn update(
                             ),
                         ));
                     }
-                    // Existing residue gate: planning cycles + non-terminal tasks still block.
+                    // Existing residue gate: planning cycles still block, as do
+                    // scheduled tasks that are todo/in_progress. An external
+                    // `blocked` and backlog tasks do not; a `blocked` row carrying
+                    // an open QA defect does — see `count_completion_residue`.
                     let pending_cycles: i64 = conn
                         .query_row(
                             "SELECT COUNT(*) FROM cycles c
@@ -230,18 +233,15 @@ async fn update(
                             |r| r.get(0),
                         )
                         .unwrap_or(0);
-                    let pending_tasks: i64 = conn
-                        .query_row(
-                            "SELECT COUNT(*) FROM tasks t
-                         JOIN units u ON t.unit_id = u.id
-                         WHERE u.plan_id = ?1 AND t.status NOT IN ('done', 'cancelled')",
-                            rusqlite::params![id],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or(0);
+                    // LM-11093: one definition, shared with the repo gate —
+                    // `blocked` (external dependency) and backlog tasks
+                    // (`cycle_id IS NULL`, deferred) are not residue. Calling
+                    // the same function is what keeps the two in lock-step;
+                    // they used to hold separate copies of the predicate.
+                    let pending_tasks = plans::count_completion_residue(&conn, &id).unwrap_or(0);
                     if pending_cycles > 0 || pending_tasks > 0 {
                         return Err(ApiError::conflict(format!(
-                            "Cannot complete plan: {} planning cycle(s) and {} non-terminal task(s) remain",
+                            "Cannot complete plan: {} planning cycle(s) and {} scheduled task(s) still open (todo/in_progress, or an unresolved QA defect)",
                             pending_cycles, pending_tasks
                         )));
                     }
@@ -278,6 +278,25 @@ async fn counts(
     let conn = app.conn();
     let plan = plans::get(&conn, &id)?.ok_or_else(|| ApiError::not_found("plan not found"))?;
 
+    // LM-11093: this endpoint is deliberately RAW — every task under the plan,
+    // including backlog (`cycle_id IS NULL`) and blocked ones.
+    //
+    // Canonical list of the readers that DO scope to scheduled work (keep this
+    // enumeration here; other sites point at it rather than re-listing):
+    //   1. `repo::tasks::cascade_complete`            — auto-complete, both arms
+    //   2. `repo::plans::update`                      — completion residue gate
+    //   3. `routes::plans` (the PATCH handler above)  — route residue gate
+    //   4. `routes::discover::query_plan_task_counts` — QA round convergence
+    //   5. `routes::dashboard`                        — the same round verdict,
+    //                                                   rendered
+    //
+    // This endpoint is NOT one of them and must not be "fixed" into lock-step:
+    // filtering here would hide deferred work from the dashboard, which is the
+    // one surface where the user needs to SEE it. The
+    // consequence is intended — a plan can read `completed` while this endpoint
+    // still reports outstanding todo/blocked counts. If that pairing needs to
+    // render better, add a `scheduled_*` breakdown rather than narrowing this.
+    //
     // Single aggregate query: group tasks by unit
     let mut stmt = conn.prepare(
         "SELECT u.id, u.title,
@@ -402,7 +421,23 @@ pub(crate) fn round_tasks_for_cycle(
 ) -> Result<Vec<RoundTask>, ApiError> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, COALESCE(scenario_id, ''), COALESCE(qa_status, ''), body
+            // Fall back to `status` when no verdict is recorded, the same
+            // two-signal reading `routes::discover::query_plan_task_counts` uses
+            // (DOGFOOD-039). Reading `qa_status` alone made a fixed defect
+            // unclassifiable: completing it clears the verdict, so the pair became
+            // `("defect", "")`, which matches no arm in `compute_round_diff` — the
+            // row vanished from every bucket, `flipped_pass` became unreachable, and
+            // the one transition that endpoint exists to show was the one it lost.
+            "SELECT id,
+                    COALESCE(scenario_id, ''),
+                    CASE
+                        WHEN qa_status IS NOT NULL THEN qa_status
+                        WHEN status = 'done' THEN 'pass'
+                        WHEN status = 'blocked' THEN 'defect'
+                        WHEN status = 'cancelled' THEN 'scenario_error'
+                        ELSE ''
+                    END,
+                    body
              FROM tasks
              WHERE cycle_id = ?1 AND COALESCE(scenario_id, '') != ''",
         )

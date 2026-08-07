@@ -322,3 +322,91 @@ async fn done_succeeds_when_prior_evidence_persists_through_missing_field() {
     assert_eq!(body["status"], "done");
     assert_eq!(body["evidence"], "logs/run-001.txt");
 }
+
+// `error-code-stability.md` requires every coded error to have a test pinning the
+// prefix → HTTP status → `code` triple. `INVALID_QA_STATUS` had none on either of
+// its two paths, and that gap is what let one of them ship with `code: null`: the
+// route layer rejects a bad TYPE (a non-string `qa_status`) while the repo layer
+// rejects a bad VALUE, and the two must answer identically.
+async fn assert_invalid_qa_status(d: &DaemonHandle, tid: &str, body: serde_json::Value) {
+    let c = d.client();
+    let resp = c
+        .patch(format!("{}/tasks/{}", d.base_url, tid))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        status.as_u16(),
+        400,
+        "expected HTTP 400, got {} (body: {})",
+        status,
+        json
+    );
+    assert_eq!(
+        json["code"].as_str(),
+        Some("INVALID_QA_STATUS"),
+        "expected code=INVALID_QA_STATUS, got body: {}",
+        json
+    );
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("INVALID_QA_STATUS:"),
+        "message must carry the prefix so the `From<anyhow>` ladder and a direct \
+         construction cannot diverge, got body: {}",
+        json
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_qa_status_value_is_coded() {
+    let d = DaemonHandle::spawn().await;
+    let tid = bootstrap_task(&d).await;
+    // Repo-layer rejection: a string outside the enum.
+    assert_invalid_qa_status(&d, &tid, serde_json::json!({"qa_status": "flaky"})).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_qa_status_type_is_coded_the_same_way() {
+    let d = DaemonHandle::spawn().await;
+    let tid = bootstrap_task(&d).await;
+    // Route-layer rejection: not a string at all. Silently cleared the verdict
+    // before the guard existed, which then settled the task and closed its plan.
+    assert_invalid_qa_status(&d, &tid, serde_json::json!({"qa_status": 42})).await;
+    assert_invalid_qa_status(&d, &tid, serde_json::json!({"qa_status": true})).await;
+    assert_invalid_qa_status(&d, &tid, serde_json::json!({"qa_status": ["pass"]})).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn null_qa_status_clears_and_is_not_an_error() {
+    let d = DaemonHandle::spawn().await;
+    let tid = bootstrap_task(&d).await;
+    let c = d.client();
+    c.patch(format!("{}/tasks/{}", d.base_url, tid))
+        .json(&serde_json::json!({"qa_status": "defect"}))
+        .send()
+        .await
+        .unwrap();
+    let resp = c
+        .patch(format!("{}/tasks/{}", d.base_url, tid))
+        .json(&serde_json::json!({"qa_status": null}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "explicit null must CLEAR the verdict, not be rejected as a bad type — it is \
+         the one transition that settles a blocked defect without a status change; \
+         got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["qa_status"].is_null(),
+        "verdict must actually be gone, got body: {body}"
+    );
+}

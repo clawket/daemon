@@ -4,7 +4,72 @@ use crate::repo::{cycles, knowledge, plans, units};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
-const TERMINAL: &[&str] = &["done", "cancelled"];
+/// LM-11093: statuses that stop a task from holding its **container** open.
+///
+/// The set is `done | cancelled | blocked` — one wider than a task's own
+/// terminal states, by `blocked`. A blocked task waits on an external
+/// dependency, so no amount of work inside the container can move it — holding
+/// the container open does not make the blocker resolve, it just makes the
+/// container permanently uncompletable, since `blocked` has no path to `done`
+/// from inside. `repo::cycles::assert_no_todo_residue` has read `blocked` this
+/// way since PDD-230 ("the cycle Exit Gate can pass on tracked blockers"); the
+/// plan gates disagreed, so a cycle could complete while its own plan refused
+/// to, naming a task the cycle had already accepted.
+///
+/// Both cascade arms use it, and they must move together: "a completed plan has
+/// no active cycle" is asserted independently by `routes::plans`
+/// (`PLAN_HAS_ACTIVE_CYCLES`, PDD-231) and `routes::discover` (DOGFOOD-004).
+/// If the cycle arm lagged the plan arm, the cascade path would produce a state
+/// the route path rejects.
+///
+/// NOT used for "what should I work on next": `plans::next_actionable` still
+/// stops at a blocked task, because the agent does owe attention there.
+/// Container completion and next-step routing ask different questions of the
+/// same status.
+///
+/// The SQL twin of this set is `repo::plans::count_completion_residue`
+/// (`NOT IN ('done','cancelled','blocked')`), which both plan gates call, plus
+/// the cycle gate's two copies in `repo::cycles::assert_no_todo_residue`. Keep
+/// them in lock-step — and note `container_terminal()` below, not this bare set,
+/// is what the cascade asks.
+const CONTAINER_TERMINAL: &[&str] = &["done", "cancelled", "blocked"];
+
+/// Does this task still hold its containers open?
+///
+/// Status alone cannot answer, because `blocked` carries two meanings in this
+/// codebase. The set above assumes the first: waiting on something outside the
+/// plan, unresolvable from inside, so holding the plan open buys nothing. But
+/// `routes::discover::bulk_sync` transcribes a QA **defect** as `blocked`
+/// (`"defect" => "blocked"`), and a defect is work *inside* the plan. Reading
+/// status alone, a round of 9 pass + 1 defect is entirely `{done, blocked}` and
+/// the cascade closes plan and cycle over an open defect — after which the
+/// `PLAN_COMPLETED` freeze rejects further `create` and the plan-active guard
+/// rejects `in_progress`, so nobody can fix the defect without reopening by hand.
+///
+/// `qa_status` already distinguishes them: bulk_sync writes `'defect'` alongside
+/// the status. So the two meanings are separable without changing the
+/// transcription, which the QA tallies and the dashboard depend on
+/// (`routes::discover::query_plan_task_counts` keys defect detection on
+/// `status = 'blocked'`).
+///
+/// `qa_status` is `None` for every non-QA task, so ordinary blockers keep the
+/// PDD-230 behaviour unchanged.
+///
+/// The check is `blocked` AND `defect`, not `defect` alone: `qa_status` is not
+/// cleared by a status change (`update` writes it only when the patch carries
+/// it) and `blocked → cancelled` is a legal transition, so a cancelled row can
+/// still hold a stale `defect` verdict. Keyed on the verdict alone, that row
+/// would count as open work forever and the only way out of `cancelled` is back
+/// to `todo` — the permanently-uncompletable plan this whole change set exists
+/// to remove, reintroduced on a new axis. `cancelled` is unambiguous in a way
+/// `blocked` is not: it means the work will not be done, whatever a stale QA
+/// verdict says.
+fn container_terminal(status: &str, qa_status: Option<&str>) -> bool {
+    if status == "blocked" && qa_status == Some("defect") {
+        return false;
+    }
+    CONTAINER_TERMINAL.contains(&status)
+}
 
 pub struct CreateInput<'a> {
     pub unit_id: &'a str,
@@ -564,6 +629,35 @@ pub fn update(
         resolve_id(conn, id)?.ok_or_else(|| anyhow::anyhow!("Task not found: {}", id))?;
     let old = get(conn, &canonical)?;
 
+    // A `defect` verdict cannot outlive the work it was written about: completing a
+    // fixed defect with `PATCH {"status":"done","evidence":"…"}` left `done` +
+    // `defect` on the row, a pair five readers each interpreted their own way, and
+    // their disagreements are what this change set spent six rounds chasing.
+    //
+    // Narrow on purpose: the row must actually hold `defect`, not merely "the patch
+    // said nothing about the verdict".
+    //   - `bulk_sync` transcribes a fresh row by CREATE-ing with the verdict and then
+    //     patching `status` alone (create hardcodes `todo`). A blanket rule NULLed the
+    //     `pass` it wrote one statement earlier — silently, because the tally's
+    //     status-based drift arm re-scored it as pass while `stats_by_batch`,
+    //     `?qa_status=pass` and the round-diff endpoints, which read the column,
+    //     saw nothing.
+    //   - A `pass` verdict on a completed row is not stale; it agrees with the state.
+    //
+    // Only `done`. Clearing on `cancelled` would make a withdrawn row
+    // indistinguishable from `bulk_sync`'s `scenario_error` transcription (also
+    // `cancelled`), so a withdrawal would report a scenario-layer failure and hold
+    // the round open — the lockout, reintroduced.
+    //
+    // The predicate is evaluated in the UPDATE itself (see `qa_status = CASE …`
+    // below), NOT against the `old` snapshot read above. `old` is read outside the
+    // transaction on a pooled WAL connection, so a concurrent
+    // `{"qa_status":"pass"}` committing in between would make this clear NULL a
+    // `pass` — round 7's defect reached through a stale read — and write an audit row
+    // claiming the prior value was `defect`. Deciding inside the statement removes
+    // the window instead of narrowing it.
+    let clear_stale_defect = f.qa_status.is_none() && f.status.as_deref() == Some("done");
+
     if let Some(ref new_title) = f.title {
         if new_title.trim().is_empty() {
             bail!("INVALID_TITLE: title cannot be empty");
@@ -766,6 +860,12 @@ pub fn update(
         &f.escalation_reason,
     );
     push_str_opt(&mut sets, &mut vals, "qa_status = ?", &f.qa_status);
+    if clear_stale_defect {
+        // Read-and-write in one statement: only a row that still holds `defect` at
+        // write time is cleared, so a verdict written concurrently survives. No bind
+        // parameter — the literal is a fixed enum value, not caller input.
+        sets.push("qa_status = CASE WHEN qa_status = 'defect' THEN NULL ELSE qa_status END");
+    }
     push_str_opt(&mut sets, &mut vals, "scenario_id = ?", &f.scenario_id);
     push_str_opt(&mut sets, &mut vals, "defect_task = ?", &f.defect_task);
     push_str_opt(
@@ -975,8 +1075,28 @@ pub fn update(
                 write_audit("tier", "updated", old_t, new_t);
             }
         }
-        // FIX-DAEMON-r2-qa: qa_status change audit
-        if let Some(ref new_qa_opt) = f.qa_status {
+        // FIX-DAEMON-r2-qa: qa_status change audit.
+        //
+        // The stale-defect clear decides inside the UPDATE, so what it actually did
+        // is only knowable by reading the row back — hence the `else` arm rather than
+        // an assumption. Skipping it would leave the clear as the one `qa_status`
+        // transition with no trail, and it is the most frequent one; assuming it
+        // fired would log a change that a concurrent write may have prevented.
+        let audited_qa: Option<Option<String>> = if f.qa_status.is_some() {
+            f.qa_status.clone()
+        } else if clear_stale_defect {
+            tx.query_row(
+                "SELECT qa_status FROM tasks WHERE id = ?1",
+                params![canonical],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .map(Some)
+            .unwrap_or(None)
+        } else {
+            None
+        };
+        if let Some(ref new_qa_opt) = audited_qa {
             let old_q: Option<&str> = old_task.qa_status.as_deref();
             let new_q: Option<&str> = new_qa_opt.as_deref();
             if old_q != new_q {
@@ -1032,12 +1152,57 @@ pub fn update(
 
     // Post-commit: cascade completion (requires conn, not tx)
     // FIX-DAEMON-106: cascade returns (event_name, entity_id) pairs for SSE emit at route layer
-    let cascade_events: Vec<CascadeEvent> = if let Some(status) = &f.status {
-        if TERMINAL.contains(&status.as_str()) {
-            cascade_complete(conn, &canonical)?
-        } else {
-            Vec::new()
-        }
+    // LM-11093: dispatch on ANY axis that can finish a container. There are three,
+    // one per field a settling transition can touch:
+    //
+    //   status → CONTAINER_TERMINAL (not the narrower done|cancelled): blocking
+    //            the last open task finishes the container just as surely as
+    //            completing it.
+    //   cycle_id → DETACHING (`Some(None)`) the last non-terminal task removes it
+    //            from the plan's scheduled set, which finishes the plan. A detach
+    //            carries NO status field, so a status-only dispatch never fires
+    //            for it.
+    //   qa_status → CLEARING a `defect` verdict settles the task too, because
+    //            `container_terminal` reads that field as well. The routes accept
+    //            `qa_status` independently of `status`, so a lone
+    //            `{"qa_status":"pass"}` patch on the last blocked defect row is a
+    //            settling transition a status-only dispatch would miss.
+    //
+    // All three needed widening for the same reason: leaving any of them narrow
+    // makes the outcome depend on transition ORDER. Same end state, two answers —
+    // finish-then-defer left the plan open forever while defer-then-finish closed
+    // it, because only the second ends on a dispatching transition. Add a fourth
+    // field to the settling criterion and it belongs in this list too.
+    //
+    // ATTACHING (`Some(Some(id))`) is deliberately excluded. It adds work to the
+    // schedule, so it can never be what finishes a container — and dispatching on
+    // it actively breaks recovery: re-attaching a still-blocked task to a fresh
+    // cycle would re-close the plan the user just re-opened, since the scheduled
+    // set is container-terminal again the moment the task lands in it.
+    let detaching = matches!(f.cycle_id, Some(None));
+    // The implicit stale-defect clear needs no axis of its own: it only fires on a
+    // patch that also sets `status = "done"`, which dispatches on the status axis
+    // above. This one covers the verdict-only patch.
+    let clearing_defect = matches!(&f.qa_status, Some(v) if v.as_deref() != Some("defect"))
+        && old
+            .as_ref()
+            .is_some_and(|t| t.qa_status.as_deref() == Some("defect"));
+    let dispatch = f
+        .status
+        .as_deref()
+        .is_some_and(|s| CONTAINER_TERMINAL.contains(&s))
+        || detaching
+        || clearing_defect;
+    // On a detach the row no longer names the cycle it left, so read it from the
+    // pre-update snapshot and hand it to the cascade. Without this the cycle arm
+    // has nothing to resolve and the plan completes over an `active` cycle.
+    let left_cycle = if detaching {
+        old.as_ref().and_then(|t| t.cycle_id.clone())
+    } else {
+        None
+    };
+    let cascade_events: Vec<CascadeEvent> = if dispatch {
+        cascade_complete(conn, &canonical, left_cycle.as_deref())?
     } else {
         Vec::new()
     };
@@ -1093,19 +1258,78 @@ pub fn remove_label(conn: &Connection, id: &str, label: &str) -> Result<Option<T
 ///
 /// Definition: a plan (or cycle) auto-completes iff
 ///   (a) it owns ≥ 1 task, AND
-///   (b) every task it owns is in a terminal status (done | cancelled).
+///   (b) every task it owns is container-terminal — `container_terminal(status,
+///       qa_status)`, i.e. done | cancelled | blocked, EXCEPT a `blocked` row
+///       carrying `qa_status = 'defect'` (an open QA defect is work inside the
+///       plan, not an external blocker).
+///
+/// The criterion reads two fields, not one. Its SQL twin is
+/// `repo::plans::count_completion_residue`; `repo::cycles::assert_no_todo_residue`
+/// carries the same clause for the manual gate. All three must move together.
 ///
 /// An empty plan / cycle (no tasks) is a cascade no-op — auto-completing a container
 /// that has no work declared yet would erase user intent.
-pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<CascadeEvent>> {
+///
+/// LM-11093 fixes two ways a plan became permanently uncompletable, which are
+/// independent and both had to be closed:
+///
+/// 1. **`blocked` counted as unfinished work.** A blocked task waits on something
+///    outside this plan, so holding the plan open cannot resolve it. The manual
+///    cycle gate already read it that way (`cycles::assert_no_todo_residue`,
+///    PDD-230, which spells the same three statuses directly in SQL); the plan
+///    gates did not, so a cycle could reach `completed` while its plan refused,
+///    citing a task that cycle had accepted. Both cascade arms and both plan
+///    residue gates now agree on `container_terminal` — including its carve-out
+///    for a QA defect, which `blocked` also spells.
+///
+/// 2. **Backlog tasks counted as this plan's remaining work.** Detaching a task
+///    (`task update --cycle ""`, `cycle_id IS NULL`) is how a user says "not this
+///    round". `tasks.unit_id` is NOT NULL (`migrations/001_initial.sql:106`) so the
+///    task keeps its unit, and the plan filter JOINs through units — deferred work
+///    stayed in the completion set. Only tasks attached to a cycle count now.
+///
+/// Deferred work is not lost: the plan can be re-opened (`completed → active`,
+/// `repo::plans::update`) and the task stays visible in the backlog view
+/// (`task list --no-cycle`) throughout. Re-scheduling it needs an active cycle,
+/// which may mean creating one — completed cycles do not restart (v3.0).
+///
+/// The exclusion is keyed on "not attached to a cycle", which is slightly wider
+/// than "the user deferred it": `repo::cycles::delete` also nulls `cycle_id` on
+/// its tasks, so deleting a cycle moves live tasks to the backlog and out of the
+/// plan's completion set. That is acceptable — deleting a cycle is itself a
+/// deliberate act and the tasks remain listed (`task list --no-cycle`). If the
+/// two ever need separating, the durable fix is a `deferred_at` column rather
+/// than overloading `cycle_id`.
+///
+/// `left_cycle` carries the cycle the trigger just VACATED, because on the detach
+/// path the task can no longer name it. `cycle_id` is set to NULL inside the
+/// transaction and committed before this function re-reads the row, so
+/// `task.cycle_id` is already `None` and the cycle arm's `Some(cid)` guard would
+/// skip — completing the plan while its cycle stayed `active`. That is the exact
+/// state the cycle arm's own comment argues must never exist and that
+/// `routes::plans` rejects with `PLAN_HAS_ACTIVE_CYCLES` (PDD-231), so the two
+/// completion paths would write different databases. Callers pass the pre-update
+/// `cycle_id` on a detach and `None` otherwise; the arm falls back to the task's
+/// own `cycle_id` for every non-detach transition.
+pub fn cascade_complete(
+    conn: &mut Connection,
+    task_id: &str,
+    left_cycle: Option<&str>,
+) -> Result<Vec<CascadeEvent>> {
     let mut cascaded: Vec<CascadeEvent> = Vec::new();
     let task = match get(conn, task_id)? {
         Some(t) => t,
         None => return Ok(cascaded),
     };
 
-    // The trigger task itself must be terminal for any cascade to be possible.
-    if !TERMINAL.contains(&task.status.as_str()) {
+    // The trigger must have stopped holding its containers open — either by
+    // reaching a container-terminal status, or by leaving the schedule entirely
+    // (backlog, `cycle_id IS NULL`). A detached task is outside the plan's
+    // scheduled set no matter what status it carries, so gating on status alone
+    // would drop exactly the detach case the dispatch site now forwards.
+    let trigger_settled =
+        container_terminal(&task.status, task.qa_status.as_deref()) || task.cycle_id.is_none();
+    if !trigger_settled {
         return Ok(cascaded);
     }
 
@@ -1113,23 +1337,38 @@ pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<Casc
     // result set is exactly the tasks owned by this plan — empty units contribute
     // zero rows and therefore cannot block completion.
     if let Some(unit) = units::get(conn, &task.unit_id)? {
-        let plan_tasks = list(
+        let owned = list(
             conn,
             ListFilter {
                 plan_id: Some(&unit.plan_id),
                 ..Default::default()
             },
         )?;
-        // Auto-complete only when every task is terminal AND at least one was
-        // actually `done`. A plan whose tasks are *all* cancelled was not
-        // completed — it was emptied/corrected (e.g. mis-created tasks cancelled
-        // to re-author them). Cascading "completed" there closes the plan and
-        // makes the active cycle unrestartable (#51). `cancelled`-only stays open.
-        let plan_done = !plan_tasks.is_empty()
-            && plan_tasks
-                .iter()
-                .all(|t| TERMINAL.contains(&t.status.as_str()))
-            && plan_tasks.iter().any(|t| t.status == "done");
+        // LM-11093: backlog tasks are deferred work, not this plan's remaining
+        // work. Dropped here rather than inside `list()` so the plan's task
+        // listing (dashboards, `task list --plan`) keeps showing everything;
+        // only the completion arithmetic narrows.
+        let scheduled: Vec<Task> = owned.into_iter().filter(|t| t.cycle_id.is_some()).collect();
+
+        // Auto-complete only when every scheduled task is container-terminal AND
+        // at least one was actually `done`. A plan whose tasks are *all*
+        // cancelled was not completed — it was emptied/corrected (e.g.
+        // mis-created tasks cancelled to re-author them). Cascading "completed"
+        // there closes the plan and makes the active cycle unrestartable (#51);
+        // `cancelled`-only stays open.
+        //
+        // `any(done)` is also what keeps the two empty-ish cases open, and it is
+        // the ONLY term doing so — it implies `!scheduled.is_empty()`, so no
+        // separate emptiness guard is needed (one was tried; mutation testing
+        // showed it could never decide the outcome):
+        //   - plan owns no tasks at all      → no work declared yet
+        //   - plan's work is entirely backlog → all of it deferred, none finished
+        // Both are right to stay open, for different reasons. Relaxing
+        // `any(done)` would silently close both.
+        let plan_done = scheduled
+            .iter()
+            .all(|t| container_terminal(&t.status, t.qa_status.as_deref()))
+            && scheduled.iter().any(|t| t.status == "done");
         if plan_done {
             if let Some(plan) = plans::get(conn, &unit.plan_id)? {
                 if plan.status == "active" {
@@ -1147,9 +1386,45 @@ pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<Casc
         }
     }
 
-    // Cycle-task-direct cascade. Symmetric definition: all tasks attached to this
-    // cycle must be terminal, and the cycle must own at least one task.
-    if let Some(cid) = task.cycle_id.as_deref() {
+    // Cycle-task-direct cascade. All tasks attached to this cycle must be
+    // container-terminal, and the cycle must own at least one task.
+    //
+    // LM-11093: this arm reads the SAME `container_terminal` as the plan arm,
+    // and it must. Narrowing it here — so a blocked task would leave its cycle
+    // live, on the reasoning that a completed cycle cannot be restarted and
+    // auto-closing one around a blocker strands it — was tried and reverted.
+    // That reasoning does not survive contact with the rest of the system:
+    //
+    //   - Starting a task requires `plan.status == "active"` as well as an
+    //     active cycle (the guards above), so leaving the cycle open buys
+    //     nothing — the plan must be re-opened either way.
+    //   - "A completed plan has no active cycle" is a system invariant, asserted
+    //     twice independently: `routes::plans` re-counts active cycles after its
+    //     cascade close and rejects with `PLAN_HAS_ACTIVE_CYCLES` (PDD-231), and
+    //     `routes::discover` closes prior-round cycles so rounds never coexist
+    //     (DOGFOOD-004). Letting this arm lag the plan arm would make the two
+    //     completion paths produce different database states — the route path
+    //     upholding the invariant, the cascade path quietly breaking it.
+    //
+    // `cycles::assert_no_todo_residue` (PDD-230) already accepts `blocked` for
+    // the manual `cycle complete`, so this arm now agrees with the gate the user
+    // reaches by hand.
+    //
+    // Recovery for a blocked task after the containers close: re-open the plan
+    // (`completed → active`), create and activate a cycle, re-attach. The old
+    // cycle cannot restart, which is v3.0 behaviour and not this change.
+    //
+    // On a detach the task no longer names the cycle it just left — `cycle_id` is
+    // already NULL by the time this function re-reads the row — so `left_cycle`
+    // supplies it. Without that, the arm below would be unreachable on exactly
+    // the axis this cascade was widened to cover, and the plan would complete
+    // over an `active` cycle. Leaving that cycle open also breaks the recovery
+    // described above: `UNIT_HAS_ACTIVE_CYCLE` (PDD A8) refuses to activate a new
+    // cycle on a unit that still has one.
+    //
+    // No backlog filter inside the arm: the cycle is resolved by id, and a
+    // detached task is no longer in it.
+    if let Some(cid) = left_cycle.or(task.cycle_id.as_deref()) {
         let cycle_tasks = list(
             conn,
             ListFilter {
@@ -1164,7 +1439,7 @@ pub fn cascade_complete(conn: &mut Connection, task_id: &str) -> Result<Vec<Casc
         let cycle_done = !cycle_tasks.is_empty()
             && cycle_tasks
                 .iter()
-                .all(|t| TERMINAL.contains(&t.status.as_str()))
+                .all(|t| container_terminal(&t.status, t.qa_status.as_deref()))
             && cycle_tasks.iter().any(|t| t.status == "done");
         if cycle_done {
             if let Some(cycle) = cycles::get(conn, cid)? {
@@ -2282,6 +2557,1066 @@ mod tests {
         assert_eq!(
             cycle.status, "active",
             "cycle must stay active (restartable) when every task is cancelled"
+        );
+    }
+
+    // LM-11093 test helper: create a task under the given unit, attached to
+    // `cycle_id` when Some. Backlog tasks are made by passing None.
+    fn mk_task(conn: &mut Connection, unit_id: &str, cycle_id: Option<&str>, title: &str) -> Task {
+        create(
+            conn,
+            CreateInput {
+                unit_id,
+                title,
+                body: None,
+                assignee: None,
+                idx: None,
+                depends_on: vec![],
+                parent_task_id: None,
+                priority: None,
+                complexity: None,
+                estimated_edits: None,
+                cycle_id,
+                reporter: None,
+                type_: None,
+                atomic_size_hint: None,
+                decomposition_policy: None,
+                tier: None,
+                qa_status: None,
+                scenario_id: None,
+                defect_task: None,
+                scenario_amendment: None,
+                evidence: None,
+                batch_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    // LM-11093 (1/2): `blocked` must not hold a plan open. It means the work is
+    // waiting on something outside this plan, so keeping the plan open cannot
+    // resolve it. `repo::cycles::assert_no_todo_residue` has read it that way
+    // since PDD-230; the plan gates disagreed, so a cycle could reach
+    // `completed` while its own plan refused — citing a task that same cycle
+    // had already accepted as terminal. This pins the agreement.
+    #[test]
+    fn cascade_completes_plan_with_blocked_task_still_in_cycle() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let blocked = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "waiting");
+        let shipped = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "shipped");
+
+        update(
+            &mut s.db.conn,
+            &blocked.id,
+            UpdateFields {
+                status: Some("blocked".into()),
+                blocked_reason: Some(Some("upstream dependency".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update(
+            &mut s.db.conn,
+            &shipped.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:blocked-is-container-terminal".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let plan = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
+        assert_eq!(
+            plan.status, "completed",
+            "a blocked task waits on something outside the plan — it must not pin it open"
+        );
+
+        // The cycle closes with it. "A completed plan has no active cycle" is a
+        // system invariant (`PLAN_HAS_ACTIVE_CYCLES` / PDD-231, DOGFOOD-004), so
+        // the two arms have to move together — a cascade that closed only the
+        // plan would produce a state the route path rejects.
+        let cycle = cycles::get(&s.db.conn, &s.cycle_id).unwrap().unwrap();
+        assert_eq!(
+            cycle.status, "completed",
+            "plan and cycle must reach completion together"
+        );
+
+        // The blocker itself is untouched — accepting it is not resolving it.
+        assert_eq!(
+            get(&s.db.conn, &blocked.id).unwrap().unwrap().status,
+            "blocked"
+        );
+    }
+
+    // LM-11093 (1/2, order): the same end state must close the plan regardless
+    // of which transition arrives last. Blocking the final open task is the
+    // natural ordering for the reported bug — you finish what you can, then
+    // park the rest — and it is the path that exercises the cascade's entry
+    // guards (dispatch at `update`, trigger check at `cascade_complete`). With
+    // those on the narrow done/cancelled set the fix was order-dependent: `done` last
+    // closed the plan, `blocked` last hung it forever.
+    #[test]
+    fn cascade_completes_plan_when_blocked_is_the_last_transition() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let shipped = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "shipped");
+        let blocked = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "waiting");
+
+        // Reverse of the previous test: finish first, block last.
+        update(
+            &mut s.db.conn,
+            &shipped.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:blocked-last".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update(
+            &mut s.db.conn,
+            &blocked.id,
+            UpdateFields {
+                status: Some("blocked".into()),
+                blocked_reason: Some(Some("upstream dependency".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let plan = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
+        assert_eq!(
+            plan.status, "completed",
+            "blocking the last open task must dispatch the cascade, not skip it"
+        );
+        let cycle = cycles::get(&s.db.conn, &s.cycle_id).unwrap().unwrap();
+        assert_eq!(cycle.status, "completed");
+    }
+
+    // LM-11093: the containers close together, so recovering a blocker is a
+    // known, walkable path — not a dead end. This walks it end to end, because
+    // the cost is real and a future change that raises it should fail here:
+    // re-open the plan, create and activate a cycle, re-attach, then start.
+    // The old cycle stays frozen (v3.0: completed cycles do not restart).
+    #[test]
+    fn blocked_task_is_recoverable_after_the_containers_auto_complete() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let shipped = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "shipped");
+        let blocked = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "waiting");
+
+        update(
+            &mut s.db.conn,
+            &shipped.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:recovery".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update(
+            &mut s.db.conn,
+            &blocked.id,
+            UpdateFields {
+                status: Some("blocked".into()),
+                blocked_reason: Some(Some("upstream dependency".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "completed"
+        );
+        assert_eq!(
+            cycles::get(&s.db.conn, &s.cycle_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed"
+        );
+
+        // The blocker resolves. Step 1: re-open the plan.
+        plans::update(
+            &s.db.conn,
+            &s.plan_id,
+            plans::UpdateFields {
+                status: Some("active".into()),
+                ..Default::default()
+            },
+        )
+        .expect("a completed plan must be re-openable");
+
+        // Step 2-3: the old cycle is frozen, so stand up a new one.
+        assert!(
+            cycles::update(
+                &s.db.conn,
+                &s.cycle_id,
+                cycles::UpdateFields {
+                    status: Some("active".into()),
+                    ..Default::default()
+                },
+            )
+            .is_err(),
+            "completed cycles do not restart — recovery goes through a new one"
+        );
+        let plan_for_cycle = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
+        let next = cycles::create(
+            &s.db.conn,
+            cycles::CreateInput {
+                project_id: &plan_for_cycle.project_id,
+                unit_id: &s.unit_id,
+                title: "C2",
+                goal: None,
+                idx: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        cycles::activate(&s.db.conn, &next.id).unwrap();
+
+        // Step 4: re-attach and resume.
+        update(
+            &mut s.db.conn,
+            &blocked.id,
+            UpdateFields {
+                cycle_id: Some(Some(next.id.clone())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update(
+            &mut s.db.conn,
+            &blocked.id,
+            UpdateFields {
+                status: Some("in_progress".into()),
+                ..Default::default()
+            },
+        )
+        .expect("the unblocked task must be startable once containers are live again");
+
+        assert_eq!(
+            get(&s.db.conn, &blocked.id).unwrap().unwrap().status,
+            "in_progress"
+        );
+    }
+
+    // LM-11093 (1/2, converse): `todo` / `in_progress` still hold the plan open.
+    // Without this the fix reads as "nothing blocks completion any more".
+    #[test]
+    fn cascade_blocked_by_todo_task_in_cycle() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let _pending = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "not started");
+        let shipped = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "shipped");
+
+        update(
+            &mut s.db.conn,
+            &shipped.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:todo-still-blocks".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let plan = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
+        assert_eq!(
+            plan.status, "active",
+            "unstarted work is this plan's own — it must keep the plan open"
+        );
+    }
+
+    // LM-11093 (2/2, order): deferring the last open task must close the plan,
+    // just as finishing it would. A detach carries no status field, so a
+    // status-only dispatch never fired for it — leaving the backlog axis with
+    // the same order-dependence the `blocked` axis had: finish-then-defer hung
+    // the plan open forever while defer-then-finish closed it, for the very same
+    // end state. This drives the order that used to fail.
+    #[test]
+    fn cascade_completes_plan_when_deferral_is_the_last_transition() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let shipped = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "shipped");
+        let deferred = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "next round");
+
+        // Finish first — the plan cannot close yet, `deferred` is still todo.
+        update(
+            &mut s.db.conn,
+            &shipped.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:defer-last".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "active"
+        );
+
+        // Defer last. Nothing about the task's status changes — only its cycle.
+        update(
+            &mut s.db.conn,
+            &deferred.id,
+            UpdateFields {
+                cycle_id: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let plan = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
+        assert_eq!(
+            plan.status, "completed",
+            "deferring the last open task must dispatch the cascade, not skip it"
+        );
+        assert_eq!(
+            get(&s.db.conn, &deferred.id).unwrap().unwrap().status,
+            "todo",
+            "deferral is not a status change — the task is parked, not finished"
+        );
+        // Both arms or neither: a `completed` plan over an `active` cycle is the
+        // state `routes::plans` rejects with `PLAN_HAS_ACTIVE_CYCLES` (PDD-231),
+        // so the cascade must not produce it. The detached task cannot name the
+        // cycle it left, which is why `update` hands the pre-update id down as
+        // `left_cycle` — without that this arm is unreachable on this axis and
+        // the assertion below fails while the plan one passes.
+        assert_eq!(
+            cycles::get(&s.db.conn, &s.cycle_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed",
+            "the vacated cycle holds only done work — it must close with the plan"
+        );
+    }
+
+    // A QA defect must keep its containers open even though `bulk_sync`
+    // transcribes it as `blocked` (`routes::discover`, `"defect" => "blocked"`).
+    // `blocked` is container-terminal on the premise that it waits on something
+    // outside the plan; a defect is work *inside* it. Reading status alone, this
+    // round (1 pass + 1 defect) is entirely `{done, blocked}` and both containers
+    // close over an open defect — after which `PLAN_COMPLETED` rejects `create`
+    // and the plan-active guard rejects `in_progress`, so the defect cannot be
+    // fixed without reopening by hand.
+    #[test]
+    fn cascade_keeps_plan_open_when_a_qa_defect_is_blocked() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let passed = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "scenario A");
+        let defect = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "scenario B");
+
+        update(
+            &mut s.db.conn,
+            &passed.id,
+            UpdateFields {
+                status: Some("done".into()),
+                qa_status: Some(Some("pass".into())),
+                evidence: Some(Some("test:qa-pass".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Exactly what bulk_sync writes for a defect row: status `blocked`,
+        // `qa_status` carrying the real verdict.
+        update(
+            &mut s.db.conn,
+            &defect.id,
+            UpdateFields {
+                status: Some("blocked".into()),
+                qa_status: Some(Some("defect".into())),
+                blocked_reason: Some(Some("assertion failed on step 3".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "active",
+            "an open QA defect is work inside the plan — it must hold the plan open"
+        );
+        assert_eq!(
+            cycles::get(&s.db.conn, &s.cycle_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "active",
+            "the round is not finished while one of its scenarios reports a defect"
+        );
+
+        // And the manual gates must agree with the cascade — otherwise the two
+        // completion paths write different databases, which is the defect class
+        // `count_completion_residue` was extracted to prevent.
+        assert_eq!(
+            plans::count_completion_residue(&s.db.conn, &s.plan_id).unwrap(),
+            1,
+            "the plan residue gate must count the defect too"
+        );
+        let cycle_gate = cycles::update(
+            &s.db.conn,
+            &s.cycle_id,
+            cycles::UpdateFields {
+                status: Some("completed".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            cycle_gate.is_err(),
+            "manual `cycle complete` must refuse a round with an open defect"
+        );
+
+        // Once the defect is resolved the containers close as usual — the guard
+        // keys on the defect verdict, not on `blocked` in general.
+        update(
+            &mut s.db.conn,
+            &defect.id,
+            UpdateFields {
+                status: Some("done".into()),
+                qa_status: Some(Some("pass".into())),
+                evidence: Some(Some("test:qa-refixed".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "completed",
+            "with the defect resolved the plan completes normally"
+        );
+    }
+
+    // An ordinary blocker — no QA verdict attached — keeps the PDD-230 behaviour:
+    // it is external, unresolvable from inside the plan, so it does NOT hold the
+    // containers open. This is the other half of the defect rule above; without
+    // it a `qa_status` check could silently re-break what PDD-230 fixed.
+    #[test]
+    fn cascade_still_completes_over_a_plain_external_blocker() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let shipped = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "shipped");
+        let waiting = mk_task(
+            &mut s.db.conn,
+            &s.unit_id,
+            Some(&s.cycle_id),
+            "waiting on ops",
+        );
+
+        update(
+            &mut s.db.conn,
+            &shipped.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:plain-blocker".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update(
+            &mut s.db.conn,
+            &waiting.id,
+            UpdateFields {
+                status: Some("blocked".into()),
+                blocked_reason: Some(Some("waiting on an external team".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            get(&s.db.conn, &waiting.id)
+                .unwrap()
+                .unwrap()
+                .qa_status
+                .is_none(),
+            "precondition: a plain blocker carries no QA verdict"
+        );
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "completed",
+            "an external blocker must not pin the plan open (PDD-230)"
+        );
+    }
+
+    // A defect verdict does not survive cancellation. `update` writes `qa_status`
+    // only when the patch carries it and `blocked → cancelled` is legal, so a
+    // cancelled row can keep a stale `defect`. Keyed on the verdict alone that row
+    // would be open work forever and the only way out of `cancelled` is back to
+    // `todo` — the permanently-uncompletable plan this change set exists to remove.
+    #[test]
+    fn cascade_completes_when_a_defect_row_is_cancelled() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let passed = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "scenario A");
+        let defect = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "scenario B");
+
+        update(
+            &mut s.db.conn,
+            &passed.id,
+            UpdateFields {
+                status: Some("done".into()),
+                qa_status: Some(Some("pass".into())),
+                evidence: Some(Some("test:cancel-defect".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update(
+            &mut s.db.conn,
+            &defect.id,
+            UpdateFields {
+                status: Some("blocked".into()),
+                qa_status: Some(Some("defect".into())),
+                blocked_reason: Some(Some("assertion failed".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "active",
+            "precondition: the open defect holds the plan"
+        );
+
+        // Cancel it — the scenario is withdrawn, not fixed. The patch says nothing
+        // about `qa_status`, and the clear-on-completion rule is `done`-only, so the
+        // verdict stays. See the tally: a cancelled row is scored as withdrawn.
+        update(
+            &mut s.db.conn,
+            &defect.id,
+            UpdateFields {
+                status: Some("cancelled".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cancelled = get(&s.db.conn, &defect.id).unwrap().unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(
+            cancelled.qa_status.as_deref(),
+            Some("defect"),
+            "withdrawal keeps the verdict: clearing it here would make the row \
+             indistinguishable from bulk_sync's scenario_error transcription, which is \
+             also cancelled — so the tally must handle this pair, and does"
+        );
+
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "completed",
+            "cancelled work is finished regardless of a stale QA verdict"
+        );
+        assert_eq!(
+            plans::count_completion_residue(&s.db.conn, &s.plan_id).unwrap(),
+            0,
+            "the SQL gate must agree — otherwise the two paths diverge again"
+        );
+        // And so must the QA tally, which is reader #4 of the same question
+        // (enumerated at `routes::plans::counts`). If it still called this row a
+        // defect, `converged` would stay false for a plan that has completed and
+        // cannot reopen — the same divergence, one layer up.
+        let counts =
+            crate::routes::discover::query_plan_task_counts(&s.db.conn, &s.plan_id).unwrap();
+        assert_eq!(
+            counts.defect, 0,
+            "a cancelled row is withdrawn work, not an open defect"
+        );
+        assert_eq!(
+            counts.scenario_error, 0,
+            "nor a scenario_error — that bucket means the scenario needs rewriting, \
+             and every convergence predicate ANDs the two, so moving it there would \
+             hold the round open exactly the same"
+        );
+        assert_eq!(counts.pass, 1, "the passing scenario is unaffected");
+        assert_eq!(
+            counts.total, 2,
+            "total still counts both scheduled rows — the three buckets are not a partition"
+        );
+        // The assertion that actually matters: the convergence predicate every
+        // reader shares must now hold. Checking the buckets individually is not
+        // enough — they are ANDed, so a row in either one keeps the round open and
+        // an operator has no action left that clears it (the plan is `completed`,
+        // `PLAN_COMPLETED` freezes `create`, and `cancelled` only leads to `todo`).
+        assert!(
+            counts.defect == 0 && counts.scenario_error == 0,
+            "the round must read converged — the plan is closed and cannot reopen"
+        );
+    }
+
+    // `bulk_sync` transcribes a fresh row in two calls: CREATE with the verdict
+    // (status is hardcoded `todo` there), then a patch carrying `status` alone. That
+    // second call looks exactly like an operator completing a task, so a clear keyed
+    // on "the patch said nothing about the verdict" wiped the `pass` written one
+    // statement earlier. Nothing failed: the tally re-scores a `(done, NULL)` row as
+    // pass through its drift arm, while `stats_by_batch`, `?qa_status=pass` and the
+    // round-diff endpoints read the column and saw an empty result.
+    #[test]
+    fn a_verdict_written_at_create_survives_the_status_patch() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        // Both rows up front: completing the first would close the plan and
+        // `PLAN_COMPLETED` would then refuse the second create.
+        let rows: Vec<(&str, Task)> = ["pass", "scenario_error"]
+            .into_iter()
+            .map(|v| (v, mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), v)))
+            .collect();
+
+        for (verdict, t) in &rows {
+            let verdict = *verdict;
+            update(
+                &mut s.db.conn,
+                &t.id,
+                UpdateFields {
+                    qa_status: Some(Some(verdict.into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // The status-only follow-up, byte for byte what bulk_sync sends.
+            update(
+                &mut s.db.conn,
+                &t.id,
+                UpdateFields {
+                    status: Some("done".into()),
+                    evidence: Some(Some("test:create-then-status".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                get(&s.db.conn, &t.id)
+                    .unwrap()
+                    .unwrap()
+                    .qa_status
+                    .as_deref(),
+                Some(verdict),
+                "a `{verdict}` verdict agrees with its terminal status and must survive \
+                 it — only a stale `defect` is cleared"
+            );
+        }
+    }
+
+    // The same trap on the other terminal axis. `blocked → done` is legal too, and
+    // a patch that carries only `status` leaves the `defect` verdict on the row —
+    // so gating the tally on "not cancelled" fixed one axis and left this one. Both
+    // readers must key on the live condition (`blocked` AND `defect`), not on a
+    // list of statuses to exclude.
+    #[test]
+    fn cascade_and_tally_agree_when_a_defect_row_is_completed() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let passed = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "scenario A");
+        let defect = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "scenario B");
+
+        update(
+            &mut s.db.conn,
+            &passed.id,
+            UpdateFields {
+                status: Some("done".into()),
+                qa_status: Some(Some("pass".into())),
+                evidence: Some(Some("test:defect-done".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update(
+            &mut s.db.conn,
+            &defect.id,
+            UpdateFields {
+                status: Some("blocked".into()),
+                qa_status: Some(Some("defect".into())),
+                blocked_reason: Some(Some("assertion failed".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "active",
+            "precondition: the open defect holds the plan"
+        );
+
+        // Fixed and completed, but the patch carries no verdict — so `defect` stays.
+        update(
+            &mut s.db.conn,
+            &defect.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:fixed-verdict-not-rewritten".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let finished = get(&s.db.conn, &defect.id).unwrap().unwrap();
+        assert_eq!(finished.status, "done");
+        assert!(
+            finished.qa_status.is_none(),
+            "the `defect` verdict must not survive the fix — leaving it produced a row \
+             that was finished to the cascade and an open defect to the tally, or \
+             worse, unscored by both while its last recorded verdict said `defect`"
+        );
+
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "completed",
+            "completed work closes the plan"
+        );
+        assert_eq!(
+            plans::count_completion_residue(&s.db.conn, &s.plan_id).unwrap(),
+            0,
+            "the SQL gate must agree"
+        );
+        let counts =
+            crate::routes::discover::query_plan_task_counts(&s.db.conn, &s.plan_id).unwrap();
+        assert!(
+            counts.defect == 0 && counts.scenario_error == 0,
+            "and so must the QA tally — otherwise `converged` stays false for a plan \
+             that is closed and cannot reopen"
+        );
+        // And it scores as `pass`, via the status-based drift catch — which is the
+        // honest result once the verdict is gone: the scenario was fixed and
+        // completed. Leaving `defect` on the row instead put it in NO bucket, so a
+        // domain could be declared converged while the last recorded verdict for one
+        // of its scenarios said `defect`, with nothing surfacing that.
+        assert_eq!(
+            counts.pass, 2,
+            "the fixed scenario counts as passing, not as unscored"
+        );
+        assert_eq!(counts.total, 2, "both rows are still scheduled work");
+    }
+
+    // Clearing the verdict is itself a settling transition. `routes::tasks` accepts
+    // `qa_status` independently of `status`, so a lone `{"qa_status":"pass"}` patch
+    // on the last blocked defect row settles the plan — and must dispatch the
+    // cascade. A status-only dispatch would leave the container open until some
+    // unrelated edit fired, which is the transition-order dependence the other two
+    // dispatch axes were widened to remove.
+    #[test]
+    fn cascade_dispatches_when_a_defect_verdict_is_cleared_alone() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let passed = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "scenario A");
+        let defect = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "scenario B");
+
+        update(
+            &mut s.db.conn,
+            &passed.id,
+            UpdateFields {
+                status: Some("done".into()),
+                qa_status: Some(Some("pass".into())),
+                evidence: Some(Some("test:clear-verdict".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Exactly what bulk_sync writes for a defect row.
+        update(
+            &mut s.db.conn,
+            &defect.id,
+            UpdateFields {
+                status: Some("blocked".into()),
+                qa_status: Some(Some("defect".into())),
+                blocked_reason: Some(Some("assertion failed on step 3".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "active",
+            "precondition: the blocked defect holds the plan"
+        );
+
+        // Verdict-only patch: no status field at all.
+        update(
+            &mut s.db.conn,
+            &defect.id,
+            UpdateFields {
+                qa_status: Some(Some("pass".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "completed",
+            "clearing the last defect verdict must dispatch the cascade, not wait for an unrelated edit"
+        );
+    }
+
+    // Clearing the verdict to NULL is the same settling transition as replacing it
+    // with `pass`, and must behave identically. `routes::tasks` parses this field
+    // through the 3-state contract, so an explicit JSON `null` reaches the repo as
+    // `Some(None)` — the repo's value validation only inspects `Some(Some(..))`,
+    // and the dispatch axis treats "not defect" as cleared.
+    #[test]
+    fn cascade_dispatches_when_a_defect_verdict_is_cleared_to_null() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let passed = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "scenario A");
+        let defect = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "scenario B");
+
+        update(
+            &mut s.db.conn,
+            &passed.id,
+            UpdateFields {
+                status: Some("done".into()),
+                qa_status: Some(Some("pass".into())),
+                evidence: Some(Some("test:clear-to-null".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update(
+            &mut s.db.conn,
+            &defect.id,
+            UpdateFields {
+                status: Some("blocked".into()),
+                qa_status: Some(Some("defect".into())),
+                blocked_reason: Some(Some("assertion failed".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "active",
+            "precondition: the blocked defect holds the plan"
+        );
+
+        // `Some(None)` — what `{"qa_status": null}` parses to.
+        update(
+            &mut s.db.conn,
+            &defect.id,
+            UpdateFields {
+                qa_status: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            get(&s.db.conn, &defect.id)
+                .unwrap()
+                .unwrap()
+                .qa_status
+                .is_none(),
+            "the verdict must actually be cleared, not silently ignored"
+        );
+        assert_eq!(
+            plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap().status,
+            "completed",
+            "clearing to null settles the row the same as replacing the verdict"
+        );
+    }
+
+    // LM-11093 (2/2): a task detached from its cycle (`task update --cycle ""`)
+    // is backlog — deferred to a later round, not this plan's remaining work.
+    // `tasks.unit_id` is NOT NULL so the task keeps its unit and the plan filter
+    // JOINs through units, which previously kept deferred work in the set.
+    // Reproduces the production case: work shipped, one task deferred.
+    #[test]
+    fn cascade_ignores_backlog_tasks_when_completing_plan() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let deferred = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "next round");
+        let shipped = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "shipped");
+
+        // `todo` — deliberately NOT blocked, so this test isolates deferral.
+        // If it were blocked the previous test's rule would carry it anyway and
+        // this one would pass for the wrong reason.
+        update(
+            &mut s.db.conn,
+            &deferred.id,
+            UpdateFields {
+                cycle_id: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let detached = get(&s.db.conn, &deferred.id).unwrap().unwrap();
+        assert!(detached.cycle_id.is_none(), "task must land in the backlog");
+        assert_eq!(
+            detached.unit_id, s.unit_id,
+            "unit_id is NOT NULL — it stays"
+        );
+        assert_eq!(detached.status, "todo", "deferral is not a status change");
+
+        update(
+            &mut s.db.conn,
+            &shipped.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:backlog-excluded".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let plan = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
+        assert_eq!(
+            plan.status, "completed",
+            "a deferred todo task must not keep the plan open once scheduled work is done"
+        );
+    }
+
+    // LM-11093: the same task, left in the cycle, must still block — proving the
+    // exclusion is keyed on the user's explicit act of detaching, not on status.
+    #[test]
+    fn cascade_blocked_by_same_task_when_left_in_cycle() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let _kept = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "next round");
+        let shipped = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "shipped");
+
+        update(
+            &mut s.db.conn,
+            &shipped.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:not-detached-still-blocks".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let plan = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
+        assert_eq!(
+            plan.status, "active",
+            "an identical task that was NOT detached must still hold the plan open"
+        );
+    }
+
+    // LM-11093: a plan whose work is *entirely* deferred stays open. Nothing in
+    // it was finished, so there is nothing to close on. The term that holds it
+    // open is `any(done)` over the scheduled set — deferring every task empties
+    // that set, so the requirement cannot be met. (A separate emptiness guard
+    // was tried here and removed: `any(done)` already implies it, so the guard
+    // could never decide the outcome.)
+    #[test]
+    fn cascade_leaves_plan_open_when_all_work_is_deferred() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let only = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "deferred");
+        update(
+            &mut s.db.conn,
+            &only.id,
+            UpdateFields {
+                cycle_id: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update(
+            &mut s.db.conn,
+            &only.id,
+            UpdateFields {
+                status: Some("done".into()),
+                evidence: Some(Some("test:all-deferred".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let plan = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
+        assert_eq!(
+            plan.status, "active",
+            "no scheduled work was completed — the plan has nothing to close on"
+        );
+    }
+
+    // LM-11093: the cascade path is Rust-side; the residue gate in
+    // `repo::plans::update` is a separate SQL predicate that must agree. Without
+    // this, reverting the SQL would leave the suite green.
+    #[test]
+    fn plan_residue_gate_accepts_blocked_and_backlog_tasks() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+
+        let blocked = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "blocked");
+        let deferred = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "deferred");
+
+        update(
+            &mut s.db.conn,
+            &blocked.id,
+            UpdateFields {
+                status: Some("blocked".into()),
+                blocked_reason: Some(Some("upstream".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Left as `todo` in the backlog — the status the old gate rejected.
+        update(
+            &mut s.db.conn,
+            &deferred.id,
+            UpdateFields {
+                cycle_id: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        plans::update(
+            &s.db.conn,
+            &s.plan_id,
+            plans::UpdateFields {
+                status: Some("completed".into()),
+                ..Default::default()
+            },
+        )
+        .expect("blocked + backlog tasks must not count as completion residue");
+
+        let plan = plans::get(&s.db.conn, &s.plan_id).unwrap().unwrap();
+        assert_eq!(plan.status, "completed");
+    }
+
+    // LM-11093 (converse): the residue gate must still reject genuinely
+    // unfinished scheduled work, with a message naming the real criterion.
+    #[test]
+    fn plan_residue_gate_rejects_todo_task_in_cycle() {
+        let mut s = setup(true);
+        cycles::activate(&s.db.conn, &s.cycle_id).unwrap();
+        let _pending = mk_task(&mut s.db.conn, &s.unit_id, Some(&s.cycle_id), "not started");
+
+        let err = plans::update(
+            &s.db.conn,
+            &s.plan_id,
+            plans::UpdateFields {
+                status: Some("completed".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("todo/in_progress"),
+            "the gate must name what it actually rejects, got: {err}"
         );
     }
 

@@ -190,6 +190,18 @@ fn parse_event_name(event: &'static str) -> (&'static str, &'static str) {
         "knowledge:deleted" => ("knowledge", "deleted"),
         "comment:created" => ("comment", "created"),
         "comment:deleted" => ("comment", "deleted"),
+        // Every name this daemon actually emits belongs here. An unmapped one
+        // falls to ("unknown","unknown"), which is worse than invisible: a client
+        // filtering `/events?entity_types=run` receives nothing while runs are
+        // being created, so the filter looks like "no activity" rather than
+        // "unsupported". The `run:*` and `discover-loop:*` families were in that
+        // state; `sse-event-wire-contract.md` names the fallthrough as the hazard.
+        //
+        // Adding a name here is part of adding an `emit` call, not a follow-up.
+        "run:created" => ("run", "created"),
+        "run:updated" => ("run", "updated"),
+        "discover-loop:started" => ("discover-loop", "started"),
+        "discover-loop:active-plan-warning" => ("discover-loop", "active-plan-warning"),
         _ => {
             // Fallback: split on ':'
             if let Some(pos) = event.find(':') {
@@ -202,5 +214,115 @@ fn parse_event_name(event: &'static str) -> (&'static str, &'static str) {
                 ("unknown", event)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_event_name;
+
+    /// Every event name the daemon emits must be mapped. An unmapped name falls to
+    /// ("unknown","unknown"), so a client filtering `/events?entity_types=run`
+    /// silently receives nothing while runs are happening — the filter reads as "no
+    /// activity" rather than "unsupported", and nothing fails loudly.
+    ///
+    /// This scans the sources for event-name literals rather than restating a list,
+    /// so adding an emit without a mapping fails here instead of in production. Two
+    /// patterns are covered, because names reach `emit` two ways:
+    ///   - `emit("name", …)` — the direct call in the route handlers.
+    ///   - `.push(("name", …))` — `repo::tasks::cascade_complete` returns names for
+    ///     the route layer to emit through a variable, so those literals sit in a
+    ///     file with no `emit(` in it.
+    ///
+    /// Honest about today's coverage: both cascade names are ALSO emitted directly
+    /// elsewhere, so the second pattern adds nothing right now. It is here for the
+    /// next name that is only ever returned — verified by deleting the direct sites
+    /// in a scratch copy and confirming the scan still finds it.
+    ///
+    /// What it still cannot see: a name assembled at runtime (`format!`) or read
+    /// from a constant. There is none today, and the `!names.is_empty()` guard only
+    /// catches a wholesale pattern change, not a single new indirection — so a
+    /// future author introducing one must extend this scan.
+    ///
+    /// It reads files at test time; `CARGO_MANIFEST_DIR` keeps that independent of
+    /// the working directory.
+    #[test]
+    fn every_emitted_event_name_is_mapped() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut names: Vec<String> = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                // Two marker shapes, and the difference matters:
+                //   `emit(`      — the literal may be on a later line (rustfmt wraps
+                //                  multi-arg calls), so skip ahead to the next quote.
+                //   `.push((\"`  — the marker already consumes the opening quote, so
+                //                  the name starts at byte 0. Skipping to "the next
+                //                  quote" here lands on the CLOSING one and yields an
+                //                  empty string, which is how this marker silently
+                //                  contributed nothing when first added.
+                for (marker, quote_consumed) in [("emit(", false), (".push((\"", true)] {
+                    for chunk in src.split(marker).skip(1) {
+                        let rest = if quote_consumed {
+                            chunk
+                        } else {
+                            let Some(open) = chunk.find('"') else {
+                                continue;
+                            };
+                            &chunk[open + 1..]
+                        };
+                        let Some(close) = rest.find('"') else {
+                            continue;
+                        };
+                        let name = &rest[..close];
+                        // Event names are "<entity>:<change>"; anything else is a
+                        // different call (e.g. a log macro) and is skipped.
+                        if name.contains(':') && !name.contains(' ') && !name.contains('{') {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !names.is_empty(),
+            "scan found no emit() call sites — the pattern must have changed, so this \
+             test is no longer checking anything"
+        );
+
+        names.sort();
+        names.dedup();
+        let unmapped: Vec<&String> = names
+            .iter()
+            .filter(|n| parse_event_name_is_unknown(n))
+            .collect();
+        assert!(
+            unmapped.is_empty(),
+            "these emitted events are not mapped in parse_event_name, so they reach \
+             subscribers as entity_type=\"unknown\" and cannot be filtered: {unmapped:?}"
+        );
+    }
+
+    /// `parse_event_name` takes `&'static str`, but scanned names are owned. Match
+    /// on the mapped set by round-tripping through the same function with a leaked
+    /// string — test-only, and the leak is bounded by the number of event names.
+    fn parse_event_name_is_unknown(name: &str) -> bool {
+        let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+        parse_event_name(leaked).0 == "unknown"
     }
 }
