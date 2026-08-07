@@ -330,6 +330,38 @@ impl From<anyhow::Error> for ApiError {
         if msg.starts_with("ESCALATION_REASON_REQUIRED:") {
             return ApiError::bad_request_coded("ESCALATION_REASON_REQUIRED", msg);
         }
+        // ── /backup, /restore (repo::backup) ──────────────────────────────
+        // Bad user-supplied path (relative, empty, NUL byte) — the request
+        // itself is malformed, so 400.
+        if msg.starts_with("INVALID_BACKUP_PATH:") {
+            return ApiError::bad_request_coded("INVALID_BACKUP_PATH", msg);
+        }
+        // The named archive is not there — 404 matches the other *_NOT_FOUND
+        // codes in this ladder.
+        if msg.starts_with("BACKUP_ARCHIVE_NOT_FOUND:") {
+            return ApiError::not_found_coded("BACKUP_ARCHIVE_NOT_FOUND", msg);
+        }
+        // Archive is present but unreadable / not a Clawket backup / payload
+        // fails integrity_check. 400: the caller handed us bad input.
+        if msg.starts_with("BACKUP_ARCHIVE_INVALID:") {
+            return ApiError::bad_request_coded("BACKUP_ARCHIVE_INVALID", msg);
+        }
+        // `--merge` is refused outright rather than silently downgraded to a
+        // replace. 400 so the CLI surfaces the reason verbatim.
+        if msg.starts_with("MERGE_NOT_SUPPORTED:") {
+            return ApiError::bad_request_coded("MERGE_NOT_SUPPORTED", msg);
+        }
+        // Archive was produced by a newer schema than this binary understands.
+        // Same prefix db.rs already uses for the on-disk downgrade guard, so a
+        // client matching that code handles both sites identically.
+        if msg.starts_with("SCHEMA_DOWNGRADE_REFUSED:") {
+            return ApiError::bad_request_coded("SCHEMA_DOWNGRADE_REFUSED", msg);
+        }
+        // Backup could not be produced (e.g. header overflow). 500: the
+        // request was fine; the daemon failed.
+        if msg.starts_with("BACKUP_FAILED:") {
+            return ApiError::internal(msg);
+        }
         if msg.starts_with("SQLITE_BUSY:") {
             return ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
