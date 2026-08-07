@@ -76,6 +76,22 @@ async fn create_backup(
         // The payload is always the whole store; say so rather than letting the
         // presence of `project_id` imply a subset.
         map.insert("scope".into(), json!("full-database"));
+        // A CLI at v0.6.1 or older documents --project as "back up this project
+        // only". It never reached a daemon (/backup did not exist), so no
+        // working behaviour changes here — but a user reading that help would
+        // take this archive for a single-project export and restore it
+        // expecting the rest of their data to survive. `scope` alone is easy to
+        // miss in a JSON blob, so when the flag is actually passed, say it.
+        if let Some(pid) = map.get("project_id").and_then(Value::as_str) {
+            map.insert(
+                "note".into(),
+                json!(format!(
+                    "project_id {pid} is recorded in the archive header for provenance, but the \
+                     archive holds the whole database — a per-project export is not implemented. \
+                     Restoring this replaces every project, not just {pid}."
+                )),
+            );
+        }
     }
     Ok(Json(value))
 }
@@ -104,6 +120,15 @@ async fn restore_backup(
     })
     .await
     .map_err(|e| crate::routes::error::ApiError::internal(format!("restore task join: {e}")))??;
+
+    // The file under the pool has been replaced. Every pooled connection still
+    // points at the old inode, so a write from here on commits into a file
+    // nothing will reopen — acknowledged, then gone. Latch the state so those
+    // writes are refused with RESTART_REQUIRED instead of being lost silently.
+    // Only on a real swap: a dry run changed nothing.
+    if result.restored {
+        app.mark_restore_pending();
+    }
 
     let value = serde_json::to_value(&result)
         .map_err(|e| crate::routes::error::ApiError::internal(e.to_string()))?;

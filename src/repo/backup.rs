@@ -153,6 +153,57 @@ fn sanitize_path(raw: &str, field: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// Remove restore staging files left by a daemon that died mid-restore.
+///
+/// The in-flight error paths clean up after themselves, but a kill -9 between
+/// staging and rename leaves `.clawket-restore-<pid>.<seq>.tmp` in the data
+/// directory forever — one full database copy each. Called once at startup,
+/// when by definition no restore of ours is in flight. Best-effort: a sweep
+/// that fails must never stop the daemon coming up.
+pub fn sweep_restore_temps(db_path: &Path) {
+    let Some(dir) = db_path.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".clawket-restore-") && name.ends_with(".tmp") {
+            match std::fs::remove_file(e.path()) {
+                Ok(()) => tracing::info!(file = %name, "removed stale restore staging file"),
+                Err(err) => {
+                    tracing::debug!(file = %name, "could not remove stale staging file: {err}")
+                }
+            }
+        }
+    }
+}
+
+/// Monotonic per-process counter. Temp paths derived from the pid alone collide
+/// between concurrent requests inside one daemon — every `/backup` and
+/// `/restore` shares a process.
+fn next_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A temp path beside `target`, distinct for every caller.
+///
+/// Appends rather than replacing the extension: `with_extension` would map
+/// `snap.gz` and `snap.tar` to the same temp name. Sibling (not `/tmp`) because
+/// the final step is a rename, which is only atomic within one filesystem.
+fn sibling_temp(target: &Path, tag: &str) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "clawket".to_string());
+    name.push_str(&format!(".{tag}.tmp"));
+    match target.parent() {
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
 /// Default archive name when the caller did not pass `--output`.
 pub fn default_output_path(now_ms: i64) -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -167,13 +218,92 @@ pub fn backup(
     schema_version: i64,
     now_ms: i64,
 ) -> Result<BackupResult> {
+    // Refuse to write onto the store we are copying, or onto its WAL/journal
+    // sidecars. `File::create` truncates unconditionally, so `--output <the db>`
+    // replaces the database with gzip magic and then reports success — the user
+    // is told the backup worked at the moment their data is gone, and unlike
+    // restore there is no pre-swap copy to fall back on.
+    //
+    // Compared by file IDENTITY, not by string. An earlier version compared the
+    // two paths lexically on the claim that both were normalised; only `output`
+    // is (`sanitize_path`). `db_path` arrives verbatim from `Paths::resolve()`,
+    // so `CLAWKET_DB`, `--db`, `CLAWKET_DATA_DIR` and `XDG_DATA_HOME` all pass
+    // their spelling straight through. Any difference defeated a string compare
+    // — `/tmp` vs its `/private/tmp` symlink target on macOS is enough, and
+    // needs no unusual input at all. Measured: the store went from a 569 KB
+    // SQLite file to a 12 KB gzip, with HTTP 200.
+    //
+    // The destination usually does not exist yet, so canonicalise its DIRECTORY
+    // (created just above) and re-join the file name. That resolves symlinks and
+    // `..` on both sides while still naming a file that is not there.
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create backup dir: {}", parent.display()))?;
+    }
+    let resolved_output = match (output.parent(), output.file_name()) {
+        (Some(dir), Some(name)) => dir.canonicalize().map(|d| d.join(name)).ok(),
+        _ => None,
+    };
+    let resolved_db = db_path.canonicalize().ok();
+    let collides = match (&resolved_output, &resolved_db) {
+        (Some(o), Some(d)) => {
+            let ds = d.to_string_lossy();
+            let os = o.to_string_lossy();
+            os == ds
+                || os == format!("{ds}-wal")
+                || os == format!("{ds}-shm")
+                || os == format!("{ds}-journal")
+        }
+        // Either side unresolvable (db missing on a first run, output parent
+        // gone). Fall back to the lexical comparison: weaker, but it still
+        // catches the exact-spelling case, and refusing every backup because a
+        // path could not be canonicalised would be worse.
+        _ => {
+            let ds = db_path.to_string_lossy();
+            let os = output.to_string_lossy();
+            os == ds
+                || os == format!("{ds}-wal")
+                || os == format!("{ds}-shm")
+                || os == format!("{ds}-journal")
+        }
+    };
+    if collides {
+        bail!(
+            "INVALID_BACKUP_PATH: `output` ({}) is the live database or one of its \
+             sidecar files. Writing there would destroy the store this backup is of.",
+            output.display()
+        );
+    }
+
+    // LM-8: `~/.claude/plugins/` is deleted wholesale by `/plugin install`. A
+    // backup written there is destroyed by the next reinstall — precisely when
+    // the user is most likely to want it. `sanitize_path` deliberately allows
+    // arbitrary destinations (offsite backup needs that), so this is the one
+    // location worth carving out, and the invariant already has a helper.
+    if crate::paths::path_overlaps_plugin_dir(output) {
+        bail!(
+            "INVALID_BACKUP_PATH: `output` ({}) is under the Claude Code plugin directory, \
+             which is deleted on every plugin reinstall. Choose a location outside it.",
+            output.display()
+        );
+    }
+
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create backup dir: {}", parent.display()))?;
     }
 
-    // VACUUM INTO needs a path that does not exist yet.
-    let snapshot_path = output.with_extension("sqlite.snapshot.tmp");
+    // Both temp paths carry a per-call nonce, not just the pid.
+    //
+    // The snapshot path was `output.with_extension(...)`, which REPLACES the
+    // extension: `snap.gz` and `snap.tar` both mapped to `snap.sqlite.snapshot.tmp`,
+    // and the unconditional remove_file below then let two concurrent backups
+    // delete each other's snapshot mid-read. Measured over 30 concurrent
+    // iterations: 30 hard errors and 2 archives that returned Ok but could not
+    // be decoded — a backup that reports success and cannot be restored is the
+    // worst outcome this feature has.
+    let nonce = format!("{}.{}", std::process::id(), next_seq());
+    let snapshot_path = sibling_temp(output, &format!("snapshot.{nonce}"));
     let _ = std::fs::remove_file(&snapshot_path);
 
     // Scope the connection so the snapshot file is closed before we read it.
@@ -201,14 +331,40 @@ pub fn backup(
             bail!("BACKUP_FAILED: header exceeds {MAX_HEADER_LEN} bytes");
         }
 
-        let file = std::fs::File::create(output)
-            .with_context(|| format!("create backup file: {}", output.display()))?;
+        // Write to a private temp file and rename it into place, the same shape
+        // restore already uses. Three problems collapse into that one change:
+        // a crash mid-write can no longer leave a truncated archive at the name
+        // the user will later restore from; two concurrent backups to the same
+        // output cannot interleave their bytes; and `O_EXCL` on the temp means
+        // we never follow a symlink at the destination during the write.
+        //
+        // The rename still replaces an existing file at `output` — that is what
+        // a caller re-running `--output backup.gz` asks for, and refusing would
+        // make routine re-backup fail. What it no longer does is destroy the
+        // old archive before the new one is known-good.
+        let staged = sibling_temp(output, &format!("write.{nonce}"));
+        let _ = std::fs::remove_file(&staged);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .with_context(|| format!("create staged backup: {}", staged.display()))?;
         let mut enc = GzEncoder::new(file, Compression::default());
         enc.write_all(MAGIC)?;
         enc.write_all(&(header_json.len() as u32).to_le_bytes())?;
         enc.write_all(&header_json)?;
         enc.write_all(&sqlite_bytes)?;
-        enc.finish().context("finish gzip stream")?;
+        let mut done = enc.finish().context("finish gzip stream")?;
+        // fsync before publishing: the rename only orders the directory entry,
+        // not the content that entry points at.
+        done.flush().context("flush staged backup")?;
+        done.sync_all().context("fsync staged backup")?;
+        drop(done);
+
+        if let Err(e) = std::fs::rename(&staged, output) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e).with_context(|| format!("publish backup to {}", output.display()));
+        }
 
         let bytes = std::fs::metadata(output)
             .with_context(|| format!("stat backup file: {}", output.display()))?
@@ -271,13 +427,24 @@ fn decode_archive(input: &Path) -> Result<(BackupHeader, Vec<u8>)> {
 
 /// Read the schema version of an on-disk SQLite file without running migrations.
 fn read_schema_version(path: &Path) -> Result<i64> {
+    // Same reasoning as the integrity failure below: a payload SQLite refuses to
+    // open is a bad archive (the caller's input), not a daemon fault.
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("open sqlite: {}", path.display()))?;
+        .map_err(|e| {
+            anyhow::anyhow!("BACKUP_ARCHIVE_INVALID: payload is not a readable database: {e}")
+        })?;
     // `integrity_check` on a freshly decoded file is the cheapest way to reject
     // a payload that is gzip-valid but not a usable database.
+    //
+    // Damage severe enough breaks the PRAGMA itself rather than returning a
+    // verdict, so that failure carries the same code: either way the caller
+    // handed us an unusable archive, which is a 400, not a daemon fault. Without
+    // this the query error escaped uncoded and surfaced as a 500.
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        .context("integrity_check")?;
+        .map_err(|e| {
+            anyhow::anyhow!("BACKUP_ARCHIVE_INVALID: payload is not a readable database: {e}")
+        })?;
     if integrity != "ok" {
         bail!("BACKUP_ARCHIVE_INVALID: payload failed integrity_check: {integrity}");
     }
@@ -325,7 +492,10 @@ pub fn restore(
              requires remapping generated ids across every foreign-key edge and resolving \
              invariants that permit no automatic answer (one active plan per project, one \
              active cycle per unit, unique project cwd). Re-run without --merge to replace \
-             the current database, after taking a backup of it."
+             the current database, after taking a backup of it. \
+             (A CLI at v0.6.1 or older describes --merge as supported: that flag has never \
+             reached a daemon — /restore did not exist until now — so nothing that worked \
+             before stops working. Its help is corrected in the next CLI release.)"
         );
     }
 
@@ -341,9 +511,16 @@ pub fn restore(
     // Downgrade guard, same spirit as `db.rs`'s SCHEMA_DOWNGRADE_REFUSED: a
     // newer archive would put this binary in front of a schema it does not
     // know how to read.
+    //
+    // Distinct code from that one on purpose. They read alike but call for
+    // different handling: the db.rs guard fires at startup over the daemon's
+    // OWN store and the daemon does not come up, so the operator upgrades and
+    // retries nothing. This one rejects a single request over a file the caller
+    // chose — the daemon keeps serving, and the caller can pick another
+    // archive. A client matching one code could not tell those apart.
     if header.schema_version > SCHEMA_VERSION_MAX {
         bail!(
-            "SCHEMA_DOWNGRADE_REFUSED: archive schema version {} > binary max {}. \
+            "ARCHIVE_SCHEMA_TOO_NEW: archive schema version {} > binary max {}. \
              Upgrade clawketd before restoring this archive.",
             header.schema_version,
             SCHEMA_VERSION_MAX
@@ -355,10 +532,33 @@ pub fn restore(
     let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create db dir: {}", parent.display()))?;
-    let staged = parent.join(format!(".clawket-restore-{}.tmp", std::process::id()));
+    // pid + nonce. With the pid alone, two concurrent restores inside one daemon
+    // staged to the same path: measured over 40 iterations per thread, 4 failed
+    // outright at the rename, and a worse interleaving is possible in principle
+    // — A validates its payload, B overwrites the staged file, A renames B's
+    // bytes into place, so the archive that was checked is not the one installed.
+    let staged = parent.join(format!(
+        ".clawket-restore-{}.{}.tmp",
+        std::process::id(),
+        next_seq()
+    ));
+    // `create_new`, like the backup path, so a name collision fails loudly
+    // instead of truncating someone else's staged payload. `next_seq()` restarts
+    // at 0 with the process, so a leftover from a daemon killed mid-restore can
+    // in principle share a name after pid reuse — rare, but silently overwriting
+    // is not an acceptable way to lose that race.
     let _ = std::fs::remove_file(&staged);
-    std::fs::write(&staged, &sqlite_bytes)
-        .with_context(|| format!("stage restore payload: {}", staged.display()))?;
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .with_context(|| format!("stage restore payload: {}", staged.display()))?;
+        f.write_all(&sqlite_bytes)
+            .with_context(|| format!("write restore payload: {}", staged.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync restore payload: {}", staged.display()))?;
+    }
 
     // Validate the staged file as a real database before it can replace
     // anything. Failure here must not leave the staging file behind.
@@ -403,11 +603,30 @@ pub fn restore(
 
     // Keep the outgoing database. A structurally valid archive can still hold
     // the wrong data, and at this point the user has no other copy.
-    let previous = db_path.with_extension("sqlite.pre-restore");
+    //
+    // Append rather than `with_extension`, which REPLACES: `CLAWKET_DB` is a
+    // documented override, so a store at `clawket.db` would have had its backup
+    // written to `clawket.pre-restore` — a name the user is not told about and
+    // would not find. Appending keeps the copy beside the file it came from
+    // whatever that file is called.
+    let previous = {
+        let mut n = db_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "db".to_string());
+        n.push_str(".pre-restore");
+        db_path.parent().unwrap_or(Path::new(".")).join(n)
+    };
     let previous_reported = if db_path.exists() {
-        std::fs::copy(db_path, &previous).with_context(|| {
-            format!("preserve current db before restore: {}", previous.display())
-        })?;
+        // Clean up the staged payload on failure: the earlier error paths do,
+        // and without it a failed copy leaves `.clawket-restore-*.tmp` sitting
+        // in the data directory forever.
+        if let Err(e) = std::fs::copy(db_path, &previous) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e).with_context(|| {
+                format!("preserve current db before restore: {}", previous.display())
+            });
+        }
         Some(previous.to_string_lossy().into_owned())
     } else {
         None
@@ -601,7 +820,7 @@ mod tests {
 
         let err = restore(&db, &archive, false, false, SCHEMA_VERSION_MAX).unwrap_err();
         assert!(
-            err.to_string().starts_with("SCHEMA_DOWNGRADE_REFUSED:"),
+            err.to_string().starts_with("ARCHIVE_SCHEMA_TOO_NEW:"),
             "unexpected error: {err}"
         );
         assert_eq!(read_marker(&db), "original");

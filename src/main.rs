@@ -37,17 +37,32 @@ struct Health {
     pid: u32,
     uptime_ms: u64,
     schema_version: i64,
+    /// A restore replaced the database under this process. Reads still answer,
+    /// but from the pre-restore file the pool is holding — so a dashboard shows
+    /// stale content with nothing to say why. Additive and omitted when false,
+    /// so existing clients are unaffected (`response-shape-backwards-compat`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    restore_pending: bool,
 }
 
 async fn health(State(app): State<AppState>) -> Json<Health> {
+    let restore_pending = app.is_restore_pending();
     Json(Health {
-        status: "ok",
+        // Do not claim "ok" while serving a database that has been replaced
+        // underneath us — that is the one state a health probe must not paper
+        // over.
+        status: if restore_pending {
+            "restart_required"
+        } else {
+            "ok"
+        },
         version: env!("CARGO_PKG_VERSION"),
         engine: "rust",
         vec_enabled: app.vec_enabled(),
         pid: app.pid(),
         uptime_ms: app.uptime_ms(),
         schema_version: app.schema_version(),
+        restore_pending,
     })
 }
 
@@ -117,6 +132,11 @@ async fn run_daemon(args: StartArgs) -> Result<()> {
     // to <state>/migration.log in addition to the tracing subscriber.
     let database = db::Db::open_with_state(&paths_cfg.db, Some(paths_cfg.state.clone()))?;
     tracing::info!(vec_enabled = database.vec_enabled, "database initialized");
+
+    // A daemon killed between staging and rename leaves a full database copy
+    // behind. Nothing else removes them, so they accumulate. Safe here: no
+    // restore of ours can be in flight before the listener binds.
+    repo::backup::sweep_restore_temps(&paths_cfg.db);
 
     // FIX-DAEMON-108: generate the TCP auth token early so AppState can hold a
     // copy. LM-10833: the SPA index handler reads it from AppState to issue the
@@ -553,6 +573,15 @@ async fn backfill_missing_embeddings(state: AppState) {
     let mut done = 0usize;
     let mut failed = 0usize;
     for (id, title, body) in rows {
+        // Checked per row, not once up front: embedding is slow enough that a
+        // restore can land mid-pass, and every store after that writes into the
+        // orphaned inode. Bounded (this returns after one pass) so unlike the
+        // rollup it destroys nothing — but the writes are still lost, and the
+        // 503 latch cannot see an in-process caller.
+        if state.is_restore_pending() {
+            tracing::warn!("backfill stopped: restore pending, restart clawketd");
+            return;
+        }
         let source = format!("{title}\n{body}");
         match embeddings::embed(&source).await {
             Ok(Some(vec)) => match repo::tasks::store_embedding(&state.conn(), &id, &vec) {
@@ -588,6 +617,18 @@ async fn activity_log_rollup_loop(state: AppState) {
         "activity_log retention policy loaded"
     );
     loop {
+        // A restore replaced the database under this process, so every pooled
+        // connection still points at the orphaned inode. The 503 latch stops
+        // clients writing there; this loop is in-process and never crosses the
+        // middleware, so it would keep going. Worse than the lost writes the
+        // latch was added for: rollup PRUNES, and it prunes the file the user's
+        // documented recovery copy (`db.sqlite.pre-restore`) was taken from —
+        // leaving the daemon up past a tick would eat the fallback underneath
+        // them. Stop for good; only a restart can bind the restored file.
+        if state.is_restore_pending() {
+            tracing::warn!("activity_log rollup stopped: restore pending, restart clawketd");
+            return;
+        }
         let result = {
             let mut conn = state.conn();
             jobs::activity_log_rollup::run_once(&mut conn, &policy, id::now_ms())
