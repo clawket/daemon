@@ -414,16 +414,27 @@ pub struct ListFilter<'a> {
     pub limit: Option<i64>,
     /// US-CKT-SCHEMA-044: pagination — number of rows to skip before returning.
     pub offset: Option<i64>,
+    /// Owning project (task → unit → plan → project). `task list --project`
+    /// sends this; without it the filter was silently dropped and the list was
+    /// global, so a leftover task in another project looked like this one's.
+    pub project_id: Option<&'a str>,
 }
 
 pub fn list(conn: &Connection, filter: ListFilter<'_>) -> Result<Vec<Task>> {
     let mut sql = String::from("SELECT s.id FROM tasks s");
     let mut clauses: Vec<String> = Vec::new();
     let mut vals: Vec<rusqlite::types::Value> = Vec::new();
-    if let Some(p) = filter.plan_id {
+    if filter.plan_id.is_some() || filter.project_id.is_some() {
         sql.push_str(" JOIN units u ON u.id = s.unit_id");
+    }
+    if let Some(p) = filter.plan_id {
         clauses.push("u.plan_id = ?".into());
         vals.push(p.to_string().into());
+    }
+    if let Some(pid) = filter.project_id {
+        sql.push_str(" JOIN plans pl ON pl.id = u.plan_id");
+        clauses.push("pl.project_id = ?".into());
+        vals.push(pid.to_string().into());
     }
     if let Some(u) = filter.unit_id {
         clauses.push("s.unit_id = ?".into());
@@ -789,6 +800,15 @@ pub fn update(
                         "EVIDENCE_REQUIRED: transitioning to status=done requires a non-empty evidence (file:line or reasoning summary)"
                     );
                 }
+                // Evidence by reference: `run:<RUN-ID>` tokens must point at a
+                // complete, finished verification run in this task's project.
+                // Free text (no token) is still accepted for non-test work.
+                if let Some(ev) = effective_evidence {
+                    if crate::repo::runs::cites_runs(ev) {
+                        let project_id = crate::repo::runs::task_project_id(conn, &canonical)?;
+                        crate::repo::runs::validate_evidence_refs(conn, ev, project_id.as_deref())?;
+                    }
+                }
             }
         }
     }
@@ -913,9 +933,11 @@ pub fn update(
 
     if let Some(status) = &f.status {
         if status == "in_progress" {
+            // Only execution runs count: a verification run (command set,
+            // migration 029) never stands for the task being worked on.
             let has_open_run: bool = {
                 tx.query_row(
-                    "SELECT COUNT(*) FROM runs WHERE task_id = ?1 AND ended_at IS NULL",
+                    "SELECT COUNT(*) FROM runs WHERE task_id = ?1 AND ended_at IS NULL AND command IS NULL",
                     params![canonical],
                     |r| r.get::<_, i64>(0),
                 )
@@ -938,6 +960,9 @@ pub fn update(
             }
         }
         if status == "done" || status == "cancelled" || status == "blocked" {
+            // Verification runs are finished by their recorder with an exit
+            // code and report hash; closing them here would leave them
+            // finished but incomplete.
             let (result, run_status) = match status.as_str() {
                 "done" => ("success", "finished"),
                 "blocked" => ("blocked", "aborted"),
@@ -946,7 +971,7 @@ pub fn update(
             let ts = now_ms();
             tx.execute(
                 "UPDATE runs SET ended_at = ?1, result = ?2, status = ?3
-                 WHERE task_id = ?4 AND ended_at IS NULL",
+                 WHERE task_id = ?4 AND ended_at IS NULL AND command IS NULL",
                 params![ts, result, run_status, canonical],
             )?;
         }

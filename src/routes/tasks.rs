@@ -13,7 +13,7 @@ use crate::git;
 use crate::models::{Task, TaskEnvelope};
 use crate::repo::{comments, cycles, locks, plans, projects, task_envelopes, tasks, units};
 use crate::routes::error::{json_or_404, ApiError, ApiResult};
-use crate::routes::util::{norm_opt, value_to_opt_string};
+use crate::routes::util::{norm_opt, resolve_project_ref_opt, value_to_opt_string};
 use crate::secrets::redact::reject_high_entropy_in_value;
 use crate::state::AppState;
 
@@ -69,6 +69,8 @@ struct ListQuery {
     limit: Option<i64>,
     /// US-CKT-SCHEMA-044: number of rows to skip before returning.
     offset: Option<i64>,
+    /// Owning project id or key (`task list --project`).
+    project_id: Option<String>,
 }
 
 async fn list(
@@ -83,9 +85,12 @@ async fn list(
         Some("null") | Some("") => (None, true),
         other => (other, false),
     };
+    let conn = app.conn();
+    let project_id = resolve_project_ref_opt(&conn, q.project_id.as_deref())?;
     Ok(Json(tasks::list(
-        &app.conn(),
+        &conn,
         tasks::ListFilter {
+            project_id: project_id.as_deref(),
             unit_id: q.unit_id.as_deref(),
             plan_id: q.plan_id.as_deref(),
             status: q.status.as_deref(),
@@ -5818,5 +5823,43 @@ mod lease {
         )
         .await;
         assert_eq!(st_b, StatusCode::CONFLICT);
+    }
+}
+
+#[cfg(test)]
+mod project_filter_tests {
+    use crate::test_fixtures::{call, fixture, scope, task};
+
+    #[tokio::test]
+    async fn list_honours_project_id() {
+        let fx = fixture();
+        let a = scope(&fx, "Alpha", Some("/pa"), "A plan");
+        let b = scope(&fx, "Beta", Some("/pb"), "B plan");
+        let (ta, tb) = {
+            let mut c = fx.state.conn();
+            (
+                task(&mut c, &a, "a", None, "in_progress"),
+                task(&mut c, &b, "b", None, "in_progress"),
+            )
+        };
+        let app = super::router().with_state(fx.state.clone());
+        let uri = format!("/tasks?status=in_progress&project_id={}", a.project_id);
+        let (st, v) = call(&app, "GET", &uri, None).await;
+        assert_eq!(st, axum::http::StatusCode::OK, "{v}");
+        let got: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, vec![ta.as_str()]);
+        let (_, all) = call(&app, "GET", "/tasks?status=in_progress", None).await;
+        let all: Vec<&str> = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert!(all.contains(&tb.as_str()) && all.contains(&ta.as_str()));
     }
 }

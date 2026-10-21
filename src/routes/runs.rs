@@ -149,6 +149,34 @@ struct CreateBody {
     /// freezes the active envelope chain at this moment. If the task has no
     /// active envelope, the snapshot is null and envelope_id is unset.
     envelope_snapshot: Option<Value>,
+    /// Verification record (migration 029). Optional; a run cited as task
+    /// evidence (`run:<ID>`) must carry all four by the time it is finished.
+    #[serde(flatten)]
+    verification: VerificationBody,
+}
+
+/// The four verification fields accepted on `POST /runs` and
+/// `POST /runs/{id}/finish`. Shared so the two bodies cannot drift.
+#[derive(Deserialize, Default)]
+struct VerificationBody {
+    command: Option<String>,
+    input_hash: Option<String>,
+    exit_code: Option<i64>,
+    report_hash: Option<String>,
+}
+
+impl VerificationBody {
+    fn as_repo(&self) -> runs::Verification<'_> {
+        fn non_empty(v: &Option<String>) -> Option<&str> {
+            v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        }
+        runs::Verification {
+            command: non_empty(&self.command),
+            input_hash: non_empty(&self.input_hash),
+            exit_code: self.exit_code,
+            report_hash: non_empty(&self.report_hash),
+        }
+    }
 }
 
 async fn create(State(app): State<AppState>, Json(body): Json<CreateBody>) -> ApiResult<Json<Run>> {
@@ -165,10 +193,21 @@ async fn create(State(app): State<AppState>, Json(body): Json<CreateBody>) -> Ap
         )));
     }
 
-    // FIX-DAEMON-111: 409 RUN_ALREADY_OPEN — prevent creating a new run when an open one exists
-    let open_run_exists: bool = conn
+    // FIX-DAEMON-111: 409 RUN_ALREADY_OPEN — prevent creating a new run when an open one exists.
+    // Verification runs (created with `command`, see migration 029) are a
+    // separate record kind: they open and finish around one command and never
+    // stand for the task's execution, so they neither conflict with nor are
+    // blocked by the task's open execution run.
+    let is_verification = body
+        .verification
+        .command
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|c| !c.is_empty());
+    let open_run_exists: bool = !is_verification
+        && conn
         .query_row(
-            "SELECT COUNT(*) FROM runs WHERE task_id = ?1 AND ended_at IS NULL",
+            "SELECT COUNT(*) FROM runs WHERE task_id = ?1 AND ended_at IS NULL AND command IS NULL",
             rusqlite::params![task.id],
             |r| r.get::<_, i64>(0),
         )
@@ -206,6 +245,13 @@ async fn create(State(app): State<AppState>, Json(body): Json<CreateBody>) -> Ap
             envelope_snapshot: snapshot.as_ref(),
         },
     )?;
+    let created = match created {
+        Some(run) if !body.verification.as_repo().is_empty() => {
+            runs::set_verification(&conn, &run.id, &body.verification.as_repo())?;
+            runs::get(&conn, &run.id)?
+        }
+        other => other,
+    };
     drop(conn);
     if let Some(ref run) = created {
         app.emit(
@@ -241,6 +287,8 @@ async fn start(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult
 struct FinishBody {
     result: String,
     notes: Option<String>,
+    #[serde(flatten)]
+    verification: VerificationBody,
 }
 
 async fn finish(
@@ -248,7 +296,14 @@ async fn finish(
     Path(id): Path<String>,
     Json(body): Json<FinishBody>,
 ) -> ApiResult<Json<Run>> {
-    let updated = runs::finish(&app.conn(), &id, &body.result, body.notes.as_deref())?;
+    let conn = app.conn();
+    // Record the verification fields before the status flip so a reader that
+    // sees `finished` never sees a half-written record.
+    if runs::get(&conn, &id)?.is_some() {
+        runs::set_verification(&conn, &id, &body.verification.as_repo())?;
+    }
+    let updated = runs::finish(&conn, &id, &body.result, body.notes.as_deref())?;
+    drop(conn);
     if let Some(ref run) = updated {
         app.emit(
             "run:updated",
@@ -462,5 +517,71 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["status"], "started");
+    }
+
+    #[tokio::test]
+    async fn verification_fields_are_recorded_on_create_and_finish() {
+        let fx = fixture();
+        let (status, v) = post_runs(
+            &fx.app,
+            json!({"task_id": fx.task_id, "command": "cargo test", "input_hash": "sha256:in"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["command"], "cargo test");
+        assert_eq!(v["input_hash"], "sha256:in");
+        assert!(v.get("exit_code").is_none(), "absent until supplied: {v}");
+        let id = v["id"].as_str().unwrap().to_string();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/runs/{id}/finish"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "result": "success",
+                    "exit_code": 0,
+                    "report_hash": "sha256:report"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = fx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "finished");
+        assert_eq!(
+            v["command"], "cargo test",
+            "create-time fields survive finish"
+        );
+        assert_eq!(v["exit_code"], 0);
+        assert_eq!(v["report_hash"], "sha256:report");
+    }
+
+    /// A verification run opens and finishes around one command while the
+    /// task's execution run stays open, so neither blocks the other.
+    #[tokio::test]
+    async fn verification_run_coexists_with_open_execution_run() {
+        let fx = fixture();
+        let (status, exec_run) = post_runs(&fx.app, json!({"task_id": fx.task_id})).await;
+        assert_eq!(status, StatusCode::OK, "{exec_run}");
+
+        let (status, v) = post_runs(
+            &fx.app,
+            json!({"task_id": fx.task_id, "command": "cargo test"}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "verification run must not hit RUN_ALREADY_OPEN: {v}"
+        );
+
+        // A second execution run is still refused while the first is open,
+        // and the open verification run does not count against it either way.
+        let (status, v) = post_runs(&fx.app, json!({"task_id": fx.task_id})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["code"], "RUN_ALREADY_OPEN");
     }
 }

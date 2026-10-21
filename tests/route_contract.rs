@@ -86,6 +86,9 @@ const PROBES: &[(&str, &str, &str)] = &[
     ("restore", "/restore", "DELETE"),
     ("migrate", "/health", "DELETE"),
     ("dashboard", "/dashboard", "DELETE"),
+    // Not a CLI command: the plugin's PreToolUse hook reads this route directly
+    // (one round trip per gated tool call) and falls back to CLI calls on 404.
+    ("hook pre-tool-use gate", "/gate/pre-tool-use", "DELETE"),
     ("project list", "/projects", "DELETE"),
     ("project by-cwd", "/projects/by-cwd/tmp", "DELETE"),
     ("plan list", "/plans", "DELETE"),

@@ -10,7 +10,7 @@
 //   - Never DROP / DELETE / TRUNCATE DB rows.
 //   - No reasoning decisions inside sync paths (X9 anti-pattern).
 //   - TSV status mapping is transcription-only (pass→done, defect→blocked,
-//     scenario_error→cancelled). Both `tasks.status` (workflow) and
+//     scenario_error→cancelled, harness_error→todo + tasks.harness_error). Both `tasks.status` (workflow) and
 //     `tasks.qa_status` (round-result) are written in lock-step so either
 //     column is a valid count source for convergence (DOGFOOD-039 fix).
 //   - cross-unit cycle allowed (PDD v3.0 A4 rollback — unit_id on cycle
@@ -280,16 +280,11 @@ async fn next_round(
         // is already converged (status=completed). Once converged, next-round is
         // a regression — caller must explicitly create a new fix plan instead.
         if prev_plan.status == "completed" {
-            let prev_counts = query_plan_task_counts(&conn, &prev_plan.id).unwrap_or(TaskCounts {
-                pass: 0,
-                defect: 0,
-                scenario_error: 0,
-                total: 0,
-            });
-            if prev_counts.defect == 0 && prev_counts.scenario_error == 0 {
+            let prev_counts = query_plan_task_counts(&conn, &prev_plan.id).unwrap_or_default();
+            if prev_counts.is_converged() {
                 return Err(ApiError::bad_request_coded(
                     "ALREADY_CONVERGED",
-                    "ALREADY_CONVERGED: previous round plan is completed with defect=0 + scenario_error=0; next-round refused (qa-flow §7).",
+                    "ALREADY_CONVERGED: previous round plan is completed with defect=0 + scenario_error=0 + harness_error=0; next-round refused (qa-flow §7).",
                 ));
             }
         }
@@ -569,6 +564,10 @@ async fn dispatch_plan(
 struct VerifyTsvBody {
     /// Raw TSV content. Header row (first line without US- prefix) is skipped.
     tsv: String,
+    /// Optional project id/key. When given, `run:<ID>` evidence references
+    /// must belong to this project; existence and completeness are checked
+    /// either way.
+    project_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -586,8 +585,86 @@ struct TsvRowError {
     message: String,
 }
 
-async fn verify_tsv(Json(body): Json<VerifyTsvBody>) -> ApiResult<Json<TsvValidationResult>> {
-    Ok(Json(validate_tsv_content(&body.tsv)))
+async fn verify_tsv(
+    State(app): State<AppState>,
+    Json(body): Json<VerifyTsvBody>,
+) -> ApiResult<Json<TsvValidationResult>> {
+    let conn = app.conn();
+    let project_id =
+        crate::routes::util::resolve_project_ref_opt(&conn, body.project_id.as_deref())?;
+    let mut result = validate_tsv_content(&body.tsv);
+    result.merge(validate_tsv_evidence_refs(
+        &conn,
+        &body.tsv,
+        project_id.as_deref(),
+    ));
+    Ok(Json(result))
+}
+
+impl TsvValidationResult {
+    fn merge(&mut self, more: Vec<TsvRowError>) {
+        if more.is_empty() {
+            return;
+        }
+        self.errors.extend(more);
+        self.errors.sort_by_key(|e| e.row);
+        self.error_count = self.errors.len() as u32;
+        self.valid = false;
+    }
+}
+
+/// Data rows of a TSV payload as `(row_number, fields)`, using the same header
+/// heuristic and row numbering as `validate_tsv_content` so errors from both
+/// passes point at the same rows.
+fn tsv_data_rows(tsv: &str) -> Vec<(u32, Vec<&str>)> {
+    let sc_re = scenario_id_re();
+    let mut out = Vec::new();
+    let mut row_count: u32 = 0;
+    for (line_idx, line) in tsv.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if line_idx == 0 && (fields.is_empty() || !sc_re.is_match(fields[0])) {
+            continue;
+        }
+        row_count += 1;
+        out.push((row_count, fields));
+    }
+    out
+}
+
+fn scenario_id_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^US-[A-Z][A-Z0-9-]*-\d{3,}$").unwrap())
+}
+
+/// DB-backed half of TSV validation: every `run:<ID>` cited in the evidence
+/// column must be a finished, complete verification run (and, when a project
+/// is known, one that belongs to it). Free-text evidence is not judged here.
+fn validate_tsv_evidence_refs(
+    conn: &rusqlite::Connection,
+    tsv: &str,
+    project_id: Option<&str>,
+) -> Vec<TsvRowError> {
+    let mut errors = Vec::new();
+    for (row, fields) in tsv_data_rows(tsv) {
+        let Some(evidence) = fields.get(3) else {
+            continue;
+        };
+        if !crate::repo::runs::cites_runs(evidence) {
+            continue;
+        }
+        if let Err(e) = crate::repo::runs::validate_evidence_refs(conn, evidence, project_id) {
+            errors.push(TsvRowError {
+                row,
+                field: "evidence".to_string(),
+                message: e.to_string(),
+            });
+        }
+    }
+    errors
 }
 
 /// Core TSV validation logic — pure, no DB access (also called from bulk_sync).
@@ -670,11 +747,14 @@ fn validate_tsv_content(tsv: &str) -> TsvValidationResult {
 
         // status validation
         match status {
-            "pass" | "defect" | "scenario_error" => {}
+            "pass" | "defect" | "scenario_error" | "harness_error" => {}
             other => errors.push(TsvRowError {
                 row: row_num,
                 field: "status".to_string(),
-                message: format!("must be pass|defect|scenario_error, got {:?}", other),
+                message: format!(
+                    "must be pass|defect|scenario_error|harness_error, got {:?}",
+                    other
+                ),
             }),
         }
 
@@ -769,6 +849,14 @@ async fn generate_batch_id() -> ApiResult<Json<Value>> {
 ///   pass           → task status = done, qa_status = pass
 ///   defect         → task status = blocked, qa_status = defect
 ///   scenario_error → task status = cancelled, qa_status = scenario_error
+///   harness_error  → task status = todo, qa_status = NULL, tasks.harness_error
+///                    = first line of the reasoning (the check could not run;
+///                    not a defect, but the round cannot converge)
+///
+/// Harness failures and rows that fail to transcribe enter the retry queue
+/// (`discover_retry_queue`) keyed by (scenario_id, failure signature); a key
+/// that already reached `retry_cap` attempts is reported in `retry_exhausted`
+/// instead of being queued again.
 ///
 /// Idempotent: if a task with `scenario_id` already exists in the cycle, it
 /// is updated in-place rather than duplicated.
@@ -782,13 +870,35 @@ struct BulkSyncBody {
     cycle_id: String,
     /// Assignee label for created tasks (default: "discover-loop").
     assignee: Option<String>,
+    /// Maximum attempts per (scenario, failure signature) before the row is
+    /// escalated instead of re-queued. Default `DEFAULT_RETRY_CAP`.
+    retry_cap: Option<u32>,
 }
+
+/// Default cap for the retry queue: a scenario failing the same way this many
+/// times is escalated (`retry_exhausted`) rather than re-run again.
+pub(crate) const DEFAULT_RETRY_CAP: u32 = 3;
 
 #[derive(Serialize)]
 struct BulkSyncResult {
     synced: u32,
     skipped: u32,
     errors: Vec<SyncRowError>,
+    /// Rows queued for another attempt, keyed by (scenario_id, signature).
+    retry_queued: Vec<RetryEntry>,
+    /// Rows whose (scenario_id, signature) already reached the cap — escalate,
+    /// do not re-run.
+    retry_exhausted: Vec<RetryEntry>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub(crate) struct RetryEntry {
+    pub(crate) scenario_id: String,
+    pub(crate) signature: String,
+    pub(crate) attempts: u32,
+    pub(crate) cap: u32,
+    pub(crate) status: String,
+    pub(crate) error: String,
 }
 
 #[derive(Serialize)]
@@ -848,7 +958,35 @@ async fn bulk_sync(
             synced: 0,
             skipped: 0,
             errors: vec![],
+            retry_queued: vec![],
+            retry_exhausted: vec![],
         }));
+    }
+    let retry_cap = body.retry_cap.unwrap_or(DEFAULT_RETRY_CAP);
+    if retry_cap == 0 {
+        return Err(ApiError::bad_request_coded(
+            "INVALID_RETRY_CAP",
+            "INVALID_RETRY_CAP: retry_cap must be >= 1",
+        ));
+    }
+    // The cycle's project scopes both the run-reference check and the retry
+    // queue. A missing cycle fails later on task create, as before.
+    let sync_project_id: Option<String> = cycles::get(&app.conn(), &body.cycle_id)
+        .ok()
+        .flatten()
+        .map(|c| c.project_id);
+    {
+        let conn = app.conn();
+        let ref_errors = validate_tsv_evidence_refs(&conn, &body.tsv, sync_project_id.as_deref());
+        if !ref_errors.is_empty() {
+            return Err(ApiError::bad_request_with_details(
+                format!(
+                    "TSV validation failed ({} error(s)) — refusing sync (run evidence)",
+                    ref_errors.len()
+                ),
+                serde_json::json!({ "tsv_errors": ref_errors }),
+            ));
+        }
     }
 
     let assignee = body
@@ -867,6 +1005,10 @@ async fn bulk_sync(
 
     let mut data_row: u32 = 0;
     let mut failed_scenario_ids: Vec<String> = Vec::new();
+    // (row, scenario_id, status, harness failure line) for every transcribable
+    // row, in arrival order. Rows whose number appears in `sync_errors` failed.
+    type RowOutcome = (u32, String, String, Option<String>);
+    let mut row_outcomes: Vec<RowOutcome> = Vec::new();
     // R3 DOGFOOD-020 fix: per-batch row-order tracking for front/back-half
     // attention-dilution stats. Each entry: (batch_id, ordinal, status).
     // Computed into a stats artifact at end-of-sync.
@@ -899,10 +1041,13 @@ async fn bulk_sync(
         let escalation_reason_field = if fields.len() == 7 { fields[6] } else { "" };
 
         // X9: pure status transcription — NO reasoning decisions here.
+        // harness_error → todo: the check itself could not run, so the scenario
+        // has no result and goes back to the queue. It is not a defect.
         let task_status = match status {
             "pass" => "done",
             "defect" => "blocked",
             "scenario_error" => "cancelled",
+            "harness_error" => "todo",
             _ => {
                 sync_errors.push(SyncRowError {
                     row: data_row,
@@ -925,6 +1070,17 @@ async fn bulk_sync(
             "pass" | "defect" | "scenario_error" => Some(status),
             _ => None,
         };
+        let harness_error_text: Option<String> = if status == "harness_error" {
+            Some(first_line(reasoning).to_string())
+        } else {
+            None
+        };
+        row_outcomes.push((
+            data_row,
+            scenario_id.to_string(),
+            status.to_string(),
+            harness_error_text,
+        ));
 
         let evidence_opt = if evidence.trim().is_empty() {
             None
@@ -1072,6 +1228,50 @@ async fn bulk_sync(
         }
     }
 
+    // harness_error bookkeeping + retry queue. Pure transcription: the status
+    // column decides everything, nothing here interprets the reasoning text
+    // beyond normalising it into a failure signature.
+    let mut retry_queued: Vec<RetryEntry> = Vec::new();
+    let mut retry_exhausted: Vec<RetryEntry> = Vec::new();
+    for (row, scenario_id, status, harness_text) in &row_outcomes {
+        let row_error = sync_errors
+            .iter()
+            .find(|e| e.row == *row)
+            .map(|e| e.message.clone());
+        if row_error.is_none() {
+            // Transcribed: record (or clear) the harness failure on the task.
+            let _ = conn.execute(
+                "UPDATE tasks SET harness_error = ?1 WHERE scenario_id = ?2 AND cycle_id = ?3",
+                rusqlite::params![harness_text, scenario_id, body.cycle_id],
+            );
+        }
+        let Some(project_id) = sync_project_id.as_deref() else {
+            continue;
+        };
+        let failure: Option<String> = match (&row_error, harness_text) {
+            (Some(err), _) => Some(err.clone()),
+            (None, Some(h)) => Some(h.clone()),
+            (None, None) => None,
+        };
+        match failure {
+            Some(text) => {
+                match record_retry(&conn, project_id, scenario_id, status, &text, retry_cap) {
+                    Ok(RetryOutcome::Queued(e)) => retry_queued.push(e),
+                    Ok(RetryOutcome::Exhausted(e)) => retry_exhausted.push(e),
+                    Err(e) => tracing::warn!(
+                        scenario_id = %scenario_id,
+                        error = %e,
+                        "discover-loop:sync — could not record retry-queue row"
+                    ),
+                }
+            }
+            None => {
+                // A real verdict resolves earlier harness/transcription failures.
+                let _ = reset_retries(&conn, project_id, scenario_id);
+            }
+        }
+    }
+
     // R2 DOGFOOD-025 fix: persist a retry-queue artifact when any rows failed
     // so a follow-up sync can resume by scenario_id without re-reasoning.
     if !failed_scenario_ids.is_empty() {
@@ -1085,6 +1285,10 @@ async fn bulk_sync(
             "unit_id": body.unit_id,
             "failed_scenario_ids": failed_scenario_ids,
             "errors": sync_errors,
+            // Attempt counts live in `discover_retry_queue`; this artifact is a
+            // human-readable snapshot of the same sync.
+            "retry_queued": retry_queued,
+            "retry_exhausted": retry_exhausted,
         })
         .to_string();
         let _ = knowledge::create(
@@ -1230,7 +1434,139 @@ async fn bulk_sync(
         synced,
         skipped,
         errors: sync_errors,
+        retry_queued,
+        retry_exhausted,
     }))
+}
+
+/// First non-empty line of a free-text field, trimmed.
+fn first_line(text: &str) -> &str {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+}
+
+/// Deterministic failure signature for the retry queue.
+///
+/// Two attempts of the same scenario that fail "the same way" must collide even
+/// when the message embeds volatile tokens (ids, counts, durations, hashes), and
+/// two genuinely different failures must not. So the first line is normalised:
+/// ULID-style ids and hex digests collapse to `#`, digit runs to `0`, case and
+/// whitespace are folded. The digest is FNV-1a 64 — stable across builds and
+/// platforms (unlike `DefaultHasher`), which matters because it is persisted.
+pub(crate) fn failure_signature(status: &str, text: &str) -> String {
+    static ID_RE: OnceLock<Regex> = OnceLock::new();
+    static HEX_RE: OnceLock<Regex> = OnceLock::new();
+    static DIGIT_RE: OnceLock<Regex> = OnceLock::new();
+    static WS_RE: OnceLock<Regex> = OnceLock::new();
+    let id_re = ID_RE.get_or_init(|| Regex::new(r"\b[A-Z]+-[0-9A-Z]{10,}\b").unwrap());
+    let hex_re = HEX_RE.get_or_init(|| Regex::new(r"(?i)\b(?:0x)?[0-9a-f]{7,}\b").unwrap());
+    let digit_re = DIGIT_RE.get_or_init(|| Regex::new(r"\d+").unwrap());
+    let ws_re = WS_RE.get_or_init(|| Regex::new(r"\s+").unwrap());
+    let line = first_line(text);
+    let line = id_re.replace_all(line, "#");
+    let line = hex_re.replace_all(&line, "#");
+    let line = digit_re.replace_all(&line, "0");
+    let line = line.to_lowercase();
+    let line = ws_re.replace_all(line.trim(), " ");
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in status
+        .as_bytes()
+        .iter()
+        .chain(b"\x1f")
+        .chain(line.as_bytes())
+    {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("sig-{hash:016x}")
+}
+
+pub(crate) enum RetryOutcome {
+    Queued(RetryEntry),
+    Exhausted(RetryEntry),
+}
+
+/// Record one failed attempt for (project, scenario, signature) and enforce
+/// the cap. `attempts` counts attempts that were queued; once it has reached
+/// `cap`, a further failure with the same signature is reported as exhausted
+/// (escalate) and not queued again.
+pub(crate) fn record_retry(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    scenario_id: &str,
+    status: &str,
+    error_text: &str,
+    cap: u32,
+) -> anyhow::Result<RetryOutcome> {
+    let signature = failure_signature(status, error_text);
+    let now = crate::id::now_ms();
+    let error_line = first_line(error_text).to_string();
+    let attempts: Option<i64> = conn
+        .query_row(
+            "SELECT attempts FROM discover_retry_queue
+             WHERE project_id = ?1 AND scenario_id = ?2 AND signature = ?3",
+            rusqlite::params![project_id, scenario_id, signature],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let attempts = attempts.unwrap_or(0).max(0) as u32;
+    let entry = |n: u32| RetryEntry {
+        scenario_id: scenario_id.to_string(),
+        signature: signature.clone(),
+        attempts: n,
+        cap,
+        status: status.to_string(),
+        error: error_line.clone(),
+    };
+    if attempts >= cap {
+        conn.execute(
+            "UPDATE discover_retry_queue
+                SET exhausted = 1, last_status = ?4, last_error = ?5, last_seen = ?6
+              WHERE project_id = ?1 AND scenario_id = ?2 AND signature = ?3",
+            rusqlite::params![project_id, scenario_id, signature, status, error_line, now],
+        )?;
+        return Ok(RetryOutcome::Exhausted(entry(attempts)));
+    }
+    let next = attempts + 1;
+    conn.execute(
+        "INSERT INTO discover_retry_queue
+            (project_id, scenario_id, signature, attempts, last_status, last_error,
+             exhausted, first_seen, last_seen)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7)
+         ON CONFLICT(project_id, scenario_id, signature) DO UPDATE SET
+            attempts = excluded.attempts,
+            last_status = excluded.last_status,
+            last_error = excluded.last_error,
+            exhausted = 0,
+            last_seen = excluded.last_seen",
+        rusqlite::params![
+            project_id,
+            scenario_id,
+            signature,
+            next,
+            status,
+            error_line,
+            now
+        ],
+    )?;
+    Ok(RetryOutcome::Queued(entry(next)))
+}
+
+/// A real verdict for the scenario ends its failure streaks. Rows are kept
+/// (this module never deletes) with their attempt count zeroed.
+pub(crate) fn reset_retries(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    scenario_id: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE discover_retry_queue SET attempts = 0, exhausted = 0
+          WHERE project_id = ?1 AND scenario_id = ?2 AND attempts > 0",
+        rusqlite::params![project_id, scenario_id],
+    )?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,19 +1596,37 @@ struct ConvergenceStatusResponse {
     previous_round: Option<PreviousRoundSummary>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug, Clone, Default, PartialEq)]
 pub(crate) struct TaskCounts {
     pub(crate) pass: i64,
     pub(crate) defect: i64,
     pub(crate) scenario_error: i64,
+    /// Scenarios whose latest verification attempt failed in the harness (the
+    /// check could not run). Not a defect — never feeds regression — but such
+    /// a scenario has no result, so the round cannot be called converged.
+    pub(crate) harness_error: i64,
     pub(crate) total: i64,
+}
+
+impl TaskCounts {
+    /// The single convergence predicate: no defect, no scenario error, and no
+    /// scenario left without a result because its harness failed.
+    pub(crate) fn is_converged(&self) -> bool {
+        self.defect == 0 && self.scenario_error == 0 && self.harness_error == 0
+    }
 }
 
 #[derive(Serialize)]
 struct PreviousRoundSummary {
     plan_id: String,
     plan_title: String,
+    /// Live re-tally of the previous round's rows.
     counts: TaskCounts,
+    /// What the previous round reported when its status was last read
+    /// (`discover_round_snapshots`). Absent for rounds recorded before the
+    /// snapshot table existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reported: Option<TaskCounts>,
 }
 
 async fn convergence_status(
@@ -1282,42 +1636,44 @@ async fn convergence_status(
     let conn = app.conn();
 
     let plan = resolve_plan(&conn, q.plan_id.as_deref(), q.project_id.as_deref())?;
-    let round = parse_round_plan_title(&plan.title).map(|(_, r)| r);
+    let ident = round_identity(&conn, &plan);
+    let round = ident.as_ref().map(|i| i.round);
     let counts = query_plan_task_counts(&conn, &plan.id)?;
 
-    // Look up previous round plan for monotone-decrease check.
-    let prev_summary = if let Some(r) = round {
-        if r > 1 {
-            find_prev_round_plan(&conn, &plan.project_id, &plan.title, r - 1)?
-        } else {
-            None
-        }
-    } else {
-        None
+    // Previous round, keyed by (project, domain key, round - 1) — not by
+    // reconstructing its title, which breaks the moment either plan is renamed.
+    let prev_snapshot = ident
+        .as_ref()
+        .and_then(|i| previous_round_snapshot(&conn, &plan.project_id, i));
+    let prev_summary = match &prev_snapshot {
+        Some(snap) => plans::get(&conn, &snap.plan_id)?.map(|p| PreviousRoundSummary {
+            counts: query_plan_task_counts(&conn, &p.id).unwrap_or_default(),
+            plan_id: p.id,
+            plan_title: p.title,
+            reported: Some(snap.counts.clone()),
+        }),
+        None => match round {
+            Some(r) if r > 1 => find_prev_round_plan(&conn, &plan.project_id, &plan.title, r - 1)?,
+            _ => None,
+        },
     };
 
-    let converged = counts.defect == 0 && counts.scenario_error == 0;
+    let converged = counts.is_converged();
 
-    // The baseline is the count round R-1 REPORTED at the time, read from the audit
-    // log, not a re-tally of R-1's rows now.
-    //
-    // Re-tallying makes the comparison unstable in the ordinary case: fixing a
-    // defect is `blocked → done` with no verdict on the patch, which drops that row
-    // from R-1's count. R1 finds 5, R2 has 2 left, R1 re-tallies as 0 — and R2 is
-    // written to a durable audit entry as `regression` when defects strictly
-    // decreased. Cancellation has the same effect, and the previous reasoning
-    // ("a withdrawn defect was never a real one") was at least arguable there; it
-    // does not survive being extended to a defect that was fixed.
-    //
-    // The audit log already records what each round reported, so the snapshot needs
-    // no new storage. Falling back to the live tally keeps rounds that predate the
-    // audit entry working — those can still drift, which is strictly better than
-    // refusing to compare.
-    let logged_prev_defect = round
-        .and_then(|r| r.checked_sub(1))
-        .and_then(|prev| logged_round_defects(&conn, &plan.project_id, &plan.title, prev));
-    let baseline_defect =
-        logged_prev_defect.or_else(|| prev_summary.as_ref().map(|p| p.counts.defect));
+    // The baseline is the count round R-1 REPORTED at the time, not a re-tally of
+    // its rows now: fixing a defect is `blocked → done`, which drops the row from
+    // R-1's live tally, so a re-tally would flag a strictly decreasing sequence as
+    // `regression`. Source order: the structured snapshot, then the legacy audit
+    // line (rounds recorded before the snapshot table), then the live tally.
+    let baseline_defect = prev_snapshot
+        .as_ref()
+        .map(|s| s.counts.defect)
+        .or_else(|| {
+            round.and_then(|r| r.checked_sub(1)).and_then(|prev| {
+                legacy_logged_round_defects(&conn, &plan.project_id, &plan.title, prev)
+            })
+        })
+        .or_else(|| prev_summary.as_ref().map(|p| p.counts.defect));
     let regression_detected = baseline_defect
         .map(|base| counts.defect > 0 && counts.defect > base)
         .unwrap_or(false);
@@ -1336,6 +1692,17 @@ async fn convergence_status(
     } else {
         "continue"
     };
+    if let Some(i) = &ident {
+        if let Err(e) =
+            write_round_snapshot(&conn, &plan.project_id, i, &plan.id, &counts, decision)
+        {
+            tracing::warn!(
+                plan_id = %plan.id,
+                error = %e,
+                "discover-loop:status — could not record the round snapshot"
+            );
+        }
+    }
     let line = format_audit_line(round.unwrap_or(0), &counts, decision);
     let audit_title = audit_log_title(&plan.project_id, &domain);
     let existing_audit = find_audit_entry(&conn, &plan.project_id, &domain);
@@ -1434,25 +1801,33 @@ async fn converged(
 ) -> ApiResult<Json<ConvergedResponse>> {
     let conn = app.conn();
     let plan = resolve_plan(&conn, q.plan_id.as_deref(), q.project_id.as_deref())?;
-    let current_round = parse_round_plan_title(&plan.title).map(|(_, r)| r);
+    let ident = round_identity(&conn, &plan);
+    let current_round = ident.as_ref().map(|i| i.round);
     let cur_counts = query_plan_task_counts(&conn, &plan.id)?;
-    let cur_zero = cur_counts.defect == 0 && cur_counts.scenario_error == 0;
+    let cur_zero = cur_counts.is_converged();
 
-    // last-2-rounds-zero check.
-    let prev_zero = match current_round {
-        None | Some(0) | Some(1) => false,
-        Some(r) => find_prev_round_plan(&conn, &plan.project_id, &plan.title, r - 1)?
-            .map(|p| p.counts.defect == 0 && p.counts.scenario_error == 0)
-            .unwrap_or(false),
+    // last-2-rounds-zero check: the previous round's reported snapshot (by plan
+    // id + domain key), falling back to a title lookup + live tally for rounds
+    // recorded before snapshots existed.
+    let prev_zero = match (&ident, current_round) {
+        (_, None | Some(0) | Some(1)) => false,
+        (Some(i), Some(r)) => match previous_round_snapshot(&conn, &plan.project_id, i) {
+            Some(snap) => snap.counts.is_converged(),
+            None => find_prev_round_plan(&conn, &plan.project_id, &plan.title, r - 1)?
+                .map(|p| p.counts.is_converged())
+                .unwrap_or(false),
+        },
+        (None, Some(_)) => false,
     };
 
     let c = cur_zero && prev_zero;
     let reason = if c {
-        "defect=0 + scenario_error=0 for 2 consecutive rounds (qa-flow §7)".to_string()
+        "defect=0 + scenario_error=0 + harness_error=0 for 2 consecutive rounds (qa-flow §7)"
+            .to_string()
     } else if !cur_zero {
         format!(
-            "current round has defect={} scenario_error={}",
-            cur_counts.defect, cur_counts.scenario_error
+            "current round has defect={} scenario_error={} harness_error={}",
+            cur_counts.defect, cur_counts.scenario_error, cur_counts.harness_error
         )
     } else if current_round.map(|r| r <= 1).unwrap_or(true) {
         "only round 1 completed — need 2 consecutive zero rounds (qa-flow §7)".to_string()
@@ -1519,12 +1894,7 @@ async fn list_round_plans(
         .into_iter()
         .filter_map(|p| {
             parse_round_plan_title(&p.title).map(|(domain, round)| {
-                let counts = query_plan_task_counts(&conn, &p.id).unwrap_or(TaskCounts {
-                    pass: 0,
-                    defect: 0,
-                    scenario_error: 0,
-                    total: 0,
-                });
+                let counts = query_plan_task_counts(&conn, &p.id).unwrap_or_default();
                 serde_json::json!({
                     "plan_id": p.id,
                     "plan_title": p.title,
@@ -1628,7 +1998,7 @@ pub(crate) fn query_plan_task_counts(
     conn: &rusqlite::Connection,
     plan_id: &str,
 ) -> anyhow::Result<TaskCounts> {
-    let (pass, defect, scenario_error, total): (i64, i64, i64, i64) = conn
+    let (pass, defect, scenario_error, harness_error, total): (i64, i64, i64, i64, i64) = conn
         .query_row(
             // A `defect` verdict counts UNLESS the row has since reached a terminal
             // status. `qa_status` is not cleared by a status change, so a verdict
@@ -1659,18 +2029,31 @@ pub(crate) fn query_plan_task_counts(
                 SUM(CASE WHEN t.qa_status = 'scenario_error'
                             OR (t.qa_status IS NULL AND t.status = 'cancelled')
                          THEN 1 ELSE 0 END),
+                SUM(CASE WHEN t.harness_error IS NOT NULL
+                              AND t.qa_status IS NULL
+                              AND t.status NOT IN ('done', 'cancelled')
+                         THEN 1 ELSE 0 END),
                 COUNT(t.id)
              FROM tasks t
              JOIN units u ON t.unit_id = u.id
              WHERE u.plan_id = ?1 AND t.cycle_id IS NOT NULL",
             rusqlite::params![plan_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    r.get(4)?,
+                ))
+            },
         )
-        .unwrap_or((0, 0, 0, 0));
+        .unwrap_or((0, 0, 0, 0, 0));
     Ok(TaskCounts {
         pass,
         defect,
         scenario_error,
+        harness_error,
         total,
     })
 }
@@ -1728,22 +2111,27 @@ fn format_audit_line(round: u32, counts: &TaskCounts, decision: &str) -> String 
     )
 }
 
-/// The defect count round `n` reported when it ran, read back from the audit log
-/// that `convergence_status` appends to (`R<n>: defect=X, …`).
+/// The defect count round `round` reported, for the domain `plan` belongs to.
 ///
-/// This exists so regression detection compares against what was reported rather
-/// than a re-tally of that round's rows, which moves whenever a defect is fixed or
-/// withdrawn. The log line is the only per-round snapshot in the system; parsing it
-/// avoids adding a second store that could disagree with it.
-///
-/// `None` when the entry, the round's line, or the field is absent — the caller
-/// falls back to the live tally rather than refusing to compare.
-///
-/// Scoped by project as well as domain. The baseline this replaced came from
-/// `find_prev_round_plan`, which filters on `project_id`; the audit entry is keyed
-/// by title alone, so two projects using the same domain name would have read each
-/// other's counts into a durable `regression` verdict.
+/// Reads the structured snapshot keyed by (project, domain key, round); falls
+/// back to the legacy audit line for rounds recorded before the snapshot
+/// table existed. `None` → the caller falls back to a live tally.
 pub(crate) fn logged_round_defects(
+    conn: &rusqlite::Connection,
+    plan: &Plan,
+    round: u32,
+) -> Option<i64> {
+    if let Some(i) = round_identity(conn, plan) {
+        if let Some(snap) = round_snapshot(conn, &plan.project_id, &i.domain_key, round) {
+            return Some(snap.counts.defect);
+        }
+    }
+    legacy_logged_round_defects(conn, &plan.project_id, &plan.title, round)
+}
+
+/// Legacy baseline: `R<n>: defect=X` parsed out of the per-domain audit entry.
+/// Scoped by project as well as domain (two projects may share a domain name).
+fn legacy_logged_round_defects(
     conn: &rusqlite::Connection,
     project_id: &str,
     current_title: &str,
@@ -1752,6 +2140,135 @@ pub(crate) fn logged_round_defects(
     let domain = parse_round_plan_title(current_title).map(|(d, _)| d)?;
     let entry = find_audit_entry(conn, project_id, &domain)?;
     parse_logged_round_defects(&entry.content, round)
+}
+
+/// Stable identity of a round plan: normalised domain key + round number.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RoundIdentity {
+    pub(crate) domain_key: String,
+    pub(crate) round: u32,
+}
+
+/// A round's recorded result.
+#[derive(Debug, Clone)]
+pub(crate) struct RoundSnapshot {
+    pub(crate) plan_id: String,
+    pub(crate) counts: TaskCounts,
+}
+
+/// Normalised domain key: case-folded, whitespace collapsed. Derived once,
+/// when a plan's first snapshot is written; afterwards the key is read back
+/// by plan id, so renaming the plan no longer changes which domain it is in.
+pub(crate) fn domain_key(domain: &str) -> String {
+    domain
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Identity of `plan` as a discover-loop round. A plan that already has a
+/// snapshot keeps the identity recorded there (lookup by plan id); otherwise
+/// it is derived from the `"<domain> Round <N>"` title once.
+pub(crate) fn round_identity(conn: &rusqlite::Connection, plan: &Plan) -> Option<RoundIdentity> {
+    let recorded: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT domain_key, round FROM discover_round_snapshots
+             WHERE plan_id = ?1 AND project_id = ?2
+             ORDER BY recorded_at DESC LIMIT 1",
+            rusqlite::params![plan.id, plan.project_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if let Some((domain_key, round)) = recorded {
+        return Some(RoundIdentity {
+            domain_key,
+            round: round.max(0) as u32,
+        });
+    }
+    parse_round_plan_title(&plan.title).map(|(d, round)| RoundIdentity {
+        domain_key: domain_key(&d),
+        round,
+    })
+}
+
+pub(crate) fn round_snapshot(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    domain_key: &str,
+    round: u32,
+) -> Option<RoundSnapshot> {
+    conn.query_row(
+        "SELECT plan_id, pass, defect, scenario_error, harness_error, total
+         FROM discover_round_snapshots
+         WHERE project_id = ?1 AND domain_key = ?2 AND round = ?3",
+        rusqlite::params![project_id, domain_key, round],
+        |r| {
+            Ok(RoundSnapshot {
+                plan_id: r.get(0)?,
+                counts: TaskCounts {
+                    pass: r.get(1)?,
+                    defect: r.get(2)?,
+                    scenario_error: r.get(3)?,
+                    harness_error: r.get(4)?,
+                    total: r.get(5)?,
+                },
+            })
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+fn previous_round_snapshot(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    ident: &RoundIdentity,
+) -> Option<RoundSnapshot> {
+    let prev = ident.round.checked_sub(1).filter(|r| *r >= 1)?;
+    round_snapshot(conn, project_id, &ident.domain_key, prev)
+}
+
+pub(crate) fn write_round_snapshot(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    ident: &RoundIdentity,
+    plan_id: &str,
+    counts: &TaskCounts,
+    decision: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO discover_round_snapshots
+            (project_id, domain_key, round, plan_id, pass, defect, scenario_error,
+             harness_error, total, decision, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(project_id, domain_key, round) DO UPDATE SET
+            plan_id = excluded.plan_id,
+            pass = excluded.pass,
+            defect = excluded.defect,
+            scenario_error = excluded.scenario_error,
+            harness_error = excluded.harness_error,
+            total = excluded.total,
+            decision = excluded.decision,
+            recorded_at = excluded.recorded_at",
+        rusqlite::params![
+            project_id,
+            ident.domain_key,
+            ident.round,
+            plan_id,
+            counts.pass,
+            counts.defect,
+            counts.scenario_error,
+            counts.harness_error,
+            counts.total,
+            decision,
+            crate::id::now_ms(),
+        ],
+    )?;
+    Ok(())
 }
 
 /// Pull `defect=N` for round `n` out of an audit-log body. Split from the DB lookup
@@ -1803,6 +2320,7 @@ fn find_prev_round_plan(
                 plan_id: p.id,
                 plan_title: p.title,
                 counts,
+                reported: None,
             }));
         }
     }
@@ -1831,6 +2349,7 @@ mod tests {
             pass: 6,
             defect: 3,
             scenario_error: 1,
+            harness_error: 0,
             total: 10,
         };
         let line = format_audit_line(4, &counts, "continue");
@@ -1900,6 +2419,324 @@ mod tests {
             parse_logged_round_defects("R1: defect=oops, pass=3", 1),
             None,
             "unparsable count"
+        );
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::{failure_signature, router};
+    use crate::test_fixtures::{call, fixture, plan_in, scope, Fx, Scope};
+    use axum::http::StatusCode;
+    use serde_json::{json, Value};
+
+    const BATCH: &str = "BATCH-01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    fn row(scenario: &str, status: &str, reasoning: &str, evidence: &str) -> String {
+        format!("{scenario}\t{status}\t{reasoning}\t{evidence}\t\t{BATCH}")
+    }
+
+    async fn sync(fx: &Fx, sc: &Scope, tsv: &str, extra: Value) -> (StatusCode, Value) {
+        let app = router().with_state(fx.state.clone());
+        let mut body = json!({ "tsv": tsv, "unit_id": sc.unit_id, "cycle_id": sc.cycle_id });
+        if let (Some(b), Some(e)) = (body.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+        call(&app, "POST", "/discover-loop/sync", Some(body)).await
+    }
+
+    async fn status(fx: &Fx, plan_id: &str) -> Value {
+        let app = router().with_state(fx.state.clone());
+        let (st, v) = call(
+            &app,
+            "GET",
+            &format!("/discover-loop/status?plan_id={plan_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        v
+    }
+
+    #[tokio::test]
+    async fn harness_error_is_accepted_and_not_a_defect() {
+        let fx = fixture();
+        let app = router().with_state(fx.state.clone());
+        let tsv = row(
+            "US-DOG-001",
+            "harness_error",
+            "runner crashed: ENOENT",
+            "log:harness.txt",
+        );
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/discover-loop/verify-tsv",
+            Some(json!({ "tsv": tsv })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["valid"], true, "{v}");
+    }
+
+    #[tokio::test]
+    async fn harness_error_blocks_convergence_until_a_real_verdict_arrives() {
+        let fx = fixture();
+        let sc = scope(&fx, "Dog", Some("/dog"), "Dogfood Round 1");
+        let (st, v) = sync(
+            &fx,
+            &sc,
+            &row(
+                "US-DOG-001",
+                "harness_error",
+                "runner crashed: ENOENT",
+                "log:harness.txt",
+            ),
+            json!({}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["synced"], 1);
+        let (task_status, qa, harness): (String, Option<String>, Option<String>) = fx
+            .state
+            .conn()
+            .query_row(
+                "SELECT status, qa_status, harness_error FROM tasks WHERE scenario_id = 'US-DOG-001'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(task_status, "todo", "needs a re-run");
+        assert_eq!(qa, None, "no verdict");
+        assert_eq!(harness.as_deref(), Some("runner crashed: ENOENT"));
+
+        let s = status(&fx, &sc.plan_id).await;
+        assert_eq!(s["counts"]["harness_error"], 1);
+        assert_eq!(
+            s["counts"]["defect"], 0,
+            "a harness failure is not a defect"
+        );
+        assert_eq!(s["converged"], false, "but it blocks convergence");
+        assert_eq!(s["regression_detected"], false);
+
+        let app = router().with_state(fx.state.clone());
+        let (_, c) = call(
+            &app,
+            "GET",
+            &format!("/discover-loop/converged?plan_id={}", sc.plan_id),
+            None,
+        )
+        .await;
+        assert_eq!(c["converged"], false);
+        assert!(
+            c["reason"].as_str().unwrap().contains("harness_error=1"),
+            "{c}"
+        );
+
+        sync(
+            &fx,
+            &sc,
+            &row("US-DOG-001", "pass", "ok now", "src/a.rs:1"),
+            json!({}),
+        )
+        .await;
+        let s = status(&fx, &sc.plan_id).await;
+        assert_eq!(s["counts"]["harness_error"], 0, "{s}");
+        assert_eq!(s["counts"]["pass"], 1);
+        assert_eq!(s["converged"], true);
+    }
+
+    #[tokio::test]
+    async fn retry_queue_is_capped_per_scenario_and_signature() {
+        let fx = fixture();
+        let sc = scope(&fx, "Dog", Some("/dog"), "Dogfood Round 1");
+        let mut seen = Vec::new();
+        // Volatile numbers in the message must not mint a new signature.
+        for n in 1..=4 {
+            let tsv = row(
+                "US-DOG-002",
+                "harness_error",
+                &format!("Timeout after {n}000 ms in worker {n}"),
+                "log:h.txt",
+            );
+            let (st, v) = sync(&fx, &sc, &tsv, json!({})).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            seen.push(v);
+        }
+        for (i, v) in seen.iter().take(3).enumerate() {
+            assert_eq!(v["retry_queued"][0]["attempts"], (i + 1) as u64, "{v}");
+            assert_eq!(v["retry_exhausted"], json!([]));
+        }
+        let last = &seen[3];
+        assert_eq!(last["retry_queued"], json!([]), "{last}");
+        assert_eq!(last["retry_exhausted"][0]["scenario_id"], "US-DOG-002");
+        assert_eq!(last["retry_exhausted"][0]["attempts"], 3);
+        assert_eq!(last["retry_exhausted"][0]["cap"], 3);
+
+        // A different failure is a different key with its own budget.
+        let (_, v) = sync(
+            &fx,
+            &sc,
+            &row(
+                "US-DOG-002",
+                "harness_error",
+                "fixture database missing",
+                "log:h.txt",
+            ),
+            json!({}),
+        )
+        .await;
+        assert_eq!(v["retry_queued"][0]["attempts"], 1, "{v}");
+        assert_ne!(
+            v["retry_queued"][0]["signature"],
+            last["retry_exhausted"][0]["signature"]
+        );
+
+        // The cap is overridable per sync.
+        let (_, v) = sync(
+            &fx,
+            &sc,
+            &row("US-DOG-003", "harness_error", "boom", "log:h.txt"),
+            json!({ "retry_cap": 1 }),
+        )
+        .await;
+        assert_eq!(v["retry_queued"][0]["attempts"], 1);
+        let (_, v) = sync(
+            &fx,
+            &sc,
+            &row("US-DOG-003", "harness_error", "boom", "log:h.txt"),
+            json!({ "retry_cap": 1 }),
+        )
+        .await;
+        assert_eq!(v["retry_exhausted"][0]["attempts"], 1, "{v}");
+
+        // A real verdict resets the streak.
+        sync(
+            &fx,
+            &sc,
+            &row("US-DOG-003", "pass", "fine", "src/a.rs:1"),
+            json!({}),
+        )
+        .await;
+        let (_, v) = sync(
+            &fx,
+            &sc,
+            &row("US-DOG-003", "harness_error", "boom", "log:h.txt"),
+            json!({ "retry_cap": 1 }),
+        )
+        .await;
+        assert_eq!(v["retry_queued"][0]["attempts"], 1, "{v}");
+    }
+
+    #[test]
+    fn signature_normalises_volatile_tokens_only() {
+        let a = failure_signature(
+            "harness_error",
+            "Timeout after 3000 ms (RUN-01ARZ3NDEKTSV4RRFFQ69G5FAV)",
+        );
+        let b = failure_signature(
+            "harness_error",
+            "timeout   after 12 ms (RUN-01BX5ZZKBKACTAV9WEVGEMMVRZ)\nstack...",
+        );
+        assert_eq!(a, b);
+        assert_ne!(
+            a,
+            failure_signature("harness_error", "fixture database missing")
+        );
+        assert_ne!(a, failure_signature("defect", "Timeout after 3000 ms"));
+    }
+
+    #[tokio::test]
+    async fn verify_tsv_rejects_unknown_run_references() {
+        let fx = fixture();
+        let app = router().with_state(fx.state.clone());
+        let tsv = row("US-DOG-004", "pass", "ok", "run:RUN-missing");
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/discover-loop/verify-tsv",
+            Some(json!({ "tsv": tsv })),
+        )
+        .await;
+        assert_eq!(v["valid"], false, "{v}");
+        assert_eq!(v["errors"][0]["field"], "evidence");
+        assert!(v["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("EVIDENCE_RUN_NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn previous_round_is_found_by_plan_id_and_domain_not_title() {
+        let fx = fixture();
+        let r1 = scope(&fx, "Dog", Some("/dog"), "Dogfood Round 1");
+        sync(
+            &fx,
+            &r1,
+            &[
+                row("US-DOG-010", "defect", "broken", "src/a.rs:1"),
+                row("US-DOG-011", "pass", "fine", "src/a.rs:2"),
+                row("US-DOG-012", "pass", "fine", "src/a.rs:3"),
+            ]
+            .join("\n"),
+            json!({}),
+        )
+        .await;
+        let s1 = status(&fx, &r1.plan_id).await;
+        assert_eq!(s1["round"], 1);
+
+        // Rename round 1 after it reported, and close it so round 2 can start.
+        let r2 = {
+            let mut c = fx.state.conn();
+            c.execute(
+                "UPDATE plans SET title = 'Dogfood — first pass', status = 'completed' WHERE id = ?1",
+                rusqlite::params![r1.plan_id],
+            )
+            .unwrap();
+            plan_in(&mut c, &r1.project_id, "Dogfood Round 2")
+        };
+        sync(
+            &fx,
+            &r2,
+            &[
+                row("US-DOG-010", "defect", "still broken", "src/a.rs:1"),
+                row("US-DOG-011", "defect", "regressed", "src/a.rs:2"),
+            ]
+            .join("\n"),
+            json!({}),
+        )
+        .await;
+        let s2 = status(&fx, &r2.plan_id).await;
+        assert_eq!(s2["round"], 2);
+        assert_eq!(s2["previous_round"]["plan_id"], r1.plan_id.as_str(), "{s2}");
+        assert_eq!(s2["previous_round"]["reported"]["defect"], 1);
+        assert_eq!(
+            s2["previous_round"]["reported"]["pass"], 2,
+            "pass counts are kept"
+        );
+        assert_eq!(s2["regression_detected"], true, "2 defects > 1 reported");
+
+        // Renaming round 2 itself keeps its identity (read back by plan id).
+        fx.state
+            .conn()
+            .execute(
+                "UPDATE plans SET title = 'renamed' WHERE id = ?1",
+                rusqlite::params![r2.plan_id],
+            )
+            .unwrap();
+        let s2b = status(&fx, &r2.plan_id).await;
+        assert_eq!(s2b["round"], 2, "{s2b}");
+        assert_eq!(s2b["previous_round"]["plan_id"], r1.plan_id.as_str());
+
+        let plan2 = crate::repo::plans::get(&fx.state.conn(), &r2.plan_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            super::logged_round_defects(&fx.state.conn(), &plan2, 1),
+            Some(1),
+            "the dashboard baseline reads the same snapshot"
         );
     }
 }
