@@ -277,6 +277,17 @@ impl From<anyhow::Error> for ApiError {
         if msg.starts_with("EVIDENCE_REQUIRED:") {
             return ApiError::bad_request_coded("EVIDENCE_REQUIRED", msg);
         }
+        // Evidence-by-reference (`run:<ID>`): the cited run must exist, be a
+        // complete verification record, and belong to the citing task's project.
+        if msg.starts_with("EVIDENCE_RUN_NOT_FOUND:") {
+            return ApiError::bad_request_coded("EVIDENCE_RUN_NOT_FOUND", msg);
+        }
+        if msg.starts_with("EVIDENCE_RUN_INCOMPLETE:") {
+            return ApiError::bad_request_coded("EVIDENCE_RUN_INCOMPLETE", msg);
+        }
+        if msg.starts_with("EVIDENCE_RUN_FOREIGN_PROJECT:") {
+            return ApiError::bad_request_coded("EVIDENCE_RUN_FOREIGN_PROJECT", msg);
+        }
         if msg.starts_with("PUBLIC_BIND_NOT_ALLOWED:") {
             return ApiError::bad_request_coded("PUBLIC_BIND_NOT_ALLOWED", msg);
         }

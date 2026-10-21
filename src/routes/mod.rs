@@ -12,6 +12,7 @@ pub mod discover;
 pub mod embed;
 pub mod error;
 pub mod events;
+pub mod gate;
 pub mod handoff;
 pub mod import_export;
 pub mod knowledge;
@@ -62,6 +63,7 @@ pub fn router() -> Router<AppState> {
         .merge(wiki::router())
         .merge(handoff::router())
         .merge(continuation::router())
+        .merge(gate::router())
         .merge(import_export::router())
         .merge(locks::router())
         .merge(usage::router())

@@ -13,7 +13,7 @@ pub type SqlitePooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 
 /// Maximum schema version this binary supports. If the on-disk DB reports a
 /// higher version, the daemon refuses to start (downgrade guard).
-pub const SCHEMA_VERSION_MAX: i64 = 28;
+pub const SCHEMA_VERSION_MAX: i64 = 29;
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
@@ -145,6 +145,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         28,
         "028_scope_convergence_audit_titles.sql",
         include_str!("../migrations/028_scope_convergence_audit_titles.sql"),
+    ),
+    (
+        29,
+        "029_run_verification_and_discover_state.sql",
+        include_str!("../migrations/029_run_verification_and_discover_state.sql"),
     ),
 ];
 
@@ -1028,7 +1033,7 @@ mod migration_028_tests {
             // after migrations ran, so write the legacy shape directly.
             seed_pre_028(&conn, "PROJ-solo", "Dogfood", "R1: defect=5, pass=3");
             conn.execute(
-                "DELETE FROM schema_version WHERE version = 28",
+                "DELETE FROM schema_version WHERE version >= 28",
                 rusqlite::params![],
             )
             .unwrap();
@@ -1075,7 +1080,7 @@ mod migration_028_tests {
             )
             .unwrap();
             conn.execute(
-                "DELETE FROM schema_version WHERE version = 28",
+                "DELETE FROM schema_version WHERE version >= 28",
                 rusqlite::params![],
             )
             .unwrap();
@@ -1115,7 +1120,7 @@ mod migration_028_tests {
             )
             .unwrap();
             conn.execute(
-                "DELETE FROM schema_version WHERE version = 28",
+                "DELETE FROM schema_version WHERE version >= 28",
                 rusqlite::params![],
             )
             .unwrap();

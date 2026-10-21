@@ -277,6 +277,18 @@ pub struct Run {
     pub envelope_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub envelope_snapshot: Option<serde_json::Value>,
+    /// Verification record (migration 029): the exact command the run executed,
+    /// a digest of its inputs, its exit status and a digest of the report it
+    /// produced. Together they let task evidence cite `run:<ID>` instead of
+    /// free text, and let a reviewer re-run the same command and compare.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_hash: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,8 @@ mod repo;
 mod routes;
 mod secrets;
 mod state;
+#[cfg(test)]
+mod test_fixtures;
 
 use anyhow::{bail, Result};
 use axum::{extract::State, routing::get, Json, Router};

@@ -386,12 +386,7 @@ async fn dashboard(
                 // 'blocked'`). Calling the same function is what keeps them
                 // from drifting again.
                 let counts = crate::routes::discover::query_plan_task_counts(&conn, &plan.id)
-                    .unwrap_or(crate::routes::discover::TaskCounts {
-                        pass: 0,
-                        defect: 0,
-                        scenario_error: 0,
-                        total: 0,
-                    });
+                    .unwrap_or_default();
                 let (defect, scenario_error, pass) =
                     (counts.defect, counts.scenario_error, counts.pass);
                 // Baseline from the audit log, the same snapshot
@@ -415,15 +410,10 @@ async fn dashboard(
                 let baseline = round_num
                     .checked_sub(1)
                     .and_then(|prev| {
-                        crate::routes::discover::logged_round_defects(
-                            &conn,
-                            &plan.project_id,
-                            &plan.title,
-                            prev,
-                        )
+                        crate::routes::discover::logged_round_defects(&conn, plan, prev)
                     })
                     .or(prev_defect);
-                let decision = if defect == 0 && scenario_error == 0 {
+                let decision = if counts.is_converged() {
                     "converged"
                 } else if defect > 0 && baseline.map(|prev| defect > prev).unwrap_or(false) {
                     "regression"
